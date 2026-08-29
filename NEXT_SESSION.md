@@ -227,6 +227,24 @@ iterdir、stat）。
 验收标准：27 条全绿 + demo_trace 自动打开浏览器，
 轨迹页含用户气泡 / 工具调用卡片（缩进 JSON 参数）/ 结果卡片 / 最终回答。
 
+## 已完成：练习 13 手写轨迹可视化页（2026-08-29，由助手写完）
+
+- `src/harness/trace.py`：render_trace 纯函数（按 role 分派：user/assistant 气泡、
+  tool_calls 卡片带 indent=2 的 JSON 参数、tool 结果卡片、未知 role 灰卡）；
+  所有文本过 html.escape 防 XSS；save_trace（时间戳文件名 + resolve 成绝对路径，
+  as_uri 只认绝对路径）；show_trace 用 webbrowser 打开。
+- 转义铁律：LLM 输出是不可信输入，进 HTML 前必须转义；危险的是"真实标签"，
+  不是长得像危险的词（onerror 转义后作为文本出现是安全的）。
+- `scripts/demo_trace.py`：离线演示，生成 trace-时间戳.html 并自动打开。
+- `tests/test_trace.py`：四 role 渲染 + XSS 双向断言（转义形态必须在、
+  原始标签绝不在）。trace-*.html 已加入 .gitignore。
+- 27 条测试全绿。提交：3a337fa。
+
+## 当前下一步
+
+练习 14：Chainlit 网页聊天（可视化下半场）——pip install chainlit，
+@cl.on_message 装饰器接入 run_agent，工具调用步骤原生展示。
+
 ## 验证命令
 
 在 PowerShell 中运行：

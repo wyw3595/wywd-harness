@@ -16,6 +16,7 @@ from src.harness.agent import run_agent
 from src.harness.file_tools import list_dir, read_file
 from src.harness.real_model import RealModel
 from src.harness.tools import Tool, ToolRegistry, tool_to_schema
+from src.harness.trace import show_trace
 
 
 def get_weather(city: str) -> str:
@@ -71,6 +72,8 @@ def main() -> None:
     print("和你的 Harness 对话吧！试试：")
     print("  北京天气怎么样？")
     print("  那上海呢？      <- 它能接住\"那\"，因为上一问还在记忆里")
+    print("  读一下 README.md，用一句话总结")
+    print("  输入 /trace 把当前会话变成可视化轨迹页（浏览器打开）")
     print("  输入 /clear 清空记忆，q 退出。\n")
 
     while True:
@@ -83,6 +86,15 @@ def main() -> None:
             continue
         if task.lower() in {"q", "quit", "exit", "退出"}:
             break
+
+        if task == "/trace":
+            # 可视化当前会话：history 就是完整的消息轨迹。
+            if history:
+                path = show_trace(history)
+                print(f"轨迹页已生成：{path}")
+            else:
+                print("还没有对话内容，先聊一句再来 /trace。")
+            continue
 
         if task == "/clear":
             history = None
