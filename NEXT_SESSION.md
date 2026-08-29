@@ -180,6 +180,22 @@ run() → Model 协议（generate(messages) -> ModelReply）→ ToolRegistry + J
 - **从现在起的工作节奏**：改代码 → 跑测试 → `git add -A && git commit -m "..."` 小步提交。
   每完成一节练习都应该有一次提交，提交信息写清"做了什么"。
 
+## 进行中：练习 12 实战文件工具 + 沙箱安全（骨架已建，等我填代码）
+
+设计：能力 = 风险，四道闸门——只读 / ALLOWED_ROOT 沙箱（is_relative_to 检查）/
+max_chars 限额 / 违规走错误回灌不崩溃。pathlib 是本课新语法（/ 拼路径、resolve、
+iterdir、stat）。
+
+- `src/harness/file_tools.py`（新建）：TODO 1 `_resolve_safe` 沙箱检查；
+  TODO 2 `list_dir`；TODO 3 `read_file`（截断 + 1MB 防爆）。
+- `scripts/chat.py`：TODO 4 注册 list_dir / read_file 并下发 schema。
+- `tests/test_file_tools.py`（新建）：TODO 5~8（放行 / 越界 / 列目录 / 读+截断）。
+
+当前测试状态：21 条通过，新 4 条报 NotImplementedError。
+
+验收标准：25 条全绿 + chat 里问"src/harness 目录里有什么？"
+"读一下 README.md 用一句话总结"能得到基于真实文件内容的回答。
+
 ## 验证命令
 
 在 PowerShell 中运行：

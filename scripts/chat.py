@@ -13,6 +13,7 @@
 """
 
 from src.harness.agent import run_agent
+from src.harness.file_tools import list_dir, read_file
 from src.harness.real_model import RealModel
 from src.harness.tools import Tool, ToolRegistry, tool_to_schema
 
@@ -44,8 +45,24 @@ def main() -> None:
     registry.register(weather_tool)
     registry.register(add_tool)
 
+    file_tool_1 = Tool(name="list_dir",
+                       description="列出项目里某个目录的内容（path 是相对项目根的路径，默认 . ）",
+                       handler=list_dir)
+    file_tool_2 = Tool(name="read_file",
+                       description="读取项目里某个文本文件（path 相对项目根；超长自动截断）",
+                       handler=read_file)
+
+    registry.register(file_tool_1)
+    registry.register(file_tool_2)
+    
+
     model = RealModel(
-        tools=[tool_to_schema(weather_tool), tool_to_schema(add_tool)]
+        tools=[
+            tool_to_schema(weather_tool),
+            tool_to_schema(add_tool),
+            tool_to_schema(file_tool_1),
+            tool_to_schema(file_tool_2),
+        ]
     )
 
     # 会话记忆：Harness 无状态，记忆归应用层管——就是这个变量。
