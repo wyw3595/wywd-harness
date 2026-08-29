@@ -14,3 +14,7 @@ __pycache__/
 
 # 轨迹页生成物：每次运行都会产出的临时快照
 trace-*.html
+
+# Chainlit 网页端的生成物
+.chainlit/
+.files/

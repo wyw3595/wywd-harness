@@ -23,6 +23,8 @@
 - `src/harness/tools.py`：工具描述、工具注册表与 `tool_to_schema`（自动生成 JSON Schema）。
 - `src/harness/real_model.py`：真实模型（DeepSeek，需要 `DEEPSEEK_API_KEY` 环境变量）。
 - `scripts/smoke_deepseek.py`：真实调用冒烟脚本（不进单元测试）。
+- `scripts/toolbox.py`：共享工具箱——终端和网页两个入口用同一套工具与模型配置。
+- `scripts/chainlit_app.py`：Chainlit 网页聊天入口（工具调用步骤原生展示）。
 - `scripts/chat.py`：交互式对话入口——和你的 Harness 真实聊天。
 - `tests/test_main.py`：核心行为测试。
 - `tests/test_agent.py`：Agent Loop 与工具回灌测试。
@@ -36,6 +38,7 @@
 .\.venv\Scripts\python.exe -X utf8 -m src.harness.agent         # 离线 Agent 演示
 .\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v   # 18 条测试
 setx DEEPSEEK_API_KEY "sk-..."   # 一次性永久设置（写注册表，新开窗口生效）
-.\.venv\Scripts\python.exe -X utf8 -m scripts.chat              # 交互式对话（产品入口）
+.\.venv\Scripts\python.exe -X utf8 -m scripts.chat              # 交互式对话（终端入口）
 .\.venv\Scripts\python.exe -X utf8 -m scripts.smoke_deepseek    # 冒烟脚本
+.\.venv\Scripts\chainlit.exe run scripts\chainlit_app.py        # 网页聊天（浏览器自动打开）
 ```

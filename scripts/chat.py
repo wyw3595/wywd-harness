@@ -1,70 +1,27 @@
 """交互式命令行：和你的 Harness 真实对话。
 
-这是整个项目的"产品入口"：输入任何问题，DeepSeek 会真的思考、
-真的发起工具调用（查天气、做加法），循环真的执行并把结果回灌。
+这是整个项目的"终端入口"：输入任何问题，DeepSeek 会真的思考、
+真的发起工具调用（查天气、做加法、列目录、读文件），循环真的执行
+并把结果回灌。
 
-运行前设置密钥（PowerShell，只对当前窗口有效）：
-    $env:DEEPSEEK_API_KEY = "sk-你的key"
+运行前设置密钥（PowerShell，一次性）：
+    setx DEEPSEEK_API_KEY "sk-你的key"
 
 运行：
     .\\.venv\\Scripts\\python.exe -X utf8 -m scripts.chat
 
-输入 q 退出。每个问题独立运行（轮内有记忆，问题之间没有）。
+输入 /trace 生成可视化轨迹页，/clear 清空记忆，q 退出。
+每个问题独立运行（轮内有记忆，问题之间没有）。
 """
 
+from scripts.toolbox import build_model, build_registry
 from src.harness.agent import run_agent
-from src.harness.file_tools import list_dir, read_file
-from src.harness.real_model import RealModel
-from src.harness.tools import Tool, ToolRegistry, tool_to_schema
 from src.harness.trace import show_trace
 
 
-def get_weather(city: str) -> str:
-    """查询一个城市今天的天气。"""
-
-    return f"{city}今天下紫色雪花，气温零下 42 度。"
-
-
-def add(a: int, b: int) -> int:
-    """计算两个整数的和。"""
-
-    return a + b
-
-
 def main() -> None:
-    weather_tool = Tool(
-        name="get_weather",
-        description="查询一个城市今天的天气",
-        handler=get_weather,
-    )
-    add_tool = Tool(
-        name="add",
-        description="计算两个整数的和",
-        handler=add,
-    )
-    registry = ToolRegistry()
-    registry.register(weather_tool)
-    registry.register(add_tool)
-
-    file_tool_1 = Tool(name="list_dir",
-                       description="列出项目里某个目录的内容（path 是相对项目根的路径，默认 . ）",
-                       handler=list_dir)
-    file_tool_2 = Tool(name="read_file",
-                       description="读取项目里某个文本文件（path 相对项目根；超长自动截断）",
-                       handler=read_file)
-
-    registry.register(file_tool_1)
-    registry.register(file_tool_2)
-    
-
-    model = RealModel(
-        tools=[
-            tool_to_schema(weather_tool),
-            tool_to_schema(add_tool),
-            tool_to_schema(file_tool_1),
-            tool_to_schema(file_tool_2),
-        ]
-    )
+    registry = build_registry()
+    model = build_model()
 
     # 会话记忆：Harness 无状态，记忆归应用层管——就是这个变量。
     history: list[dict] | None = None
