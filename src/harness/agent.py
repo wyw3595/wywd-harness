@@ -93,7 +93,19 @@ def run_agent(
 
     while step < max_steps:
         emit("round_start", step=step)
-        reply = model.generate(messages)
+        # 失败也是出口（练习 16）：模型层的异常（RealModel 重试耗尽等）不再
+        # 炸穿调用方，而是落地成 status="failed" 的结果——失败是结果，
+        # 不是异常。messages 照常返回：用户的问题已入列，不许弄丢。
+        try:
+            reply = model.generate(messages)
+        except Exception as error:
+            return RunResult(
+                run_id=str(uuid4()),
+                task=task,
+                output=f"调用模型失败：{error}",
+                status="failed",
+                messages=messages,
+            )
         emit(
             "model_reply",
             kind=reply.kind,

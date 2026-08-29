@@ -85,7 +85,12 @@ def main() -> None:
             on_event=on_event,
         )
         history = result.messages
-        print(f"助手> {result.output}\n")
+        # 失败不该和成功长得一样（练习 16）；history 照常更新——
+        # 用户的问题已入列，下一问还带着上下文。
+        if result.status == "failed":
+            print(f"⚠️ {result.output}")
+        else:
+            print(f"助手> {result.output}\n")
 
     print("再见！")
 

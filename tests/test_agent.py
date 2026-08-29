@@ -296,5 +296,24 @@ class AgentEventHookTests(unittest.TestCase):
         self.assertEqual(result.output, "安静完成")
 
 
+class RunAgentFailureTests(unittest.TestCase):
+    """练习 16：失败也是出口——模型层的异常不能炸穿 Harness。"""
+
+    def test_model_exception_becomes_failed_result(self) -> None:
+        # 满足 Model 协议（只有一个 generate 方法）就能塞进 run_agent——
+        # 协议的妙处：不用继承任何东西。
+        class ExplodingModel:
+            def generate(self, messages: list[dict]) -> ModelReply:
+                raise RuntimeError("模拟：API 密钥无效")
+
+        result = run_agent("随便什么任务", model=ExplodingModel())
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("API 密钥无效", result.output)
+        # 用户的问题已入列，失败也不许弄丢。
+        self.assertEqual(result.messages[0]["role"], "user")
+        self.assertEqual(result.messages[0]["content"], "随便什么任务")
+
+
 if __name__ == "__main__":
     unittest.main()

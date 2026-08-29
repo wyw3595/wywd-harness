@@ -242,8 +242,8 @@ iterdir、stat）。
 
 ## 当前下一步
 
-练习 14：Chainlit 网页聊天（可视化下半场）——pip install chainlit，
-@cl.on_message 装饰器接入 run_agent，工具调用步骤原生展示。
+练习 17 候选（见下方「已完成：练习 16」之后的优先级清单），
+从 wire 解析防御开始。
 
 ## 已完成：练习 14 Chainlit 网页聊天（2026-08-29，由助手写完）
 
@@ -259,6 +259,55 @@ iterdir、stat）。
   （call_00_ffdjI3AhgYvKBLsFET005618）+ 紫色雪花回答。
 - 运行：`.\.venv\Scripts\chainlit.exe run scripts\chainlit_app.py`。
 - 提交：5141847。
+
+## 已完成：练习 15 事件钩子 on_event（2026-08-29，实时直播）
+
+- `agent.py`：run_agent 新增 `on_event: Callable[[str, dict], None] | None`，
+  内部 `emit(event, **data)` 在四个节点广播：round_start（step）/ model_reply
+  （kind/text/tool_names）/ tool_start（call_id/name/arguments）/
+  tool_end（call_id/name/content）。不传钩子则零行为变化。
+- `scripts/chat.py`：终端实时播报（⚙️ 轮次 / 🤖 模型动作 / 🔧 工具执行与返回）。
+- `scripts/chainlit_app.py`：回放式步骤升级为直播——on_event 回调发生在
+  run_agent 的工作线程，用 `asyncio.run_coroutine_threadsafe(coro, loop)`
+  把 Step 卡片架桥回主事件循环实时创建。
+- `tests/test_agent.py`：事件序列与载荷断言 + "无钩子时行为不变"回归。
+- 验收：29 条测试全绿；终端管道实测逐行播报；浏览器实测
+  "⚙️ 调用 get_weather" / "✅ 结果" 直播卡片 + 真实回答。
+- 提交：0f3fbe8。
+
+## 已完成：练习 16 让失败成为一等公民（2026-08-29，代码由我填，助手收尾）
+
+- A 组失败语义：RunResult.status 的 Literal 增加 "failed"；
+  run_agent 把 model.generate 包进 try/except Exception——失败落地成
+  status="failed" 的 RunResult（output 写人话、messages 照常返回）；
+  real_model 新增 _is_permanent_error 纯函数（4xx 除 429 全算永久错误），
+  在 raise_for_status 之前先问策略，命中立刻 raise RuntimeError——
+  RuntimeError 不在 RequestException 家族，从重试网里穿出去（401 秒失败）。
+- B 组沙箱保镖：file_tools 第五道闸门 FORBIDDEN_PARTS = {".env", ".git"}，
+  _resolve_safe 用 relative_to + any(parts) 查整条动线——.git/config 的
+  文件名是 config，撞禁区的是路径中段的 .git；src/../.env 也会被拦
+  （resolve 先归一化再检查）。模块 docstring 升级为五道闸门。
+- 显示层：chat 打印 ⚠️ 分支；chainlit 用 cl.Message 发 ⚠️ 卡片。
+  我的踩坑：把 chat 的 print 分支原样复制进 chainlit——print 是终端的嘴，
+  网页用户什么都看不见，而旧的 send() 还在照发普通回答。
+  教训：两个入口共用 RunResult，不共用显示代码。
+- 测试：爆炸模型（定义在测试方法内的局部类，满足协议即插即用）验证
+  failed 出口；策略打表（401/403 True，429/500/200 False）；禁区两条
+  （.env 不需真实存在——检查先于读取）。
+- 验收：33 条测试全绿；离线攻击演练 .env / .git/config / src/../.env /
+  list_dir(.git) 全部拦截，README / src 正常放行。
+- 待办：真实冒烟——故意设错 key 跑 chat，确认 401 一秒内出 ⚠️ 且终端
+  不崩；Chainlit 网页里看到 ⚠️ 卡片。
+- 提交：73396cf（含补记的练习 15 笔记）
+
+## 当前下一步
+
+练习 17 候选（按优先级）：
+1. wire 解析防御——response.json()["choices"][0] 缺键、json.loads 坏参数
+   现在会裸炸；模型输出是不可信输入，解析处就是信任边界；
+2. requests.Session 连接复用——每轮 generate 都重新 TCP+TLS 握手；
+3. usage（token 用量）接进练习 15 的事件流，成本可观测；
+4. 历史窗口截断/摘要——账单随会话长度线性涨。
 
 ## 验证命令
 

@@ -82,4 +82,9 @@ async def on_message(message: cl.Message) -> None:
     # 更新会话记忆：下一个问题带着完整历史。
     cl.user_session.set("history", result.messages)
 
-    await cl.Message(content=result.output).send()
+    # 失败不该和成功长得一样（练习 16）：print 是终端的嘴，网页的嘴是
+    # cl.Message——两个入口共用 RunResult，不共用显示代码。
+    if result.status == "failed":
+        await cl.Message(content=f"⚠️ {result.output}").send()
+    else:
+        await cl.Message(content=result.output).send()

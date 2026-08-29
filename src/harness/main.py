@@ -36,7 +36,8 @@ class RunResult:
     run_id: str
     task: str
     output: str
-    status: Literal["completed", "max_steps"] = "completed"
+    # 练习 16 起 "failed" 也是合法结局：契约先承认失败，循环才有值可写。
+    status: Literal["completed", "max_steps", "failed"] = "completed"
     messages: list[dict] = field(default_factory=list)
 
 

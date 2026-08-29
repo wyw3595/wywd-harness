@@ -8,6 +8,9 @@
      防止把上下文窗口和账单撑爆；
   4. 拒绝不崩溃：违规一律走"抛异常 -> 循环捕获 -> 错误回灌"的老路，
      模型会自己道歉并换路径（练习 04 建好的机制开始收利息）。
+  5. 禁区（练习 16）：界内也有皇冠珠宝——.env 里的密钥、.git 里的
+     版本库，路径任意一截撞上 FORBIDDEN_PARTS 直接拒绝。
+     沙箱管"有没有越界"，禁区管"界内哪些不能碰"。
 """
 
 from pathlib import Path
@@ -15,6 +18,10 @@ from pathlib import Path
 # 沙箱根：本文件位于 src/harness/，往上两级就是项目根目录。
 # 用 __file__ 定位而不是 cwd，保证无论从哪里启动，沙箱都是同一个。
 ALLOWED_ROOT = Path(__file__).resolve().parents[2]
+
+# 沙箱保镖（练习 16）：界内禁区。.env 里的密钥、.git 里的版本库一旦被
+# read_file 读走，密钥就会流进对话、轨迹页和网页界面。
+FORBIDDEN_PARTS = {".env", ".git"}
 
 
 def _resolve_safe(path_text: str) -> Path:
@@ -28,6 +35,11 @@ def _resolve_safe(path_text: str) -> Path:
     resolved = (ALLOWED_ROOT / path_text).resolve()
     if not resolved.is_relative_to(ALLOWED_ROOT):
         raise PermissionError(f"路径越出沙箱：{path_text}")
+    # 禁区检查：查整条动线而不只查终点——read_file(".git/config") 的
+    # 文件名是 config，撞禁区的是路径中段的 .git。
+    relative = resolved.relative_to(ALLOWED_ROOT)
+    if any(part in FORBIDDEN_PARTS for part in relative.parts):
+        raise PermissionError(f"禁区文件，拒绝访问：{path_text}")
     return resolved
 
 

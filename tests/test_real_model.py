@@ -6,7 +6,7 @@
 import json
 import unittest
 
-from src.harness.real_model import _to_wire_messages
+from src.harness.real_model import _is_permanent_error, _to_wire_messages
 from src.harness.tools import Tool, tool_to_schema
 
 
@@ -63,6 +63,19 @@ class ToWireMessagesTests(unittest.TestCase):
         self.assertEqual(len(wire), 2)
         self.assertEqual(wire[0], messages[0])
         self.assertEqual(wire[1], messages[1])
+
+
+class PermanentErrorPolicyTests(unittest.TestCase):
+    """练习 16：重试策略打表——不发网络，纯函数直接问。"""
+
+    def test_policy_table(self) -> None:
+        # 4xx（除 429）＝重试也没用：key 错、权限错。
+        self.assertTrue(_is_permanent_error(401))
+        self.assertTrue(_is_permanent_error(403))
+        # 429 限流是"歇会儿再来"；5xx 是服务端抖动；200 根本没出错。
+        self.assertFalse(_is_permanent_error(429))
+        self.assertFalse(_is_permanent_error(500))
+        self.assertFalse(_is_permanent_error(200))
 
 
 if __name__ == "__main__":

@@ -40,5 +40,22 @@ class FileToolTests(unittest.TestCase):
         self.assertLess(len(truncated), len(full))
 
 
+class DenylistTests(unittest.TestCase):
+    """练习 16：沙箱保镖——界内禁区同样进不去。"""
+
+    def test_env_is_forbidden(self) -> None:
+        # 检查发生在读取之前，不需要真的创建 .env。
+        with self.assertRaises(PermissionError):
+            read_file(".env")
+
+    def test_git_is_forbidden(self) -> None:
+        # 文件名是 config，撞禁区的是路径中段的 .git。
+        with self.assertRaises(PermissionError):
+            read_file(".git/config")
+        # 禁区对两个工具一视同仁。
+        with self.assertRaises(PermissionError):
+            list_dir(".git")
+
+
 if __name__ == "__main__":
     unittest.main()

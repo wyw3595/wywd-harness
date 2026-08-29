@@ -85,6 +85,20 @@ def _to_wire_messages(messages: list[dict]) -> list[dict]:
     return wire_messages
 
 
+# 重试策略（练习 16）："该不该重试"抽成纯函数——不发网络，测试能离线打表。
+# 4xx（除 429）＝请求本身有问题（key 错、参数错），重试一万次还是它；
+# 429 限流＝"你没错，只是太快，歇会儿再来"；5xx 和网络异常＝暂时性故障，
+# 交给下面的重试循环。
+def _is_permanent_error(status_code: int) -> bool:
+    """判断一个 HTTP 状态码是否属于"重试也没用"的永久性错误。"""
+
+    if status_code == 429:
+        return False
+    if 400 <= status_code < 500:
+        return True
+    return False
+
+
 class RealModel:
     """调用 DeepSeek /chat/completions 的真实模型，实现 Model 协议。
 
@@ -124,9 +138,9 @@ class RealModel:
         if self.tools:
             payload["tools"] = self.tools
 
-        # 已知边界：raise_for_status 抛的 HTTPError 属于 RequestException 家族，
-        # 所以 401（key 无效）也会被重试 3 次——严格说它属于"真意外"，
-        # 应先判 response.status_code == 401 立刻抛错。v1 保持简单，留作改进点。
+        # 永久性错误快速失败（练习 16）：401 这类错误重试一万次也是它，
+        # 所以先判策略再 raise_for_status。RuntimeError 不在 RequestException
+        # 家族，这个 raise 会从 except 的网里穿出去——绝不重试。
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 response = requests.post(
@@ -135,6 +149,11 @@ class RealModel:
                     headers=headers,
                     timeout=REQUEST_TIMEOUT,
                 )
+                if _is_permanent_error(response.status_code):
+                    raise RuntimeError(
+                        f"DeepSeek 拒绝请求（HTTP {response.status_code}）："
+                        f"永久性错误，不重试。{response.text}"
+                    )
                 response.raise_for_status()
                 choice = response.json()["choices"][0]
                 message = choice["message"]
