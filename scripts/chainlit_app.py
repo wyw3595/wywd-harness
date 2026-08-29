@@ -9,6 +9,8 @@
    异步 UI 属于集成测试领域），27 条核心测试就是它的安全网。
 """
 
+import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -53,29 +55,29 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(content="记忆已清空。").send()
         return
 
+    # 实时直播：on_event 回调发生在 run_agent 的工作线程里，而界面操作
+    # 必须回到主事件循环——run_coroutine_threadsafe 就是那座桥。
+    loop = asyncio.get_running_loop()
+
+    async def emit_step(name: str, output: str) -> None:
+        async with cl.Step(name=name, type="tool") as step:
+            step.output = output
+
+    def on_event(event: str, data: dict) -> None:
+        if event == "tool_start":
+            args = json.dumps(data["arguments"], indent=2, ensure_ascii=False)
+            asyncio.run_coroutine_threadsafe(
+                emit_step(f"⚙️ 调用 {data['name']}", f"参数：\n{args}"), loop
+            )
+        elif event == "tool_end":
+            asyncio.run_coroutine_threadsafe(
+                emit_step(f"✅ 结果（{data['name']}）", str(data["content"])), loop
+            )
+
     # run_agent 是同步的（会阻塞着等 HTTP），扔进线程池跑，界面不卡。
     result = await cl.make_async(run_agent)(
-        task, model=model, registry=registry, history=history
+        task, model=model, registry=registry, history=history, on_event=on_event
     )
-
-    # 回放式步骤展示：只回放"本轮新增"的消息——
-    # history 里的旧消息上一问已经展示过，user 提问链式聊天界面自己会显示。
-    prior_len = len(history) if history else 0
-    new_messages = result.messages[prior_len + 1 :]
-
-    for m in new_messages:
-        if m["role"] == "assistant" and "tool_calls" in m:
-            for call in m["tool_calls"]:
-                async with cl.Step(name=call["name"], type="tool") as step:
-                    step.output = (
-                        "参数："
-                        + json.dumps(call["arguments"], indent=2, ensure_ascii=False)
-                    )
-        elif m["role"] == "tool":
-            async with cl.Step(
-                name=f"工具结果（{m['tool_call_id']}）", type="tool"
-            ) as step:
-                step.output = m["content"]
 
     # 更新会话记忆：下一个问题带着完整历史。
     cl.user_session.set("history", result.messages)

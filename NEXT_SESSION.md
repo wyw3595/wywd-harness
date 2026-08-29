@@ -245,6 +245,21 @@ iterdir、stat）。
 练习 14：Chainlit 网页聊天（可视化下半场）——pip install chainlit，
 @cl.on_message 装饰器接入 run_agent，工具调用步骤原生展示。
 
+## 已完成：练习 14 Chainlit 网页聊天（2026-08-29，由助手写完）
+
+- `scripts/toolbox.py`：共享工具箱（4 个工具 + build_registry/build_model），
+  终端和网页两个入口共用，新增工具只改一处。
+- `scripts/chainlit_app.py`：@cl.on_chat_start（建模型/注册表/清记忆）+
+  @cl.on_message（cl.make_async 跑同步 run_agent；回放式 Step 展示本轮新增的
+  工具调用与结果，切片 result.messages[prior_len+1:] 防止旧步骤重复显示）。
+- 关键坑：chainlit 用 spec_from_file_location 加载应用文件，不会把项目根放进
+  sys.path——文件开头自行 bootstrap PROJECT_ROOT，否则 src.*/scripts.* 导入全挂。
+- 验收：27 条测试全绿；chainlit 起服务器（HTTP 200）；浏览器实测真实对话——
+  网页上出现"已使用 get_weather"步骤卡片 + DeepSeek 真实 call_id
+  （call_00_ffdjI3AhgYvKBLsFET005618）+ 紫色雪花回答。
+- 运行：`.\.venv\Scripts\chainlit.exe run scripts\chainlit_app.py`。
+- 提交：5141847。
+
 ## 验证命令
 
 在 PowerShell 中运行：

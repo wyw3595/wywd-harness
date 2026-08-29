@@ -237,5 +237,64 @@ class AgentHistoryTests(unittest.TestCase):
         self.assertEqual(history, [{"role": "user", "content": "第一问"}])
 
 
+class AgentEventHookTests(unittest.TestCase):
+    """练习 15：事件钩子——循环在关键节点广播过程。"""
+
+    def setUp(self) -> None:
+        self.registry = ToolRegistry()
+        self.registry.register(
+            Tool(name="add", description="计算两个整数的和", handler=add)
+        )
+
+    def test_on_event_receives_lifecycle(self) -> None:
+        events: list[tuple[str, dict]] = []
+        model = ScriptedModel(
+            [
+                ModelReply(
+                    kind="tool_calls",
+                    tool_calls=[ToolCall("call_1", "add", {"a": 2, "b": 3})],
+                ),
+                ModelReply(kind="final", text="等于 5"),
+            ]
+        )
+
+        run_agent(
+            "加法任务",
+            model=model,
+            registry=self.registry,
+            on_event=lambda event, data: events.append((event, data)),
+        )
+
+        # 两轮的完整事件序列：每轮 round_start + model_reply，
+        # 工具轮多一对 tool_start + tool_end。
+        self.assertEqual(
+            [event for event, _ in events],
+            [
+                "round_start",
+                "model_reply",
+                "tool_start",
+                "tool_end",
+                "round_start",
+                "model_reply",
+            ],
+        )
+        tool_start = events[2][1]
+        self.assertEqual(tool_start["name"], "add")
+        self.assertEqual(tool_start["arguments"], {"a": 2, "b": 3})
+        self.assertIn("返回：5", events[3][1]["content"])
+        # 最终轮的 model_reply 报告 final + 文本。
+        self.assertEqual(events[5][1]["kind"], "final")
+        self.assertEqual(events[5][1]["text"], "等于 5")
+
+    def test_no_hook_is_silent(self) -> None:
+        # 不传 on_event 时一切照旧——钩子是可选的，默认行为不能变。
+        model = ScriptedModel([ModelReply(kind="final", text="安静完成")])
+
+        result = run_agent("普通任务", model=model)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.output, "安静完成")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,8 @@
 每个问题独立运行（轮内有记忆，问题之间没有）。
 """
 
+import json
+
 from scripts.toolbox import build_model, build_registry
 from src.harness.agent import run_agent
 from src.harness.trace import show_trace
@@ -22,6 +24,23 @@ from src.harness.trace import show_trace
 def main() -> None:
     registry = build_registry()
     model = build_model()
+
+    def on_event(event: str, data: dict) -> None:
+        """实时播报循环事件——过程不再黑盒。"""
+
+        if event == "round_start":
+            print(f"  ⚙️ 第 {data['step']} 轮")
+        elif event == "model_reply":
+            if data["kind"] == "tool_calls":
+                names = "、".join(data["tool_names"])
+                print(f"  🤖 模型请求调用工具：{names}")
+            else:
+                print("  🤖 模型给出最终回答")
+        elif event == "tool_start":
+            args = json.dumps(data["arguments"], ensure_ascii=False)
+            print(f"  🔧 执行 {data['name']}({args}) ……")
+        elif event == "tool_end":
+            print(f"     ↳ {data['content']}")
 
     # 会话记忆：Harness 无状态，记忆归应用层管——就是这个变量。
     history: list[dict] | None = None
@@ -58,7 +77,13 @@ def main() -> None:
             print("记忆已清空")
             continue
 
-        result = run_agent(task, model=model, registry=registry, history=history)
+        result = run_agent(
+            task,
+            model=model,
+            registry=registry,
+            history=history,
+            on_event=on_event,
+        )
         history = result.messages
         print(f"助手> {result.output}\n")
 

@@ -29,6 +29,7 @@ Harness 练习 03 ~ 08：Agent Loop、工具回灌、对话历史与结构化
 ============================================================
 """
 
+from typing import Any, Callable
 from uuid import uuid4
 
 from src.harness.main import RunResult
@@ -42,6 +43,7 @@ def run_agent(
     registry: ToolRegistry | None = None,
     max_steps: int = 5,
     history: list[dict] | None = None,
+    on_event: Callable[[str, dict], None] | None = None,
 ) -> RunResult:
     """驱动模型最多 max_steps 轮，直到它给出最终回答。
 
@@ -56,6 +58,11 @@ def run_agent(
     结束时把完整对话放在返回结果的 messages 字段里，
     调用方用 history = result.messages 延续会话。
     Harness 本身无状态——记多久、记不记，是应用层的事。
+
+    事件钩子（练习 15 起）：传入 on_event(event, data) 后，循环在每个
+    关键节点都会广播事件——round_start / model_reply / tool_start /
+    tool_end——调用方借此"实时直播"过程（终端打印、网页步骤卡、
+    日志、计费统计都吃同一份事件流）。不传则完全安静。
 
     保险丝：连续 max_steps 轮没等到最终回答 -> 返回 status="max_steps"
     的 RunResult，output 说明最后一轮请求了哪些工具。
@@ -78,8 +85,21 @@ def run_agent(
         messages = []
     messages.append({"role": "user", "content": task})
 
+    def emit(event: str, **data: Any) -> None:
+        """广播事件；没人订阅（on_event 为 None）就什么都不发生。"""
+
+        if on_event is not None:
+            on_event(event, data)
+
     while step < max_steps:
+        emit("round_start", step=step)
         reply = model.generate(messages)
+        emit(
+            "model_reply",
+            kind=reply.kind,
+            text=reply.text,
+            tool_names=[call.name for call in reply.tool_calls],
+        )
 
         if reply.kind == "final":
             # 每轮发言先入历史——最终回答也留在对话记录里。
@@ -110,6 +130,12 @@ def run_agent(
         )
 
         for call in reply.tool_calls:
+            emit(
+                "tool_start",
+                call_id=call.call_id,
+                name=call.name,
+                arguments=call.arguments,
+            )
             try:
                 tool_output = registry.execute(call.name, **call.arguments)
                 content = f"工具 {call.name} 返回：{tool_output}"
@@ -118,6 +144,12 @@ def run_agent(
                 # 一次工具失败绝不拖垮同轮的其他调用。
                 content = f"工具 {call.name} 出错：{error}"
 
+            emit(
+                "tool_end",
+                call_id=call.call_id,
+                name=call.name,
+                content=content,
+            )
             messages.append(
                 {
                     "role": "tool",
