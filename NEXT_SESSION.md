@@ -196,6 +196,37 @@ iterdir、stat）。
 验收标准：25 条全绿 + chat 里问"src/harness 目录里有什么？"
 "读一下 README.md 用一句话总结"能得到基于真实文件内容的回答。
 
+## 已完成：练习 12 实战文件工具 + 沙箱安全（2026-08-29，测试由助手写）
+
+- `src/harness/file_tools.py`：ALLOWED_ROOT 沙箱（`_resolve_safe` 用 resolve +
+  is_relative_to 检查）、list_dir、read_file（1MB 防爆 + utf-8 + max_chars 截断）。
+  四道闸门：只读 / 沙箱 / 限额 / 违规走错误回灌不崩溃。
+- `scripts/chat.py`：注册 list_dir / read_file，四个工具 schema 全量下发。
+- `tests/test_file_tools.py`：放行 / 越界 / 列目录 / 读+截断，全离线。
+- 验收：25 条测试全绿；离线攻击演练（list_dir('D:/React')）沙箱拦截成功；
+  真实 chat 实测：模型真实调用工具列出 src/harness 的真实文件和字节数、
+  基于 README 真实内容给出总结。
+- 提交：6ffff8f。
+
+## 进行中：练习 13 手写轨迹可视化页（骨架已建，等我填代码）
+
+方向调研结论：业界两条路——Chainlit（Agent 聊天界面首选，工具步骤原生展示）
+和 Langfuse（轨迹树平台，需自托管数据库）。我们选择先手写迷你轨迹页：
+零依赖、复用 RunResult.messages，做完再上 Chainlit。
+
+- `src/harness/trace.py`（新建）：TODO 1 `_escape`（html.escape）；
+  TODO 2 `_render_message` 按 role 分派（四种形态 + 未知 role 灰卡）；
+  TODO 3 `render_trace` 组装整页（PAGE_TEMPLATE.format，CSS 大括号双写）；
+  TODO 4 `save_trace`（时间戳文件名）；TODO 5 `show_trace`（as_uri + webbrowser）。
+- `scripts/demo_trace.py`：TODO 6 一行调用 show_trace。
+- `tests/test_trace.py`：TODO 7 四种 role 全渲染（JSON 期望值用 html.escape
+  动态构造）；TODO 8 XSS 灵魂测试（&lt;script&gt; 必须出现、原始 &lt;script&gt; 绝不出现）。
+
+当前测试状态：25 条通过，新 2 条报 NotImplementedError。
+
+验收标准：27 条全绿 + demo_trace 自动打开浏览器，
+轨迹页含用户气泡 / 工具调用卡片（缩进 JSON 参数）/ 结果卡片 / 最终回答。
+
 ## 验证命令
 
 在 PowerShell 中运行：
