@@ -320,7 +320,7 @@ iterdir、stat）。
 - 测试：正常 final/tool_calls 往返 + 四条畸形打表（缺 choices /
   没给清单 / 空清单 / 坏参数；空清单放行会让 agent 空转到 max_steps）。
 - 验收：35 条测试全绿。
-- 提交：PENDING17
+- 提交：2d988c0
 
 ## 当前下一步
 
