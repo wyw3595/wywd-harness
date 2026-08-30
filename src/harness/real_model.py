@@ -105,8 +105,13 @@ def _is_permanent_error(status_code: int) -> bool:
 # IndexError/TypeError）在此翻译成人话，raise ... from 保留案发现场。
 def _parse_reply(payload: dict) -> ModelReply:
     """把 API 返回的 JSON 字典解析成 ModelReply；畸形一律 ValueError。"""
-    # token 账单（练习 18）：wire 响应里的 usage 随身带回协议——
-    # final 和 tool_calls 两条 return 都带上，缺了就给空字典。
+    # token 账单（练习 18）：wire 响应里的 usage 随身带回协议，缺了给空
+    # 字典。注意 wire 的 usage 混着嵌套明细（prompt_tokens_details 等是
+    # 字典），而协议约定 usage 是"键 -> 整数"的平表——在边界处清洗，只留
+    # int。第一次真实运行就在记账处炸出 TypeError（0 + {...}）：
+    # 离线测试的盲区（离线模型 usage 为空），真实数据一进门就现形。
+    raw_usage = payload.get("usage") or {}
+    usage = {k: v for k, v in raw_usage.items() if isinstance(v, int)}
     try:
         choices = payload["choices"]
         choice = choices[0]
@@ -123,7 +128,7 @@ def _parse_reply(payload: dict) -> ModelReply:
                 raise ValueError(f"响应畸形：tool_calls 但没有工具调用。原始 message：{message}")
             return ModelReply(
                 kind="tool_calls",
-                usage=payload.get("usage") or {},
+                usage=usage,
                 tool_calls=[
                     ToolCall(
                         call_id=item["id"],
@@ -145,7 +150,7 @@ def _parse_reply(payload: dict) -> ModelReply:
     return ModelReply(
         kind="final",
         text=message.get("content") or "",
-        usage=payload.get("usage") or {},
+        usage=usage,
     )
 
 

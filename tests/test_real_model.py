@@ -153,6 +153,29 @@ class ParseReplyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_reply(bad_args)
 
+    def test_usage_details_are_flattened_to_ints(self) -> None:
+        # 真实 DeepSeek 的 usage 混着嵌套明细字典——协议只收"键 -> 整数"。
+        # 回归：第一次真实运行在记账处炸出 TypeError（0 + {...}）。
+        payload = {
+            "choices": [
+                {"finish_reason": "stop", "message": {"content": "你好"}}
+            ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 0},
+            },
+        }
+
+        reply = _parse_reply(payload)
+
+        self.assertEqual(
+            reply.usage,
+            {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
