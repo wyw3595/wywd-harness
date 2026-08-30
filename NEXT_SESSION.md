@@ -300,14 +300,34 @@ iterdir、stat）。
   不崩；Chainlit 网页里看到 ⚠️ 卡片。
 - 提交：5659d68（含补记的练习 15 笔记）
 
+## 已完成：练习 17 wire 解析防御（2026-08-30，代码由我填，助手收尾）
+
+- _parse_reply(payload) 纯函数哨兵：缺 choices/message、说用工具没给
+  清单、空清单、参数坏 JSON，一律 raise ValueError（消息带原始 payload
+  便于排障，低级异常 raise ... from 翻译）；generate 里裸解析退役，
+  一行 return _parse_reply(response.json())。
+- 重试循环挂第二个 except ValueError：解析失败=暂时性（代理吐 HTML、
+  模型偶发坏参数），同样退避重试，耗尽消息与网络失败区分开。
+  except 顺序知识点：requests 的 JSONDecodeError 同时是 ValueError 和
+  RequestException 的子类，ValueError 分支放前面先匹配，坏 JSON 拿到
+  "解析失败"的准确消息而不是被误报成网络失败。
+- 本课最大教训（验收现场）：_parse_reply 一度漏了 final 分支——普通
+  回答走进不了 tool_calls 的 if，函数静默 return None（没执行到 return
+  就等于 return None），真实聊天每问必挂。33 条老测试抓不到（不 import
+  real_model），TODO 4 一上岗就用 'NoneType' object has no attribute
+  'kind' 钉住它。结论：没被测试看过的代码不算写完；练习 16 的失败出口
+  把崩溃变成体面失败，也把 bug 藏深了——测试是首道防线。
+- 测试：正常 final/tool_calls 往返 + 四条畸形打表（缺 choices /
+  没给清单 / 空清单 / 坏参数；空清单放行会让 agent 空转到 max_steps）。
+- 验收：35 条测试全绿。
+- 提交：PENDING17
+
 ## 当前下一步
 
-练习 17 候选（按优先级）：
-1. wire 解析防御——response.json()["choices"][0] 缺键、json.loads 坏参数
-   现在会裸炸；模型输出是不可信输入，解析处就是信任边界；
-2. requests.Session 连接复用——每轮 generate 都重新 TCP+TLS 握手；
-3. usage（token 用量）接进练习 15 的事件流，成本可观测；
-4. 历史窗口截断/摘要——账单随会话长度线性涨。
+练习 18 候选（练习 17 完成后按序）：
+1. requests.Session 连接复用——每轮 generate 都重新 TCP+TLS 握手；
+2. usage（token 用量）接进练习 15 的事件流，成本可观测；
+3. 历史窗口截断/摘要——账单随会话长度线性涨。
 
 ## 验证命令
 

@@ -6,7 +6,7 @@
 import json
 import unittest
 
-from src.harness.real_model import _is_permanent_error, _to_wire_messages
+from src.harness.real_model import _is_permanent_error, _parse_reply, _to_wire_messages
 from src.harness.tools import Tool, tool_to_schema
 
 
@@ -76,6 +76,82 @@ class PermanentErrorPolicyTests(unittest.TestCase):
         self.assertFalse(_is_permanent_error(429))
         self.assertFalse(_is_permanent_error(500))
         self.assertFalse(_is_permanent_error(200))
+
+
+class ParseReplyTests(unittest.TestCase):
+    """练习 17：wire 解析防御——畸形输入一律 ValueError，不炸穿。"""
+
+    def test_parses_final_and_tool_calls(self) -> None:
+        final = _parse_reply(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "你好"}}]}
+        )
+        self.assertEqual(final.kind, "final")
+        self.assertEqual(final.text, "你好")
+
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {"name": "add", "arguments": '{"a": 2}'},
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        reply = _parse_reply(payload)
+        self.assertEqual(reply.kind, "tool_calls")
+        self.assertEqual(reply.tool_calls[0].call_id, "call_1")
+        self.assertEqual(reply.tool_calls[0].name, "add")
+        # arguments 在协议内已是解析好的字典，直接对比内容。
+        self.assertEqual(reply.tool_calls[0].arguments, {"a": 2})
+
+    def test_malformed_payloads_raise_value_error(self) -> None:
+        # 缺 choices：整体结构就不对。
+        with self.assertRaises(ValueError):
+            _parse_reply({"foo": 1})
+
+        # 说要用工具，却没给清单。
+        no_list = {
+            "choices": [
+                {"finish_reason": "tool_calls", "message": {"content": None}}
+            ]
+        }
+        with self.assertRaises(ValueError):
+            _parse_reply(no_list)
+
+        # 清单是空列表：模型放话要用工具，一条调用都没给——
+        # 放行它，agent 循环就会空转到 max_steps 烧钱。
+        empty_list = {
+            "choices": [
+                {"finish_reason": "tool_calls", "message": {"tool_calls": []}}
+            ]
+        }
+        with self.assertRaises(ValueError):
+            _parse_reply(empty_list)
+
+        # 参数不是合法 JSON。
+        bad_args = {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {"name": "add", "arguments": "{不是json}"},
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        with self.assertRaises(ValueError):
+            _parse_reply(bad_args)
 
 
 if __name__ == "__main__":

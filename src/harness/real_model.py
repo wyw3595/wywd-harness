@@ -99,6 +99,60 @@ def _is_permanent_error(status_code: int) -> bool:
     return False
 
 
+# wire 解析哨兵（练习 17）：网络层交进来的 payload 是不可信输入，任何畸形
+# ——缺 choices/message、说用工具没给清单、空清单、参数坏 JSON——一律
+# raise ValueError，上层当"暂时性失败"退避重试。低级异常（KeyError/
+# IndexError/TypeError）在此翻译成人话，raise ... from 保留案发现场。
+def _parse_reply(payload: dict) -> ModelReply:
+    """把 API 返回的 JSON 字典解析成 ModelReply；畸形一律 ValueError。"""
+    try:
+        choices = payload["choices"]
+        choice = choices[0]
+        message = choice["message"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise ValueError(
+            f"响应畸形：缺少 choices/message 结构。原始 payload：{payload}"
+        ) from error
+
+    if choice.get("finish_reason") == "tool_calls":
+        try:
+            items = message["tool_calls"]
+            if not items:
+                raise ValueError(f"响应畸形：tool_calls 但没有工具调用。原始 message：{message}")
+            return ModelReply(
+                kind="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        call_id=item["id"],
+                        name=item["function"]["name"],
+                        arguments=_parse_tool_arguments(item),
+                    )
+                    for item in items
+                ],
+            )
+
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"响应畸形：说是 tool_calls 却没给可用清单。原始 message：{message}"
+            ) from error
+
+    # 走到这里说明 finish_reason 不是 "tool_calls"（"stop"/"length" 等），
+    # 一律按最终回答处理。这行就是验收抓出的 None bug 的补丁：
+    # 函数没走到 return，就等于 return None。
+    return ModelReply(kind="final", text=message.get("content") or "")
+
+
+def _parse_tool_arguments(item: dict) -> dict:
+    try:
+        return json.loads(item["function"]["arguments"])
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"响应畸形：工具参数不是 JSON。原始 item：{item}"
+        ) from error
+
+
+
+
 class RealModel:
     """调用 DeepSeek /chat/completions 的真实模型，实现 Model 协议。
 
@@ -155,26 +209,23 @@ class RealModel:
                         f"永久性错误，不重试。{response.text}"
                     )
                 response.raise_for_status()
-                choice = response.json()["choices"][0]
-                message = choice["message"]
-
-                if choice["finish_reason"] == "tool_calls":
-                    return ModelReply(
-                        kind="tool_calls",
-                        tool_calls=[
-                            ToolCall(
-                                call_id=item["id"],
-                                name=item["function"]["name"],
-                                arguments=json.loads(item["function"]["arguments"]),
-                            )
-                            for item in message["tool_calls"]
-                        ],
-                    )
-
-                return ModelReply(kind="final", text=message.get("content") or "")
+                # 解析交给哨兵（练习 17）：json() 抛的 JSONDecodeError 也是
+                # ValueError 家族，和 payload 畸形共用同一个 except 分支。
+                return _parse_reply(response.json())
+            except ValueError as error:
+                if attempt == MAX_RETRIES:
+                    raise RuntimeError(f"响应无法解析，已重试 {MAX_RETRIES} 次。") from error
+                time.sleep(2 ** attempt)
 
             except requests.RequestException as error:
                 if attempt == MAX_RETRIES:
                     raise RuntimeError(f"调用 DeepSeek API 失败，已重试 {MAX_RETRIES} 次。") from error
                 time.sleep(2 ** attempt)
+
+
+
+            # TODO 3（练习 17）：再挂一个 except ValueError 分支——解析失败
+            # （坏 JSON / 缺字段 / 坏参数）算"暂时性失败"，走同样的退避重试；
+            # 耗尽后 raise RuntimeError，消息要和网络失败区分开（说清是
+            # "响应无法解析"）。思考：为什么它可重试，401 却不可重试？
 
