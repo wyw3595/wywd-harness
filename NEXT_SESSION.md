@@ -322,12 +322,29 @@ iterdir、stat）。
 - 验收：35 条测试全绿。
 - 提交：2d988c0
 
+## 已完成：练习 18 连接复用 + 成本可观测（2026-08-30，代码由我填，助手补账单循环）
+
+- real_model：__init__ 建 self._session = requests.Session()，generate 改用
+  self._session.post——连接池复用 TCP/TLS，省掉每轮几百毫秒握手；
+  _parse_reply 两条 return 都带 usage=payload.get("usage") or {}。
+- models：ModelReply 加 usage 字段（默认空 dict——协议加字段，旧实现
+  零改动）；main：RunResult 加 usage。
+- agent：totals 跨轮按键求和（totals[k] = totals.get(k, 0) + v），三个
+  出口都带 usage。验收抓出的坑：骨架期 totals 声明和出口传参都写了，
+  但循环里忘了累加——账单永远是 {}，测试一上岗就抓到
+  （{} != {...250...}）。结论同练习 17：链路每一环都要有测试盯着。
+- chat：每问打印"（本问 tokens：输入 X / 输出 Y）"。
+- 可观测三件套收齐：事件（15）/ 轨迹（13）/ 成本（18）。
+- 验收：36 条测试全绿；待真实冒烟：chat 连问两轮，第二轮输入 tokens
+  应明显大于第一轮（历史全量重发，记忆=钱）。
+- 提交：PENDING18
+
 ## 当前下一步
 
-练习 18 候选（练习 17 完成后按序）：
-1. requests.Session 连接复用——每轮 generate 都重新 TCP+TLS 握手；
-2. usage（token 用量）接进练习 15 的事件流，成本可观测；
-3. 历史窗口截断/摘要——账单随会话长度线性涨。
+练习 19 候选（练习 18 完成后按序）：
+1. 历史窗口截断/摘要——练习 10 成本刹车的续集，账单随会话长度线性涨；
+2. 消息结构 TypedDict 化——裸 dict 换类型，练习 05 的 KeyError 类 bug 编译期拦截；
+3. GitHub Actions CI——每次 push 自动跑全量测试。
 
 ## 验证命令
 

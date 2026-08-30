@@ -35,6 +35,10 @@ class ModelReply:
     kind: Literal["final", "tool_calls"]
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # 练习 18：本次 API 调用的 token 用量（wire 响应里的 usage：
+    # prompt_tokens / completion_tokens / total_tokens）。离线模型不产生
+    # 用量，默认空字典——协议加字段，FakeModel / ScriptedModel 零改动。
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 class Model(Protocol):

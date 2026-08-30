@@ -105,6 +105,8 @@ def _is_permanent_error(status_code: int) -> bool:
 # IndexError/TypeError）在此翻译成人话，raise ... from 保留案发现场。
 def _parse_reply(payload: dict) -> ModelReply:
     """把 API 返回的 JSON 字典解析成 ModelReply；畸形一律 ValueError。"""
+    # token 账单（练习 18）：wire 响应里的 usage 随身带回协议——
+    # final 和 tool_calls 两条 return 都带上，缺了就给空字典。
     try:
         choices = payload["choices"]
         choice = choices[0]
@@ -121,6 +123,7 @@ def _parse_reply(payload: dict) -> ModelReply:
                 raise ValueError(f"响应畸形：tool_calls 但没有工具调用。原始 message：{message}")
             return ModelReply(
                 kind="tool_calls",
+                usage=payload.get("usage") or {},
                 tool_calls=[
                     ToolCall(
                         call_id=item["id"],
@@ -139,7 +142,11 @@ def _parse_reply(payload: dict) -> ModelReply:
     # 走到这里说明 finish_reason 不是 "tool_calls"（"stop"/"length" 等），
     # 一律按最终回答处理。这行就是验收抓出的 None bug 的补丁：
     # 函数没走到 return，就等于 return None。
-    return ModelReply(kind="final", text=message.get("content") or "")
+    return ModelReply(
+        kind="final",
+        text=message.get("content") or "",
+        usage=payload.get("usage") or {},
+    )
 
 
 def _parse_tool_arguments(item: dict) -> dict:
@@ -174,6 +181,11 @@ class RealModel:
             )
         self.model = model
 
+        # 连接复用（练习 18）：Session 自带连接池——每次 requests.post 都要
+        # 重新 TCP+TLS 握手（一次几百毫秒），而 Agent 循环"短间隔、多次、
+        # 同一台服务器"，正是复用收益最大的场景。
+        self._session = requests.Session()
+
         # 没传 tools 就是"手无寸铁"的模型；传了说明书它才知道能调用什么。
         self.tools = tools
 
@@ -197,7 +209,7 @@ class RealModel:
         # 家族，这个 raise 会从 except 的网里穿出去——绝不重试。
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = requests.post(
+                response = self._session.post(
                     DEEPSEEK_URL,
                     json=payload,
                     headers=headers,

@@ -91,6 +91,12 @@ def main() -> None:
             print(f"⚠️ {result.output}")
         else:
             print(f"助手> {result.output}\n")
+        # 本问账单（练习 18）：usage 是本次运行跨轮累计的 token 用量。
+        # 连着追问几句，输入 tokens 会随记忆变大——历史全量重发，记忆=钱。
+        print(
+            f"（本问 tokens：输入 {result.usage.get('prompt_tokens', 0)}"
+            f" / 输出 {result.usage.get('completion_tokens', 0)}）"
+        )
 
     print("再见！")
 

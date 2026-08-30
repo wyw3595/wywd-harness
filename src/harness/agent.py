@@ -77,6 +77,10 @@ def run_agent(
 
     step = 0
     last_reply = ""
+    # 跨轮记账（练习 18）：每轮 reply.usage 是"单次 API 调用"的账单，
+    # run_agent 是唯一看全所有轮的地方——在这里按键求和，三个出口
+    # （completed / max_steps / failed）都把 totals 填进 RunResult.usage。
+    totals: dict[str, int] = {}
     if history is not None:
         # 会话记忆：从调用方给的历史"复制"起步——复制是为了
         # 不在调用方的列表上原地追加（共享可变引用，第三次登门）。
@@ -105,7 +109,12 @@ def run_agent(
                 output=f"调用模型失败：{error}",
                 status="failed",
                 messages=messages,
+                usage=totals,
             )
+        # 本轮入账（练习 18）：totals.get(k, 0) 在键第一次出现时给 0，
+        # 省去"是不是第一轮"的特判。离线模型 usage 为空字典，循环空转。
+        for key, value in reply.usage.items():
+            totals[key] = totals.get(key, 0) + value
         emit(
             "model_reply",
             kind=reply.kind,
@@ -122,6 +131,7 @@ def run_agent(
                 output=reply.text,
                 status="completed",
                 messages=messages,
+                usage=totals,
             )
 
         # 工具调用轮：先把调用清单存入历史（这是我们的方言，
@@ -181,6 +191,7 @@ def run_agent(
         output=last_reply,
         status="max_steps",
         messages=messages,
+        usage=totals,
     )
 
 

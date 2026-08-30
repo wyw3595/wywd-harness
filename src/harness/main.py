@@ -39,6 +39,9 @@ class RunResult:
     # 练习 16 起 "failed" 也是合法结局：契约先承认失败，循环才有值可写。
     status: Literal["completed", "max_steps", "failed"] = "completed"
     messages: list[dict] = field(default_factory=list)
+    # 练习 18：本次运行累计的 token 用量（跨轮求和），由 run_agent 填写
+    # ——成本从"听说很贵"变成看得见的数字。
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 def run(task: str, model: Model | None = None) -> RunResult:

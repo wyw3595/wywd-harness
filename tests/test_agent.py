@@ -296,6 +296,40 @@ class AgentEventHookTests(unittest.TestCase):
         self.assertEqual(result.output, "安静完成")
 
 
+class UsageAccumulationTests(unittest.TestCase):
+    """练习 18：token 用量跨轮求和——成本可观测的离线验证。"""
+
+    def test_usage_sums_across_rounds(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            Tool(name="add", description="计算两个整数的和", handler=add)
+        )
+
+        model = ScriptedModel(
+            [
+                ModelReply(
+                    kind="tool_calls",
+                    tool_calls=[ToolCall("call_1", "add", {"a": 2, "b": 3})],
+                    usage={"prompt_tokens": 100, "completion_tokens": 10},
+                ),
+                ModelReply(
+                    kind="final",
+                    text="等于 5",
+                    usage={"prompt_tokens": 150, "completion_tokens": 5},
+                ),
+            ]
+        )
+
+        result = run_agent("加法任务", model=model, registry=registry)
+
+        self.assertEqual(result.status, "completed")
+        # 两轮账单按键求和：100+150、10+5。
+        self.assertEqual(
+            result.usage,
+            {"prompt_tokens": 250, "completion_tokens": 15},
+        )
+
+
 class RunAgentFailureTests(unittest.TestCase):
     """练习 16：失败也是出口——模型层的异常不能炸穿 Harness。"""
 
