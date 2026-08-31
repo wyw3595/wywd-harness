@@ -16,8 +16,9 @@
 
 import json
 
-from scripts.toolbox import build_model, build_registry
+from scripts.toolbox import MAX_HISTORY_MESSAGES, build_model, build_registry
 from src.harness.agent import run_agent
+from src.harness.memory import trim_history
 from src.harness.trace import show_trace
 
 
@@ -77,6 +78,10 @@ def main() -> None:
             print("记忆已清空")
             continue
 
+        # 成本刹车（练习 19）：调 run_agent 之前先把历史瘦到窗口大小。
+        # result.messages 以截断后的历史为前缀，下一问自动延续瘦身的记忆。
+        if history:
+            history = trim_history(history, MAX_HISTORY_MESSAGES)
         result = run_agent(
             task,
             model=model,

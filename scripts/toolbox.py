@@ -7,6 +7,11 @@ from src.harness.file_tools import list_dir, read_file
 from src.harness.real_model import RealModel
 from src.harness.tools import Tool, ToolRegistry, tool_to_schema
 
+# 历史窗口大小（练习 19）：按"条数"计（一条 = 一条消息，一轮工具往返
+# 约占 3 条）。数字越小越省钱、记忆越短——这是取舍题，不是优化题。
+# 记忆策略归应用层（练习 10 铁律），harness 保持中立；两个入口共用。
+MAX_HISTORY_MESSAGES = 20
+
 
 def get_weather(city: str) -> str:
     """查询一个城市今天的天气。"""

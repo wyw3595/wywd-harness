@@ -345,12 +345,53 @@ iterdir、stat）。
   应明显大于第一轮（历史全量重发，记忆=钱）。
 - 提交：aacba84 + 热修 b4f8834
 
+## 已完成：练习 19 历史窗口截断（2026-08-31，由助手写完）
+
+- src/harness/memory.py（新建）：trim_history 纯函数——不超限返回
+  防御性副本 / 超限负切片取最近 N 条 / 配对安全（窗口开头是孤儿 tool
+  消息就丢弃，while 先判空再取 [0]）。负切片的坑：history[-0:] 等价
+  于整个列表（-0 就是 0），max_messages 为 0 必须显式返回空。
+- toolbox：MAX_HISTORY_MESSAGES = 20（取舍常量，两个入口共用）；
+  chat / chainlit：run_agent 之前 if history: history = trim_history(...)
+  ——result.messages 以截断后历史为前缀，下一问自动延续瘦身的记忆
+  （记忆策略归应用层，纯函数进库）。
+- tests/test_memory.py：防御性副本 / 保留最新 / 丢孤儿 tool / 配对完整。
+- 验收：41 条测试全绿；待真实冒烟：chat 连问 5+ 轮，每问输入 tokens
+  应稳定在某个范围（对比练习 18 的线性上涨——刹车生效）。
+- 提交：PENDING20
+
 ## 当前下一步
 
-练习 19 候选（练习 18 完成后按序）：
-1. 历史窗口截断/摘要——练习 10 成本刹车的续集，账单随会话长度线性涨；
-2. 消息结构 TypedDict 化——裸 dict 换类型，练习 05 的 KeyError 类 bug 编译期拦截；
-3. GitHub Actions CI——每次 push 自动跑全量测试。
+方向调整（2026-08-31，用户定：先深入学习工具系统）。调研结论
+（OpenAI Agents SDK / LangChain / PydanticAI / MCP / Anthropic）：
+我们自建的内核（inspect 反射生成 schema + 注册表解耦 + 错误回灌）
+正是各家共同核心，差距集中在四件事——给模型的说明书（参数描述）、
+错误策略可配置、依赖注入、工具协议化。
+
+工具深潜系列（练习 20~25）：
+- 练习 20 · docstring 驱动的 schema：手写简易 Google 风格 docstring
+  解析器（仿 griffe 思路），参数描述自动进 JSON Schema——OpenAI SDK
+  同款机制；
+- 练习 21 · 输入校验 + 错误策略三档：参数先按 schema 校验（类型不对
+  回灌可行动的错误文案——Anthropic 标准），Tool 加 on_error：
+  "backflow"（现状）/ "message"（自定义文案）/ "raise"（快速失败）；
+- 练习 22 · 上下文注入：仿 PydanticAI RunContext——沙箱根从模块级
+  全局改为注入的 ctx，注入参数不进 schema（模型可见面 vs 程序依赖面
+  分离，安全课续集）；
+- 练习 23 · 审批闸门：Tool 加 needs_approval，循环暂停等人工确认
+  （chat y/n、Chainlit 按钮），拒绝回灌"用户否决了这次调用"——
+  MCP 规范 "SHOULD always have human in the loop" 的落地；
+- 练习 24 · MCP 客户端（大件）：stdio 连外部 MCP server，tools/list
+  动态发现 + tools/call 调用 + annotations 风险提示接进审批闸门；
+- 贯穿作业 · 工具设计评审（先做它，成本最低见效最快）：拿 Anthropic
+  《Writing effective tools for agents》的标准过现有 4 个工具——
+  命名空间前缀、描述像 onboarding 文档、返回上下文相关、错误文案
+  可行动。
+
+原排期顺延：TypedDict 消息结构、GitHub Actions CI、摘要压缩（选做）。
+参考（详见会话记录）：Anthropic《Writing effective tools for agents》
+/ OpenAI Agents SDK Tools / LangChain Tools / PydanticAI Dependencies
+/ MCP Tools 规范。
 
 ## 验证命令
 

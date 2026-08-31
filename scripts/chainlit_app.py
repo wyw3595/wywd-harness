@@ -24,8 +24,9 @@ import json
 
 import chainlit as cl
 
-from scripts.toolbox import build_model, build_registry
+from scripts.toolbox import MAX_HISTORY_MESSAGES, build_model, build_registry
 from src.harness.agent import run_agent
+from src.harness.memory import trim_history
 
 
 @cl.on_chat_start
@@ -74,6 +75,10 @@ async def on_message(message: cl.Message) -> None:
                 emit_step(f"✅ 结果（{data['name']}）", str(data["content"])), loop
             )
 
+    # 成本刹车（练习 19）：网页聊得再久，账单也不许线性涨——调 run_agent
+    # 之前先把历史瘦到窗口大小。
+    if history:
+        history = trim_history(history, MAX_HISTORY_MESSAGES)
     # run_agent 是同步的（会阻塞着等 HTTP），扔进线程池跑，界面不卡。
     result = await cl.make_async(run_agent)(
         task, model=model, registry=registry, history=history, on_event=on_event
