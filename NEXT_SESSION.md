@@ -358,7 +358,7 @@ iterdir、stat）。
 - tests/test_memory.py：防御性副本 / 保留最新 / 丢孤儿 tool / 配对完整。
 - 验收：41 条测试全绿；待真实冒烟：chat 连问 5+ 轮，每问输入 tokens
   应稳定在某个范围（对比练习 18 的线性上涨——刹车生效）。
-- 提交：PENDING20
+- 提交：e7eb2b5
 
 ## 当前下一步
 
