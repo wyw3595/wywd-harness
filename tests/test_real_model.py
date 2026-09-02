@@ -153,6 +153,32 @@ class ParseReplyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_reply(bad_args)
 
+    def test_length_finish_marks_truncated(self) -> None:
+        # s01 整合：finish_reason="length" = 输出被 token 预算掐断，
+        # 解析层必须如实标 truncated；"stop" 才是完整结束。
+        truncated = _parse_reply(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "我已经回答到这里"},
+                    }
+                ]
+            }
+        )
+        self.assertEqual(truncated.kind, "final")
+        self.assertEqual(truncated.text, "我已经回答到这里")
+        self.assertTrue(truncated.truncated)
+
+        complete = _parse_reply(
+            {
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": "完整回答"}}
+                ]
+            }
+        )
+        self.assertFalse(complete.truncated)
+
     def test_usage_details_are_flattened_to_ints(self) -> None:
         # 真实 DeepSeek 的 usage 混着嵌套明细字典——协议只收"键 -> 整数"。
         # 回归：第一次真实运行在记账处炸出 TypeError（0 + {...}）。

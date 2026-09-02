@@ -92,8 +92,12 @@ def main() -> None:
         history = result.messages
         # 失败不该和成功长得一样（练习 16）；history 照常更新——
         # 用户的问题已入列，下一问还带着上下文。
+        # s01 整合：截断（答案被 token 预算掐断）也因为 incomplete 而闪黄——
+        # 和失败同理，不能让用户以为这是完整回答。
         if result.status == "failed":
             print(f"⚠️ {result.output}")
+        elif result.status == "truncated":
+            print(f"⚠️ 助手> {result.output}（回答被截断，内容不完整）\n")
         else:
             print(f"助手> {result.output}\n")
         # 本问账单（练习 18）：usage 是本次运行跨轮累计的 token 用量。

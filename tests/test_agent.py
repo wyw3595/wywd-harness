@@ -42,6 +42,21 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.output, "请求调用工具：add")
         self.assertTrue(result.run_id)
 
+    def test_truncated_final_answer_reports_truncated_status(self) -> None:
+        # s01 整合：模型自报 truncated（finish_reason="length" 的映射）时，
+        # 循环不能假装 completed——诚实的状态是 truncated"答案不完整"。
+        model = ScriptedModel(
+            [ModelReply(kind="final", text="回答到一半", truncated=True)]
+        )
+
+        result = run_agent("截断任务", model=model)
+
+        self.assertEqual(result.status, "truncated")
+        # output 保留现有部分文本，不凭空补全。
+        self.assertEqual(result.output, "回答到一半")
+        # 回答仍入历史——下一问带着不完整的上下文继续。
+        self.assertEqual(result.messages[-1]["content"], "回答到一半")
+
     def test_final_answer_on_the_last_allowed_step_still_wins(self) -> None:
         model = ScriptedModel(
             [

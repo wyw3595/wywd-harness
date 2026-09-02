@@ -125,11 +125,16 @@ def run_agent(
         if reply.kind == "final":
             # 每轮发言先入历史——最终回答也留在对话记录里。
             messages.append({"role": "assistant", "content": reply.text})
+            # s01 整合：provider 以 finish_reason="length" 掐断输出时
+            # （reply.truncated），沉默地当成 completed 是骗调用方——
+            # 显式承认"答案不完整"，RunResult 才诚实。一行三元，
+            # 不复制整个 RunResult、不制造两个 look-alike 分支。
+            status = "truncated" if reply.truncated else "completed"
             return RunResult(
                 run_id=str(uuid4()),
                 task=task,
                 output=reply.text,
-                status="completed",
+                status=status,
                 messages=messages,
                 usage=totals,
             )
