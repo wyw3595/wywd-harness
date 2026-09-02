@@ -30,8 +30,10 @@ import requests
 
 from src.harness.models import ModelReply, ToolCall
 
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
+# 生产级整理（2026-09-02）：端点与模型名从环境变量读取，未设置时落回 DeepSeek 默认。
+# 无需改代码即可换到别的 OpenAI 兼容网关（WYWD_API_BASE）或模型档位（WYWD_MODEL）。
+DEEPSEEK_URL = os.environ.get("WYWD_API_BASE") or "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = os.environ.get("WYWD_MODEL") or "deepseek-chat"
 REQUEST_TIMEOUT = 30  # 秒。网络调用必须设超时，否则可能永远卡住。
 MAX_RETRIES = 3
 
@@ -147,10 +149,13 @@ def _parse_reply(payload: dict) -> ModelReply:
     # 走到这里说明 finish_reason 不是 "tool_calls"（"stop"/"length" 等），
     # 一律按最终回答处理。这行就是验收抓出的 None bug 的补丁：
     # 函数没走到 return，就等于 return None。
+    # s01 整合：length = 输出被 token 预算掐断，如实标记 truncated——
+    # stop 是完整结束，length 只是"到这里为止"，两者不能都叫 final。
     return ModelReply(
         kind="final",
         text=message.get("content") or "",
         usage=usage,
+        truncated=(choice.get("finish_reason") == "length"),
     )
 
 

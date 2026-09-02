@@ -88,6 +88,41 @@ class ToolRegistry:
 # 真实框架（pydantic、各家 SDK）都内置了这张表，这里是最小版。
 TYPE_MAP = {int: "integer", float: "number", str: "string", bool: "boolean"}
 
+# Google 风格 docstring 的段名。遇到 Args: 进入参数段；遇到其他段名
+# （如 Returns:）说明参数段结束了。真实框架（griffe）支持 Google /
+# NumPy / Sphinx 三种风格，我们只手写 Google 简化版——机制相同：
+# 找段名、逐行切"名字: 说明"。
+SECTION_HEADERS = {"Args:", "Returns:", "Raises:", "Examples:"}
+
+
+def parse_docstring(doc: str | None) -> dict[str, str]:
+    """从 Google 风格 docstring 的 Args 段解析出 {参数名: 说明}。"""
+
+    descriptions: dict[str, str] = {}
+    if not doc:
+        # 没有 docstring（或空串）就没有说明书——空字典，不炸。
+        return descriptions
+
+    in_args = False
+    for raw_line in doc.splitlines():
+        line = raw_line.strip()
+        if line in SECTION_HEADERS:
+            # 段名行：遇 Args: 进入参数段，遇 Returns: 等退出——
+            # 一行同时处理"进入"和"退出"两种情况。
+            in_args = line == "Args:"
+            continue
+        if not in_args or not line:
+            # 段外散文、空行：跳过。
+            continue
+        head, _, tail = line.partition(":")
+        # isidentifier 守卫：冒号前必须是"合法参数名的形状"，挡住
+        # "注意:xxx" 式散文行（诚实边界：Python 3 中文也算合法标识符，
+        # 守卫不完美，但 Args 段里正常只有参数行，够用）。
+        if head.isidentifier() and tail.strip():
+            descriptions[head] = tail.strip()
+
+    return descriptions
+
 
 def tool_to_schema(tool: Tool) -> dict:
     """把一个 Tool 翻译成 wire 格式的 JSON Schema 说明书。
@@ -102,11 +137,19 @@ def tool_to_schema(tool: Tool) -> dict:
     """
 
     sig = inspect.signature(tool.handler)
+    # 参数说明（练习 20）：docstring 是唯一来源——getdoc 拿到清洗过缩进
+    # 的 docstring，parse_docstring 抽出 {参数名: 说明}；没写说明的参数
+    # 不加 description 键（键不存在比空字符串诚实）。
+    # 工具级 description 不动：Tool.description 是显式配置，优先。
+    param_docs = parse_docstring(inspect.getdoc(tool.handler))
 
     properties: dict[str, dict] = {}
     required: list[str] = []
     for name, param in sig.parameters.items():
-        properties[name] = {"type": TYPE_MAP.get(param.annotation, "string")}
+        prop = {"type": TYPE_MAP.get(param.annotation, "string")}
+        if name in param_docs:
+            prop["description"] = param_docs[name]
+        properties[name] = prop
         if param.default is inspect.Parameter.empty:
             required.append(name)
 

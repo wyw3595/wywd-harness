@@ -1,0 +1,41 @@
+# ============================================================
+# CI：离线测试门禁（生产级整理，2026-09-02）
+# ============================================================
+# 任何 push / PR 都跑一遍全部离线测试，挂了就不许合并。
+# 刻意不装 chainlit：网页入口属于集成测试领域，且会拖慢 CI；
+# 判定"可发布"的唯一门槛是 41+ 条核心测试全绿。
+#
+# 值得一提：pip install -e . --no-deps 这一行不是跑测试所必需
+# （直接从 cwd 也能 import），它是在 CI 上验证 pyproject.toml
+# 的打包配置没有写坏——声明文件只在干净环境里才验得了真身。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # 项目开发机是 Python 3.13.9；矩阵顺带验证对旧版本的兼容。
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 运行时依赖只有 requests 被测试真正 import（chainlit 不碰）。
+      - name: 安装依赖
+        run: pip install requests
+
+      # 校验 pyproject 打包配置合法（见文件头说明）。
+      - name: 校验 pyproject 并注册包
+        run: pip install -e . --no-deps
+
+      - name: 跑全部离线测试
+        run: python -X utf8 -m unittest discover -s tests -v

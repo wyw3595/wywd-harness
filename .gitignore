@@ -18,3 +18,19 @@ trace-*.html
 # Chainlit 网页端的生成物
 .chainlit/
 .files/
+
+# ---------- 以下为生产级整理（2026-09-02）新增 ----------
+
+# 构建产物：pip install / build 后出现，随时可重建
+build/
+dist/
+*.egg-info/
+
+# 覆盖率 / lint / 测试缓存：工具自动生成
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# 编辑器：与 .idea 同类的个人配置
+.vscode/

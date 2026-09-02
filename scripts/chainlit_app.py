@@ -20,8 +20,6 @@ PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import json
-
 import chainlit as cl
 
 from scripts.toolbox import MAX_HISTORY_MESSAGES, build_model, build_registry

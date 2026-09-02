@@ -14,17 +14,32 @@ MAX_HISTORY_MESSAGES = 20
 
 
 def get_weather(city: str) -> str:
-    """查询一个城市今天的天气。"""
+    """查询一个城市今天的天气。
+
+    Args:
+        city: 城市名，中文或拼音均可，如 "北京" 或 "beijing"。
+    """
 
     return f"{city}今天下紫色雪花，气温零下 42 度。"
 
 
 def add(a: int, b: int) -> int:
-    """计算两个整数的和。"""
+    """计算两个整数的和。
+
+    Args:
+        a: 第一个加数，整数。
+        b: 第二个加数，整数。
+    """
 
     return a + b
 
 
+# TODO 3（练习 20）："给模型的说明书"写作作业——给 get_weather / add 的
+# docstring 补 Google 风格 Args 段，每个参数一句话，写清格式和取值。
+# 例：get_weather 的 city → "城市名，中文或拼音均可，如 '北京' 或 'beijing'"。
+# 这些说明会被 parse_docstring 送进 schema，模型第一次知道参数该传什么。
+# file_tools.py 里的 list_dir / read_file 也要写（read_file 的 max_chars
+# 必须说明默认值和截断行为——模型现在完全不知道它是干什么的）。
 ALL_TOOLS: list[Tool] = [
     Tool(
         name="get_weather",

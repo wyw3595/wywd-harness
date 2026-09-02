@@ -1,0 +1,47 @@
+# ============================================================
+# wywd-harness —— 打包与依赖声明（生产级工程骨架）
+# ============================================================
+# 历史补课：本项目此前只有 .venv（靠 cwd 直接 import，无任何声明文件）。
+# 这份文件让"依赖是什么、装什么、测试怎么跑"第一次落了纸。
+#
+# 用法（PowerShell）：
+#   .\.venv\Scripts\python.exe -m pip install -e .       # 开发模式安装
+#   .\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v   # 跑测试
+# 不想安装也能跑：直接从项目根用现有 .venv 运行（src 在 sys.path 之外，
+# 靠 cwd 提供包路径）——本项目两种方式都支持。
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wywd-harness"
+# 语义化版本：0.x 代表还没到稳定 API。
+version = "0.1.0"
+description = "从零实现一个生产级 Python LLM / Agent Harness 的学习项目"
+readme = "README.md"
+requires-python = ">=3.11"
+# 运行时依赖就两个：requests 是 RealModel 的网络层，chainlit 是网页入口。
+# 宽松下限 + 硬上限：锁定"能跑的已知区间"，又不挡小版本升级。
+dependencies = [
+    "requests>=2.31,<3",
+    "chainlit>=1.0,<3",
+]
+
+[project.optional-dependencies]
+# 开发工具不污染运行时依赖。pytest 只作参考（本项目刻意用 unittest），
+# ruff 是 lint 的现代默认（Python 3.13 只支持新版，所以锁 >=0.5）。
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[tool.setuptools.packages.find]
+# src 布局的标准写法：只在 src/ 下找包，避免把 scripts、tests 误当发布内容。
+where = ["src"]
+
+[tool.ruff]
+# 如果以后装 ruff：line-length 对齐现有代码风格（90 列是手写时代的习惯），
+# 只检查 src/ 和 scripts/，tests/ 里的教学式长断言不 lint。
+line-length = 90
+target-version = "py311"

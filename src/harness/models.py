@@ -39,6 +39,11 @@ class ModelReply:
     # prompt_tokens / completion_tokens / total_tokens）。离线模型不产生
     # 用量，默认空字典——协议加字段，FakeModel / ScriptedModel 零改动。
     usage: dict[str, int] = field(default_factory=dict)
+    # s01 整合：provider 以 finish_reason="length" 截断输出时置 True。
+    # learn-workbuddy s01 把 MAX_TOKENS 当成一等终止原因——输出被 token
+    # 预算掐断 ≠ 完成，harness 必须如实告诉调用方"答案不完整"。
+    # 离线模型不截断，默认 False——协议加字段，旧实现零改动。
+    truncated: bool = False
 
 
 class Model(Protocol):

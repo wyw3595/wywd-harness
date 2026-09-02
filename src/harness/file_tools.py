@@ -43,8 +43,15 @@ def _resolve_safe(path_text: str) -> Path:
     return resolved
 
 
+# TODO 3（练习 20）：给 list_dir / read_file 的 docstring 补 Google 风格
+# Args 段——path 一句、max_chars 一句（说明默认值和截断行为）。
+# tool_to_schema 会把它们送进 schema：这是模型第一次知道 max_chars
+# 是干什么的，不用再靠猜。
 def list_dir(path: str = ".") -> str:
     """列出沙箱内一个目录的内容，标记目录/文件和大小。
+
+    Args:
+        path: 相对项目根的路径，"." 表示项目根目录。
 
     返回格式示例：
         harness/  (目录)
@@ -62,7 +69,12 @@ def list_dir(path: str = ".") -> str:
 
 
 def read_file(path: str, max_chars: int = 2000) -> str:
-    """读取沙箱内的文本文件；超长截断，超大文件直接拒绝。"""
+    """读取沙箱内的文本文件；超长截断，超大文件直接拒绝。
+
+    Args:
+        path: 相对项目根的文件路径。
+        max_chars: 最多返回的字符数，默认 2000；超出部分截断并附原长说明。
+    """
 
     resolved = _resolve_safe(path)
     if resolved.stat().st_size > 1_000_000:
