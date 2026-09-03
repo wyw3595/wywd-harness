@@ -22,7 +22,12 @@ if PROJECT_ROOT not in sys.path:
 
 import chainlit as cl
 
-from scripts.toolbox import MAX_HISTORY_MESSAGES, build_model, build_registry
+from scripts.toolbox import (
+    MAX_HISTORY_MESSAGES,
+    build_model,
+    build_registry,
+    build_system_prompt,
+)
 from src.harness.agent import run_agent
 from src.harness.memory import trim_history
 
@@ -77,6 +82,12 @@ async def on_message(message: cl.Message) -> None:
     # 之前先把历史瘦到窗口大小。
     if history:
         history = trim_history(history, MAX_HISTORY_MESSAGES)
+    # 目录常驻：system 提示（含延迟工具目录）每次调到最前，幂等。
+    system_message = {"role": "system", "content": build_system_prompt()}
+    if not history:
+        history = [system_message]
+    elif history[0].get("role") != "system":
+        history = [system_message] + history
     # run_agent 是同步的（会阻塞着等 HTTP），扔进线程池跑，界面不卡。
     result = await cl.make_async(run_agent)(
         task, model=model, registry=registry, history=history, on_event=on_event

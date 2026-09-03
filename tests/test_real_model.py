@@ -64,6 +64,17 @@ class ToWireMessagesTests(unittest.TestCase):
         self.assertEqual(wire[0], messages[0])
         self.assertEqual(wire[1], messages[1])
 
+    def test_system_message_passes_through(self) -> None:
+        """s03 目录注入：system 消息（含延迟工具目录）由应用层塞进
+        history 最前，wire 翻译必须原样放行——OpenAI 兼容协议认
+        role="system"（给模型的全局设定）。"""
+        system = {"role": "system", "content": "当前可用的延迟工具：…"}
+
+        wire = _to_wire_messages([{**system}, {"role": "user", "content": "hi"}])
+
+        self.assertEqual(wire[0], system)
+        self.assertEqual(wire[1]["role"], "user")
+
 
 class PermanentErrorPolicyTests(unittest.TestCase):
     """练习 16：重试策略打表——不发网络，纯函数直接问。"""

@@ -65,6 +65,16 @@ def _render_message(message: dict) -> str:
 
     role = message["role"]
 
+    # 系统提示：会话开局注入的工具目录。低调小卡片，标灰信息
+    # （s03 的目录是常驻工件，不该和用户对话同权重）。
+    if role == "system":
+        return (
+            '<div class="card" style="background:#f0f0f2;border:1px solid #ddd;">'
+            '<span class="role-tag">系统提示（工具目录）</span>'
+            f'{_escape(message["content"])}'
+            "</div>"
+        )
+
     if role == "user":
         return (
             '<div class="bubble user">'
