@@ -3,7 +3,13 @@
 import inspect
 import unittest
 
-from src.harness.tools import Tool, ToolRegistry, parse_docstring, tool_to_schema
+from src.harness.tools import (
+    Tool,
+    ToolRegistry,
+    parse_docstring,
+    tool_to_schema,
+    validate_arguments,
+)
 
 
 def add(a: int, b: int) -> int:
@@ -128,3 +134,71 @@ class DocstringSchemaTests(unittest.TestCase):
 
         props = schema["function"]["parameters"]["properties"]
         self.assertNotIn("description", props["city"])
+
+
+class ValidateArgumentsTests(unittest.TestCase):
+    """练习 22-b（s02 核心课）：执行前参数校验——schema 也是本地执行契约。"""
+
+    @staticmethod
+    def make_schema(properties: dict, required: list[str]) -> dict:
+        return {"type": "object", "properties": properties, "required": required}
+
+    def test_missing_required_argument(self) -> None:
+        schema = self.make_schema({"path": {"type": "string"}}, ["path"])
+
+        self.assertEqual(validate_arguments(schema, {}), "缺少必填参数：path")
+
+    def test_unknown_argument_is_rejected(self) -> None:
+        # 反射 schema 没有 additionalProperties: false——properties 之外
+        # 的键都是模型拼错的参数，执行前拦下。
+        schema = self.make_schema({"path": {"type": "string"}}, ["path"])
+
+        self.assertEqual(
+            validate_arguments(schema, {"path": "a", "extra": 1}),
+            "多余参数：extra",
+        )
+
+    def test_wrong_value_type(self) -> None:
+        schema = self.make_schema({"path": {"type": "string"}}, ["path"])
+
+        self.assertEqual(validate_arguments(schema, {"path": 123}), "参数 'path' 必须是 string")
+
+    def test_bool_is_not_integer(self) -> None:
+        # s02 同款坑：Python 的 bool 是 int 的子类，isinstance(True, int)
+        # 为真——但 JSON 参数里的 true 不该通过 integer 校验。
+        schema = self.make_schema({"n": {"type": "integer"}}, ["n"])
+
+        self.assertEqual(validate_arguments(schema, {"n": True}), "参数 'n' 必须是 integer")
+
+    def test_non_object_arguments_rejected(self) -> None:
+        # 空 schema 不定义参数，但参数本身必须是对象（JSON Schema 的
+        # object 前提）。None / 字符串都不是。
+        schema = self.make_schema({}, [])
+
+        self.assertEqual(validate_arguments(schema, None), "参数必须是对象")
+
+    def test_valid_arguments_pass_cleanly(self) -> None:
+        schema = self.make_schema(
+            {"path": {"type": "string"}, "limit": {"type": "integer"}},
+            ["path"],
+        )
+
+        # 可选参数 limit 不传合法；传了也合法。
+        self.assertIsNone(validate_arguments(schema, {"path": "src"}))
+        self.assertIsNone(validate_arguments(schema, {"path": "src", "limit": 3}))
+
+    def test_registry_validate_uses_reflected_schema(self) -> None:
+        # 校验用的 schema 与发给模型的说明书出自同一个 tool_to_schema——
+        # add(a: int, b: int) 反射出的 required = ["a", "b"]，同一份契约。
+        registry = ToolRegistry()
+        registry.register(Tool(name="add", description="加法", handler=add))
+
+        self.assertIsNone(registry.validate("add", {"a": 1, "b": 2}))
+        self.assertEqual(registry.validate("add", {"a": 1}), "缺少必填参数：b")
+        # 只多传、不缺参，才单独命中"多余参数"分支（缺参检查优先）。
+        self.assertEqual(
+            registry.validate("add", {"a": 1, "b": 2, "a1": 3}),
+            "多余参数：a1",
+        )
+        # 未知工具不在这层报错：返回 None，交给 execute 的 KeyError 路径。
+        self.assertIsNone(registry.validate("missing", {}))

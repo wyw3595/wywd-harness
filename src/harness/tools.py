@@ -83,6 +83,26 @@ class ToolRegistry:
 
         return list(self._tools)
 
+    def validate(self, name: str, arguments: dict) -> str | None:
+        """执行前校验模型传来的参数；非法返回可行动文案，合法返回 None。
+
+        s02 核心课（练习 22-b）：schema 不只发给模型当说明书，也在本地
+        执行前当校验契约——模型"看过" schema 不等于会传对，缺字段、
+        类型错、拼错的参数都要在执行前拦住，并回灌一句模型能据此修正
+        的文案。校验用的 schema 和 real_model 下发的是同一个
+        tool_to_schema 反射出来的——同一份契约，不存在两份会漂移的副本。
+
+        工具不存在时返回 None：让调用方走既有"未知工具"错误路径
+        （execute 抛 KeyError，循环捕获回灌），语义保持清晰。
+        """
+
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+
+        parameters = tool_to_schema(tool)["function"]["parameters"]
+        return validate_arguments(parameters, arguments)
+
 
 # Python 类型标注 -> JSON Schema 类型的映射表。
 # 真实框架（pydantic、各家 SDK）都内置了这张表，这里是最小版。
@@ -165,3 +185,57 @@ def tool_to_schema(tool: Tool) -> dict:
             },
         },
     }
+
+
+def validate_arguments(parameters: dict, raw: object) -> str | None:
+    """执行前校验模型传来的参数；非法返回可行动文案，合法返回 None。
+
+    s02 核心课（练习 22-b）：json 里 model 看到的是什么契约，本地执行前
+    就按什么校验——缺必填、类型错、多传（拼错）的参数都要在执行前
+    拦住，回灌"缺了什么、哪里不对"，而不是让 handler 的 ** 展开把
+    模糊的 TypeError 冒出来。parameters 是 tool_to_schema 产出的
+    "parameters" 那段（type / properties / required）。
+    """
+
+    if not isinstance(raw, dict):
+        return "参数必须是对象"
+
+    properties = parameters.get("properties", {})
+    required = parameters.get("required", [])
+
+    missing = [name for name in required if name not in raw]
+    if missing:
+        return "缺少必填参数：" + "、".join(missing)
+
+    # 反射 schema 没有 additionalProperties: false——properties 里印出来的
+    # 就是全部合法键，多出来的只能是模型拼错的参数，执行前同样拦下。
+    unknown = sorted(set(raw) - set(properties))
+    if unknown:
+        return "多余参数：" + "、".join(unknown)
+
+    # 类型反向映射：JSON Schema 类型 -> Python 类型集合。
+    json_types: dict[str, tuple[type, ...]] = {
+        "integer": (int,),
+        "number": (int, float),
+        "string": (str,),
+        "boolean": (bool,),
+        "array": (list,),
+        "object": (dict,),
+    }
+    for name, value in raw.items():
+        rule = properties.get(name)
+        if not isinstance(rule, dict):
+            continue
+        expected = rule.get("type")
+        accepted = json_types.get(expected)
+        if not accepted:
+            continue
+        # s02 同款坑：Python 的 bool 是 int 的子类，isinstance(True, int)
+        # 为真——但 JSON 参数里的 true 不该通过 integer / number 校验。
+        is_bool_in_number_like = (
+            expected in {"integer", "number"} and isinstance(value, bool)
+        )
+        if not isinstance(value, accepted) or is_bool_in_number_like:
+            return f"参数 {name!r} 必须是 {expected}"
+
+    return None

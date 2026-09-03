@@ -164,8 +164,17 @@ def run_agent(
                 arguments=call.arguments,
             )
             try:
-                tool_output = registry.execute(call.name, **call.arguments)
-                content = f"工具 {call.name} 返回：{tool_output}"
+                # s02 核心课（练习 22-b）：校验先行——模型"看过" schema
+                # 不等于会传对。缺参数 / 类型错 / 拼错键都在执行前拦住，
+                # 回灌可行动文案（invalid_arguments）；只有校验通过才进
+                # handler，那里再出错才是执行错误（execution_error）。
+                # 两类错误原因不同，回灌的信息因此不同。
+                validation_error = registry.validate(call.name, call.arguments)
+                if validation_error:
+                    content = f"工具 {call.name} 参数无效：{validation_error}"
+                else:
+                    tool_output = registry.execute(call.name, **call.arguments)
+                    content = f"工具 {call.name} 返回：{tool_output}"
             except Exception as error:
                 # 错误也是信息：回灌给模型让它自己决定下一步，
                 # 一次工具失败绝不拖垮同轮的其他调用。

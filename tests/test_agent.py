@@ -147,6 +147,39 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(tool_messages[0]["tool_call_id"], "call_a")
         self.assertEqual(tool_messages[1]["tool_call_id"], "call_b")
 
+    def test_invalid_arguments_are_rejected_before_handler(self) -> None:
+        # 练习 22-b（s02 核心课）：模型"看过" schema 不等于会传对——
+        # 缺参数的工具调用要执行前拦下、回灌可行动文案，
+        # handler 一次都不许真的执行。
+        calls: list[int] = []
+
+        def spy(a: int, b: int) -> str:
+            calls.append(a)
+            return str(a + b)
+
+        self.registry.register(
+            Tool(name="spy", description="记录调用次数", handler=spy)
+        )
+        model = ScriptedModel(
+            [
+                ModelReply(
+                    kind="tool_calls",
+                    tool_calls=[ToolCall("call_1", "spy", {})],
+                ),
+                ModelReply(kind="final", text="参数不对，我换一种做法"),
+            ]
+        )
+
+        result = run_agent("缺参任务", model=model, registry=self.registry)
+
+        # handler 没被调用；回灌的是"参数无效"而非 ** 展开的 TypeError。
+        self.assertEqual(calls, [])
+        self.assertEqual(result.output, "参数不对，我换一种做法")
+        self.assertIn(
+            "参数无效：缺少必填参数：a、b",
+            model.received_inputs[1][-1]["content"],
+        )
+
 
 class AgentHistoryTests(unittest.TestCase):
     """对话历史直接以消息列表传给模型（不再渲染成文本）。"""
