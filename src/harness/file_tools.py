@@ -1,11 +1,14 @@
-"""实战文件工具：让 Agent 能"看见"项目目录（只读 + 沙箱）。
+"""实战文件工具：让 Agent 能"看见"也能"修改"项目（沙箱 + 审批）。
 
 📚 安全设计（本课的灵魂，写代码前先读完）
-  能力 = 风险。四道闸门缺一不可：
-  1. 只读：没有写/删/执行工具——最小权限原则；
+  能力 = 风险。五道闸门缺一不可：
+  1. 默认只读：list_dir / read_file / find_text / tree_dir 全程不改状态；
+     唯一的写工具 write_file 在权限层被 path.write_ask 规则拦成 ASK——
+     界内写也必须人点头（练习 s04 审批闸门），本模块只管"被放行之后
+     怎么安全地写"；
   2. 沙箱：所有路径必须落在 ALLOWED_ROOT 内，越界抛 PermissionError；
-  3. 限额：read_file 有 max_chars 截断，超大文件直接拒绝——
-     防止把上下文窗口和账单撑爆；
+  3. 限额：read_file 有 max_chars 截断，read/write 对超大内容直接
+     拒绝——防止把上下文窗口、账单和磁盘撑爆；
   4. 拒绝不崩溃：违规一律走"抛异常 -> 循环捕获 -> 错误回灌"的老路，
      模型会自己道歉并换路径（练习 04 建好的机制开始收利息）。
   5. 禁区（练习 16）：界内也有皇冠珠宝——.env 里的密钥、.git 里的
@@ -83,3 +86,29 @@ def read_file(path: str, max_chars: int = 2000) -> str:
     if len(text) > max_chars:
         return text[:max_chars] + f"……（已截断，原文件共 {len(text)} 字符）"
     return text
+
+
+# 写入限额（练习 s04）：读有 max_chars，写也要有。危险点不同——读撑的是
+# 上下文，写改的是状态；这里限的是"一次工具调用能改多少状态"。
+MAX_WRITE_CHARS = 20_000
+
+
+def write_file(path: str, text: str) -> str:
+    """写入或覆盖沙箱内的文本文件；唯一改状态的工具，必须过人工审批。
+
+    Args:
+        path: 相对项目根的目标文件路径；父目录必须已存在，不会自动创建。
+        text: 要写入的完整文本——整文件覆盖，不是追加。
+
+    沙箱和禁区由 _resolve_safe 把关（与读工具同一套机制）；超过
+    MAX_WRITE_CHARS 直接拒绝。审批闸门在权限层（permissions.py 的
+    path.write_ask 规则），执行到这里意味着人或规则已经放行。
+    """
+
+    resolved = _resolve_safe(path)
+    if len(text) > MAX_WRITE_CHARS:
+        raise ValueError(
+            f"写入内容过长（{len(text)} 字符，上限 {MAX_WRITE_CHARS}），拒绝写入"
+        )
+    resolved.write_text(text, encoding="utf-8")
+    return f"已写入 {path}（{len(text)} 字符）"

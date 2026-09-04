@@ -34,6 +34,7 @@ from uuid import uuid4
 
 from src.harness.main import RunResult
 from src.harness.models import FakeModel, Model, ModelReply, ScriptedModel, ToolCall
+from src.harness.permissions import GovernedToolRunner, ToolRequest
 from src.harness.tools import Tool, ToolRegistry
 
 
@@ -44,6 +45,7 @@ def run_agent(
     max_steps: int = 5,
     history: list[dict] | None = None,
     on_event: Callable[[str, dict], None] | None = None,
+    runner: GovernedToolRunner | None = None,
 ) -> RunResult:
     """驱动模型最多 max_steps 轮，直到它给出最终回答。
 
@@ -172,6 +174,20 @@ def run_agent(
                 validation_error = registry.validate(call.name, call.arguments)
                 if validation_error:
                     content = f"工具 {call.name} 参数无效：{validation_error}"
+                elif runner is not None:
+                    # s04 整合：给了 runner 就过权限闸口。ToolRequest
+                    # 承载 provider 的 tool block；Runner 内部 decide →
+                    # approve → execute，BLOCKED 不碰 handler。三态结局
+                    # 统一由 to_protocol_block 编码——Error 前缀只有
+                    # 这一个真源，循环不再自己拼拦截文案。
+                    result = runner.run(
+                        ToolRequest(
+                            tool_use_id=call.call_id,
+                            name=call.name,
+                            arguments=call.arguments,
+                        )
+                    )
+                    content = f"工具 {call.name} 返回：{result.to_protocol_block()}"
                 else:
                     tool_output = registry.execute(call.name, **call.arguments)
                     content = f"工具 {call.name} 返回：{tool_output}"

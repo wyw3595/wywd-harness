@@ -14,7 +14,12 @@
   tree_dir —— 目录树（低频、长 schema，正好当延迟加载的演示对象）。
 """
 
-from src.harness.file_tools import list_dir, read_file
+from src.harness.file_tools import ALLOWED_ROOT, list_dir, read_file, write_file
+from src.harness.permissions import (
+    PermissionPolicy,
+    WorkspaceScope,
+    build_default_policy,
+)
 from src.harness.real_model import RealModel
 from src.harness.std_tools import calc, find_text, tree_dir
 from src.harness.tools import Tool, ToolRegistry
@@ -69,6 +74,12 @@ ALL_TOOLS: list[Tool] = [
         handler=read_file,
     ),
     Tool(
+        name="write_file",
+        description="写入或覆盖项目里某个文本文件（path 相对项目根，整文件覆盖；"
+        "需用户审批后才会真正执行）",
+        handler=write_file,
+    ),
+    Tool(
         name="calc",
         description="安全计算数学表达式，如 (1 + 2) * 3 或 sqrt(16) * 2",
         handler=calc,
@@ -90,6 +101,30 @@ DEFERRED_TOOLS: list[Tool] = [
         defer=True,
     ),
 ]
+
+# 免审批白名单（练习 s04）：只读 / 沙箱内的工具显式放行。write_file
+# 刻意不在名单里——它由 path.write_ask 规则拦成 ASK，执行前必须人点头。
+# 新工具默认 default.deny：必须有人把它加进某条规则才算"有了治理路径"。
+# 注意：策略看见的是桥接工具 ToolSearch / DeferExecuteTool 本身，不是
+# 延迟工具 tree_dir——延迟加载把执行藏在桥后面，策略管不到穿透后的
+# 那一层（已知边界：tree_dir 只读 + 沙箱内，风险可接受）。
+SAFE_TOOLS: frozenset[str] = frozenset({
+    "get_weather", "add", "list_dir", "read_file",
+    "calc", "find_text", "ToolSearch", "DeferExecuteTool",
+})
+
+
+def build_policy() -> PermissionPolicy:
+    """装配本项目工具箱的权限策略：默认规则 + 沙箱作用域 + 白名单。
+
+    scope 用的就是文件工具的 ALLOWED_ROOT——决策层（执行前预判）和
+    执行层（handler 里的 _resolve_safe）认同一个沙箱根，两层不说两家话。
+    """
+
+    return build_default_policy(
+        scope=WorkspaceScope(ALLOWED_ROOT),
+        safe_tools=sorted(SAFE_TOOLS),
+    )
 
 
 def build_system_prompt() -> str:

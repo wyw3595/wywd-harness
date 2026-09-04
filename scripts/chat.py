@@ -19,12 +19,30 @@ import json
 from scripts.toolbox import (
     MAX_HISTORY_MESSAGES,
     build_model,
+    build_policy,
     build_registry,
     build_system_prompt,
 )
 from src.harness.agent import run_agent
 from src.harness.memory import trim_history
+from src.harness.permissions import (
+    AuditTrail,
+    GovernedToolRunner,
+    PermissionDecision,
+)
 from src.harness.trace import show_trace
+
+
+def cli_approver(decision: PermissionDecision) -> bool:
+    """终端审批员（练习 s04）：把待审请求亮出来，等用户敲 y/n。
+
+    只有 ASK 分支会调到这里——ALLOW/DENY 不惊动人；返回 False 时
+    循环回灌"被权限拦截"，模型会换路径或向用户解释。
+    """
+
+    print(f"  ⚠️ 需要审批 [{decision.rule_id}] {decision.reason}")
+    answer = input("     允许这次工具调用吗？(y/n) ").strip().lower()
+    return answer == "y"
 
 
 def _with_system(history: list[dict] | None) -> list[dict]:
@@ -91,6 +109,15 @@ def _format_tools(tools: list[dict] | None) -> str:
 def main() -> None:
     registry = build_registry()
     model = build_model()
+    # 权限闸门（练习 s04）：每次工具调用先过 runner——决策 -> 审批 ->
+    # 执行，全部调用记账进审计轨迹。审批员是终端 y/n（chainlit 的
+    # 按钮审批是另一个入口另一套 UI，不共用显示代码）。
+    runner = GovernedToolRunner(
+        policy=build_policy(),
+        approver=cli_approver,
+        registry=registry,
+        audit=AuditTrail(),
+    )
 
     def on_event(event: str, data: dict) -> None:
         """实时播报循环事件——过程不再黑盒。"""
@@ -180,6 +207,7 @@ def main() -> None:
             registry=registry,
             history=history,
             on_event=on_event,
+            runner=runner,
         )
         history = result.messages
         # 失败不该和成功长得一样（练习 16）；history 照常更新——
