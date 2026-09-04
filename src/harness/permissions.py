@@ -160,12 +160,15 @@ class WorkspaceScope:
       a) ../outside/secret.txt  相对路径穿越
       b) /etc/hosts             绝对外部路径
       c) link/new.txt           符号链接指向工作区外
+    以及界内禁区(s04 追加):路径任一段撞上 forbidden_parts(如 .env/.git)
+    同样拒绝——沙箱管"有没有越界",禁区管"界内哪些不能碰"。
     resolve(strict=False):目标尚不存在也允许解析(要写入的文件还没
     创建),同时解开已存在的父级符号链接。
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, forbidden_parts: Sequence[str] = ()) -> None:
         self._root = root.resolve()  # 归一化成绝对路径,防止 root 自身带 ".."
+        self._forbidden = frozenset(forbidden_parts)
 
     def resolve(self, path_text: str) -> Path:
         """把相对/绝对文本解析成受保护的绝对路径;越界抛 PermissionError。"""
@@ -174,6 +177,23 @@ class WorkspaceScope:
         if not resolved.is_relative_to(self._root):
             raise PermissionError(f"路径越出工作区:{path_text}")
         return resolved
+
+    def has_forbidden_part(self, path_text: str) -> bool:
+        """解析后任一路径段撞上禁区 -> True(与 file_tools._resolve_safe 同款判定)。
+
+        越界不归这里管:has_forbidden_part 只回答"界内是否撞禁区",越界返回
+        False 交给排在前面的 outside 规则。判定沿 file_tools:查整条动线而
+        不只查终点——read_file(".git/config") 撞禁区的是路径中段的 .git。
+        """
+
+        if not self._forbidden:
+            return False
+        try:
+            resolved = self.resolve(path_text)
+        except PermissionError:
+            return False  # 越界:那是 outside 规则的管辖范围
+        relative = resolved.relative_to(self._root)
+        return any(part in self._forbidden for part in relative.parts)
 
 
 # ----------------------------------------------------------------------
@@ -193,14 +213,16 @@ def resolve_permission(
 
     if decision.action is PermissionAction.ALLOW:
         return PermissionResolution(decision, True, "not_required")
-    elif decision.action is PermissionAction.DENY:
+    if decision.action is PermissionAction.DENY:
         return PermissionResolution(decision, False, "not_required")
-    else:  # ASK —— 只有这里才请老板
+    if decision.action is PermissionAction.ASK:
         approved = approver(decision)
         return PermissionResolution(
             decision, approved,
             "approved" if approved else "rejected",
         )
+    # 未知动作:显式炸,而不是静默当 ASK——枚举再扩展时不踩"悄悄放行"。
+    raise AssertionError(f"未知权限动作:{decision.action!r}")
 
 
 # ----------------------------------------------------------------------
@@ -210,17 +232,27 @@ def resolve_permission(
 def build_default_policy(
     scope: WorkspaceScope | None = None,
     safe_tools: Sequence[str] = (),
+    read_tools: Sequence[str] = ("read_file", "list_dir"),
+    write_tools: Sequence[str] = ("write_file",),
 ) -> PermissionPolicy:
     """装配一套默认规则(顺序不可乱)。
 
     顺序 = 安全语义:
       1. bash.hard_deny(危险命令)  -> DENY
       2. path.outside_workspace    -> DENY(先于读写规则!)
-      3. path.read_allow           -> ALLOW(只读工具 + 界内,显式放行)
-      4. path.write_ask            -> ASK(写工具 + 界内:改状态必须问人)
-      5. bash.requires_approval    -> ASK
-      6. tool.allow_safe(可选)     -> ALLOW(免审批白名单,见 safe_tools)
-      7. default.deny              -> 由 decide 兜底,无需显式规则
+      3. path.forbidden_zone       -> DENY(界内禁区,同越界一样不可覆盖)
+      4. path.read_allow           -> ALLOW(只读工具 + 界内,显式放行)
+      5. path.write_ask            -> ASK(写工具 + 界内:改状态必须问人)
+      6. bash.requires_approval    -> ASK
+      7. tool.allow_safe(可选)     -> ALLOW(免审批白名单,见 safe_tools)
+      8. default.deny              -> 由 decide 兜底,无需显式规则
+
+    read_tools / write_tools 由装配层(toolbox.py)声明本项目的读写工具
+    集合,permissions 只提供通用框架——新增写工具不改这里,改装配层
+    一处即可(去重:写/读集合不再散在多处硬编码)。默认值保证"不带任何
+    参数"也能跑出 fail-closed 的教学默认。禁区由 scope.forbidden_parts
+    表达(WorkspaceScope 持有),界内撞禁区和越界一样是 DENY——权限层
+    预判在先,执行层 file_tools._resolve_safe 兜底在后,两层同一语义。
 
     safe_tools 是免审批白名单:只读/沙箱内工具的名字集合。不在名单里
     的新工具没有任何规则管它 -> default.deny,必须有人显式写规则才算
@@ -229,6 +261,9 @@ def build_default_policy(
     """
 
     DANGEROUS = {"sudo", "rm", "reboot", "shutdown", "dd"}
+    read_set = frozenset(read_tools)
+    write_set = frozenset(write_tools)
+    path_tools = read_set | write_set
 
     def command_text(request: ToolRequest) -> str:
         """提取命令原文给 explain 用(matches 已保证形状,这里只防御)。"""
@@ -248,6 +283,14 @@ def build_default_policy(
                 return path
         return "<路径不可读>"
 
+    def path_arg(request: ToolRequest) -> str | None:
+        """路径工具的参数形状:path 必须是字符串,否则 None(交给 default.deny)。"""
+
+        if not isinstance(request.arguments, dict):
+            return None
+        path = request.arguments.get("path")
+        return path if isinstance(path, str) else None
+
     def is_hard_deny(request: ToolRequest) -> bool:
         if request.name != "bash":
             return False
@@ -259,14 +302,12 @@ def build_default_policy(
         return command.strip().split()[0] in DANGEROUS
 
     def is_outside(request: ToolRequest) -> bool:
-        if scope is None:
+        """越界:路径工具 + 参数里的 path 解析后跑出工作区。"""
+
+        if scope is None or request.name not in path_tools:
             return False
-        if request.name not in {"read_file", "write_file", "list_dir"}:
-            return False
-        if not isinstance(request.arguments, dict):
-            return False
-        path = request.arguments.get("path")
-        if not isinstance(path, str):
+        path = path_arg(request)
+        if path is None:
             return False
         try:
             scope.resolve(path)  # 没抛 = 在界内
@@ -274,20 +315,23 @@ def build_default_policy(
             return True  # 越界,命中
         return False
 
-    # 只读路径工具白名单:界内读操作显式放行(教材 path.read_allow)。
-    READ_TOOLS = {"read_file", "list_dir"}
+    def is_forbidden(request: ToolRequest) -> bool:
+        """界内禁区:路径工具 + 参数里的 path 撞上 scope 的禁区段。"""
+
+        if scope is None or request.name not in path_tools:
+            return False
+        path = path_arg(request)
+        if path is None:
+            return False
+        return scope.has_forbidden_part(path)
 
     def is_read_inside(request: ToolRequest) -> bool:
         """命中的条件:只读工具 + 参数里的 path 能通过 scope(界内)。"""
 
-        if scope is None:
+        if scope is None or request.name not in read_set:
             return False
-        if request.name not in READ_TOOLS:
-            return False
-        if not isinstance(request.arguments, dict):
-            return False
-        path = request.arguments.get("path")
-        if not isinstance(path, str):
+        path = path_arg(request)
+        if path is None:
             return False
         try:
             scope.resolve(path)  # 能解析 = 在界内
@@ -295,20 +339,15 @@ def build_default_policy(
             return False  # 越界 -> 不命中 read_allow(留给 outside 规则 DENY)
         return True
 
-    # 写路径工具(s04 整合):界内写 -> ASK。这是 Harness 里唯一的改状态
-    # 能力;"越界写"在这里返回 False,交给排在前面的 outside 规则硬拒,
-    # 轮不到审批——顺序即安全语义。
-    WRITE_TOOLS = {"write_file"}
-
     def is_write_inside(request: ToolRequest) -> bool:
-        if scope is None:
+        """写路径工具(装配层声明):界内写 -> ASK。这是 Harness 里唯一的
+        改状态能力;"越界写"在这里返回 False,交给排在前面的 outside 规则
+        硬拒,轮不到审批——顺序即安全语义。"""
+
+        if scope is None or request.name not in write_set:
             return False
-        if request.name not in WRITE_TOOLS:
-            return False
-        if not isinstance(request.arguments, dict):
-            return False
-        path = request.arguments.get("path")
-        if not isinstance(path, str):
+        path = path_arg(request)
+        if path is None:
             return False
         try:
             scope.resolve(path)
@@ -329,6 +368,10 @@ def build_default_policy(
         PermissionRule(
             "path.outside_workspace", PermissionAction.DENY, is_outside,
             lambda r: f"路径 {path_text(r)!r} 越出工作区,拒绝",
+        ),
+        PermissionRule(
+            "path.forbidden_zone", PermissionAction.DENY, is_forbidden,
+            lambda r: f"路径 {path_text(r)!r} 撞上禁区,拒绝",
         ),
         PermissionRule(
             "path.read_allow", PermissionAction.ALLOW, is_read_inside,
@@ -446,30 +489,22 @@ class GovernedToolRunner:
     def run(self, request: ToolRequest) -> ToolExecutionResult:
         """一条固定的治理流水线(顺序不可换):
 
-          1. 审计预检:request
+          1. 审计 request(带 call_id 便于按调用关联三笔账)
           2. policy.decide -> PermissionDecision
           3. resolve_permission -> PermissionResolution(ASK 才请老板)
-          4. 审计:permission(带 rule/outcome)
+          4. 审计 permission(带 rule/outcome)
           5. 被拦(allowed=False):审计 result(BLOCKED)+ 返回,不碰 handler
-          6. 放行:参数不是 dict -> 直接 BLOCKED(无法安全判断=拦,
-                    理论到不了:policy 已 fail-closed,这里是双保险)
-                    调 registry.execute(name, **dict(args))
-                    成功 -> SUCCEEDED;异常 -> FAILED
-          7. 审计 result(带 status)
-
-        TODO 3 (你写):
-          按上面的顺序编排,用 self._policy/self._approver/self._registry
-          和 request。每步先想清楚"这一步产出什么变量,下一步消费它"。
-          提示:
-            - decision = self._policy.decide(request)
-            - resolution = resolve_permission(decision, self._approver)
-            - 执行用 self._registry.execute(request.name, **arguments)
-              (registry None 时执行不可用,一律 FAILED 带说明)
-            - 一律返回 ToolExecutionResult(request, status, 文案)
+          6. 放行:registry 缺失 -> FAILED;参数不是 dict -> BLOCKED;
+             调 registry.execute 成功 -> SUCCEEDED,异常 -> FAILED
+          7. 每个出口都记 result 审计——"记满三笔"不只对被拦有效,
+             FAILED / 参数毒 BLOCKED 同样是决策轨迹,不能从复盘里消失
         """
 
         # ① 审计预检
-        self._log("request", tool=request.name, args=request.arguments)
+        self._log(
+            "request", tool=request.name,
+            call_id=request.tool_use_id, args=request.arguments,
+        )
         # ② 决策 -> ③ 决议(ASK 才请老板)
         decision = self._policy.decide(request)
         resolution = resolve_permission(decision, self._approver)
@@ -477,24 +512,39 @@ class GovernedToolRunner:
         self._log(
             "permission",
             tool=request.name,
+            call_id=request.tool_use_id,
             rule=decision.rule_id,
             outcome=resolution.approval_status,
         )
         # ⑤ 被拦:不碰 handler,审计也要记
         if not resolution.allowed:
-            self._log("result", tool=request.name, status="blocked")
+            self._log(
+                "result", tool=request.name,
+                call_id=request.tool_use_id, status="blocked",
+            )
             return ToolExecutionResult(
                 request,
                 ToolExecutionStatus.BLOCKED,
                 f"{decision.rule_id}: {decision.reason}",
             )
-        # ⑥ 放行执行:registry 缺失 / 参数毒 / handler 异常,三个兜底
+        # ⑥ 放行执行:registry 缺失 / 参数毒 / handler 异常,三个兜底。
+        #    每个出口都记 result 审计(带 error 归因)。
         if self._registry is None:
+            self._log(
+                "result", tool=request.name,
+                call_id=request.tool_use_id, status="failed",
+                error="runner 没有绑定 registry",
+            )
             return ToolExecutionResult(
                 request, ToolExecutionStatus.FAILED,
                 "runner 没有绑定 registry,无法执行工具",
             )
         if not isinstance(request.arguments, dict):
+            self._log(
+                "result", tool=request.name,
+                call_id=request.tool_use_id, status="blocked",
+                error="arguments 不是对象",
+            )
             return ToolExecutionResult(
                 request, ToolExecutionStatus.BLOCKED,
                 "arguments 不是对象,无法安全执行",
@@ -504,29 +554,19 @@ class GovernedToolRunner:
                 request.name, **dict(request.arguments)
             )
         except Exception as exc:
+            self._log(
+                "result", tool=request.name,
+                call_id=request.tool_use_id, status="failed",
+                error=str(exc),
+            )
             return ToolExecutionResult(
                 request, ToolExecutionStatus.FAILED, str(exc)
             )
         # ⑦ 审计 + 成功返回
-        self._log("result", tool=request.name, status="succeeded")
+        self._log(
+            "result", tool=request.name,
+            call_id=request.tool_use_id, status="succeeded",
+        )
         return ToolExecutionResult(
             request, ToolExecutionStatus.SUCCEEDED, str(content)
         )
-        
-        
-      
-      
-        
-
-        
-
-
-
-
-
-
-
-
-
-
-  

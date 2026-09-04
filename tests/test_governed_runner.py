@@ -183,6 +183,74 @@ class RunnerExecuteTests(unittest.TestCase):
         self.assertIn("execution_error", result.to_protocol_block())
 
 
+class RunnerAuditCompletenessTests(unittest.TestCase):
+    """每个出口都记满三笔账——FAILED / 参数毒 BLOCKED 不许从复盘里消失。"""
+
+    def setUp(self) -> None:
+        self.audit = AuditTrail()
+        self.registry = ToolRegistry()
+        self.registry.register(
+            Tool(name="add", description="加法", handler=lambda a, b: a + b)
+        )
+        self.runner = GovernedToolRunner(
+            policy=PermissionPolicy([
+                PermissionRule(
+                    "everything", PermissionAction.ALLOW,
+                    lambda request: request.name == "add",
+                    explain=lambda request: "安全",
+                ),
+            ]),
+            approver=lambda decision: True,
+            registry=self.registry,
+            audit=self.audit,
+        )
+
+    def test_handler_exception_fully_audited(self) -> None:
+        """handler 抛异常 -> FAILED,result 审计也在(带 error 归因)。"""
+
+        def boom(a: int, b: int) -> int:
+            raise ZeroDivisionError("boom")
+
+        registry = ToolRegistry()
+        registry.register(Tool(name="add", description="加法", handler=boom))
+        runner = GovernedToolRunner(
+            policy=PermissionPolicy([
+                PermissionRule(
+                    "ok", PermissionAction.ALLOW,
+                    lambda r: r.name == "add", explain=lambda r: "ok",
+                ),
+            ]),
+            approver=lambda decision: True,
+            registry=registry,
+            audit=self.audit,
+        )
+        result = runner.run(req("add", {"a": 1, "b": 0}, rid="c1"))
+        self.assertIs(result.status, ToolExecutionStatus.FAILED)
+        results = self.audit.by_kind("result")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertIn("boom", results[0]["error"])
+
+    def test_poison_arguments_fully_audited(self) -> None:
+        """参数不是 dict -> BLOCKED,result 审计也在(带 error 归因)。"""
+
+        result = self.runner.run(req("add", "not a dict", rid="c2"))
+        self.assertIs(result.status, ToolExecutionStatus.BLOCKED)
+        results = self.audit.by_kind("result")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "blocked")
+        self.assertIn("不是对象", results[0]["error"])
+
+    def test_call_id_links_all_three_records(self) -> None:
+        """三笔账都带同一个 call_id——按调用可完整复盘多轮里的每次调用。"""
+
+        self.runner.run(req("add", {"a": 1, "b": 2}, rid="trace-1"))
+        for kind in ("request", "permission", "result"):
+            records = self.audit.by_kind(kind)
+            self.assertEqual(len(records), 1, kind)
+            self.assertEqual(records[0]["call_id"], "trace-1", kind)
+
+
 class AgentLoopIntegrationTests(unittest.TestCase):
     """s04 整合:agent loop 把 runner 的 BLOCKED 结果回灌给模型。"""
 

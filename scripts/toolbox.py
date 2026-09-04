@@ -14,7 +14,7 @@
   tree_dir —— 目录树（低频、长 schema，正好当延迟加载的演示对象）。
 """
 
-from src.harness.file_tools import ALLOWED_ROOT, list_dir, read_file, write_file
+from src.harness.file_tools import ALLOWED_ROOT, FORBIDDEN_PARTS, list_dir, read_file, write_file
 from src.harness.permissions import (
     PermissionPolicy,
     WorkspaceScope,
@@ -113,17 +113,27 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     "calc", "find_text", "ToolSearch", "DeferExecuteTool",
 })
 
+# 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions
+# 只提供通用规则框架。新增写工具只改这里一处（加进 WRITE_TOOLS 并确认
+# 不在 SAFE_TOOLS 里），build_policy 会把集合喂给 build_default_policy。
+READ_TOOLS: frozenset[str] = frozenset({"read_file", "list_dir"})
+WRITE_TOOLS: frozenset[str] = frozenset({"write_file"})
+
 
 def build_policy() -> PermissionPolicy:
     """装配本项目工具箱的权限策略：默认规则 + 沙箱作用域 + 白名单。
 
     scope 用的就是文件工具的 ALLOWED_ROOT——决策层（执行前预判）和
     执行层（handler 里的 _resolve_safe）认同一个沙箱根，两层不说两家话。
+    forbidden_parts 同样来自 file_tools 的事实源（.env/.git），决策层
+    在 DENY 阶段就拦下禁区，不再等到执行层才炸（s04 补的错位）。
     """
 
     return build_default_policy(
-        scope=WorkspaceScope(ALLOWED_ROOT),
+        scope=WorkspaceScope(ALLOWED_ROOT, forbidden_parts=FORBIDDEN_PARTS),
         safe_tools=sorted(SAFE_TOOLS),
+        read_tools=sorted(READ_TOOLS),
+        write_tools=sorted(WRITE_TOOLS),
     )
 
 

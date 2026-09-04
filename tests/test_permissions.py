@@ -244,6 +244,72 @@ class WriteAskPolicyTests(unittest.TestCase):
         self.assertEqual(result.rule_id, "default.deny")
 
 
+class WorkspaceForbiddenTests(unittest.TestCase):
+    """禁区段判定(s04 追加):与 file_tools._resolve_safe 同款——查整条动线。"""
+
+    def setUp(self) -> None:
+        self.scope = WorkspaceScope(Path("/workspace"), forbidden_parts={".env", ".git"})
+
+    def test_deep_forbidden_part_detected(self) -> None:
+        """路径中段撞禁区也算——.git/config 撞的是 .git 那段,不是终点名。"""
+
+        self.assertTrue(self.scope.has_forbidden_part(".git/config"))
+
+    def test_clean_inside_not_forbidden(self) -> None:
+        """界内普通路径不撞禁区。"""
+
+        self.assertFalse(self.scope.has_forbidden_part("src/main.py"))
+
+    def test_escape_is_not_forbidden(self) -> None:
+        """越界不算禁区:那是 outside 规则的管辖范围,这里只答"界内禁区吗"。"""
+
+        self.assertFalse(self.scope.has_forbidden_part("../outside.txt"))
+
+    def test_no_forbidden_configured(self) -> None:
+        """没配禁区的 scope 永远 False——不凭空拦截。"""
+
+        plain = WorkspaceScope(Path("/workspace"))
+        self.assertFalse(plain.has_forbidden_part(".git/config"))
+
+
+class ForbiddenZonePolicyTests(unittest.TestCase):
+    """path.forbidden_zone:界内禁区在权限层就 DENY,轮不到 read/write 规则。"""
+
+    def setUp(self) -> None:
+        self.policy = build_default_policy(
+            scope=WorkspaceScope(Path("/workspace"), forbidden_parts={".env", ".git"}),
+        )
+
+    def test_read_forbidden_is_denied_not_allowed(self) -> None:
+        """读禁区:不再被 read_allow 放行——DENY 且拒绝理由带目标路径。"""
+
+        result = self.policy.decide(req("read_file", {"path": ".env/secret"}))
+        self.assertIs(result.action, PermissionAction.DENY)
+        self.assertEqual(result.rule_id, "path.forbidden_zone")
+        self.assertIn(".env/secret", result.reason)
+
+    def test_write_forbidden_is_denied_not_ask(self) -> None:
+        """写禁区:不升级成 ASK——改 .git 没得商量,直接 DENY。"""
+
+        result = self.policy.decide(req("write_file", {"path": ".git/config"}))
+        self.assertIs(result.action, PermissionAction.DENY)
+        self.assertEqual(result.rule_id, "path.forbidden_zone")
+
+    def test_forbidden_zone_beats_read_allow(self) -> None:
+        """顺序:禁区规则排在 read_allow 之前,界内禁区漏不进免审批白名单。"""
+
+        result = self.policy.decide(req("list_dir", {"path": ".git"}))
+        self.assertIs(result.action, PermissionAction.DENY)
+        self.assertEqual(result.rule_id, "path.forbidden_zone")
+
+    def test_clean_path_unchanged(self) -> None:
+        """没撞禁区的正常读,照旧 read_allow——禁区只拦禁区。"""
+
+        result = self.policy.decide(req("read_file", {"path": "src/main.py"}))
+        self.assertIs(result.action, PermissionAction.ALLOW)
+        self.assertEqual(result.rule_id, "path.read_allow")
+
+
 class SafeToolsPolicyTests(unittest.TestCase):
     """tool.allow_safe:显式白名单免审批;名单外依旧 default.deny。"""
 
