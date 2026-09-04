@@ -517,6 +517,7 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # 冒烟前设置
 
 ## 已完成：s04\_permission\_hooks 分级信任 + 审批闸门（2026-09-04，由助手写完）
 
+- 提交：21f2f8a。
 - 环境热修：项目搬家后 .venv 丢失，用 uv 重建；learn-workbuddy/ 加入
   .gitignore（第三方教材，只读参考不进仓库）。
 
