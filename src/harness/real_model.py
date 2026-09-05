@@ -244,10 +244,3 @@ class RealModel:
                     raise RuntimeError(f"调用 DeepSeek API 失败，已重试 {MAX_RETRIES} 次。") from error
                 time.sleep(2 ** attempt)
 
-
-
-            # TODO 3（练习 17）：再挂一个 except ValueError 分支——解析失败
-            # （坏 JSON / 缺字段 / 坏参数）算"暂时性失败"，走同样的退避重试；
-            # 耗尽后 raise RuntimeError，消息要和网络失败区分开（说清是
-            # "响应无法解析"）。思考：为什么它可重试，401 却不可重试？
-

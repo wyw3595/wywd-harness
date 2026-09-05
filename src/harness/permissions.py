@@ -238,7 +238,7 @@ def build_default_policy(
     """装配一套默认规则(顺序不可乱)。
 
     顺序 = 安全语义:
-      1. bash.hard_deny(危险命令)  -> DENY
+      1. bash.hard_deny(危险命令)    -> DENY
       2. path.outside_workspace    -> DENY(先于读写规则!)
       3. path.forbidden_zone       -> DENY(界内禁区,同越界一样不可覆盖)
       4. path.read_allow           -> ALLOW(只读工具 + 界内,显式放行)

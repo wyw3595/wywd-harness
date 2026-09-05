@@ -46,10 +46,6 @@ def _resolve_safe(path_text: str) -> Path:
     return resolved
 
 
-# TODO 3（练习 20）：给 list_dir / read_file 的 docstring 补 Google 风格
-# Args 段——path 一句、max_chars 一句（说明默认值和截断行为）。
-# tool_to_schema 会把它们送进 schema：这是模型第一次知道 max_chars
-# 是干什么的，不用再靠猜。
 def list_dir(path: str = ".") -> str:
     """列出沙箱内一个目录的内容，标记目录/文件和大小。
 
