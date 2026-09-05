@@ -568,3 +568,42 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # 冒烟前设置
 - 下一步候选（由用户定）：① s05\_electron\_shell（契约顺位，桌面
   壳，重）；② Chainlit 按钮审批（把 s04 的网页入口补齐，轻）；
   ③ 工具设计评审贯穿作业（拿 Anthropic 标准过全部 9 个工具）。
+
+## 已完成：s04-b Chainlit 按钮审批（2026-09-05，由助手写完）
+
+- 缺口修复（本课真正的动因）：网页入口调 run\_agent 一直没传 runner——
+  完全绕过 s04 闸门，write\_file 会直接执行（只剩执行层沙箱兜底）。
+  本次接上 GovernedToolRunner，网页和终端从此过同一道闸门。
+
+- 只改 scripts/chainlit\_app.py，permissions.py / agent.py / toolbox.py
+  一行未动——approver 注入铁律的红利现场：CLI input() / 网页按钮 /
+  测试 lambda，三入口同一治理内核。
+
+- 接线三件套：
+  - on\_chat\_start 存 policy + audit（会话级工件，每个聊天页一份，
+    互不串账）；审批员不在这造——它必须闭包住 on\_message 的事件循环；
+  - ask\_approval 协程：cl.AskActionMessage 画"✅ 允许 / ⛔ 拒绝"卡片。
+    chainlit 2.12 的 API 事实（读源码确认）：Action(name, payload, label)
+    ——payload 必填；send() 返回 TypedDict（含 name/label），超时返回
+    None。判定 bool(response and response.get("name") == "approve")：
+    不回应即拒绝，fail-closed；
+  - web\_approver 同步闭包：run\_coroutine\_threadsafe +
+    Future.result()——与练习 15 的 emit\_step 同一座桥、相反用法
+    （播报 fire-and-forget，审批必须拿回程票）；except Exception
+    一律 False：桥断/等待超时都当拒绝，审批路径永远 fail-closed。
+
+- 环境坑（排障实录）：端口 8000 被练习 14 时代（8/29）的旧 chainlit
+  进程占着，新服务器绑定失败退出、旧进程照常答 HTTP 200——测的是
+  旧代码。排障法：Get-NetTCPConnection -LocalPort 8000 拿 PID →
+  Stop-Process，再重启。
+
+- 验收：141 条测试全绿（未碰 harness，此层按约定不配单测）；浏览器
+  实测 10/10——请求写 hello.txt → 审批卡弹出（path.write\_ask +
+  理由）→ 点"⛔ 拒绝"后模型收到 permission\_blocked 回灌并向用户
+  解释；重试 → 点"✅ 允许" → 模型报告创建成功；磁盘验证 hello.txt
+  内容"审批通过的紫色雪花"一字不差（验证后已清理）。卡片点完后
+  自动显示"Selected: ..."是 chainlit 内建反馈。
+
+- 下一步候选（由用户定）：① s05\_electron\_shell（契约顺位，重）；
+  ② s06\_sidecar\_server（教材顺位）；③ 工具设计评审贯穿作业
+  （Anthropic 标准过全部工具，轻、见效快）。
