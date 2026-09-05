@@ -1,7 +1,8 @@
-"""标准工具集：让 Agent 能算、能搜、能看树（全部只读 + 沙箱内）。
+"""标准工具集：让 Agent 能看时间、能算、能搜、能看树（全部只读 + 沙箱内）。
 
-往这里加"通用能力"工具：calc（安全数学）、find_text（项目内搜索）、
-tree_dir（目录树）。回归测试对应 tests/test_std_tools.py。
+往这里加"通用能力"工具：now（当前时间）、calc（安全数学）、
+find_text（项目内搜索）、tree_dir（目录树）。回归测试对应
+tests/test_std_tools.py。
 
 安全原则沿袭 file_tools.py（能力 = 风险）：
   - calc：ast 白名单求值，不允许任何变量/属性/文件访问；
@@ -14,9 +15,22 @@ import math
 import operator
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 from src.harness.file_tools import ALLOWED_ROOT, FORBIDDEN_PARTS, _resolve_safe
+
+
+def now() -> str:
+    """返回当前本地日期与时间，如 "2026-09-05 14:30"。
+
+    Agent 的上下文里没有时钟——模型不知道"今天几号"，这个工具就是
+    它的表。返回人类可读文本而非时间戳：模型能直接读懂、直接引用，
+    不用先解析（"返回有意义上下文，给 agent 能直接行动的信息"的样板）。
+    零状态纯函数，免审批。
+    """
+
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def calc(expression: str) -> str:

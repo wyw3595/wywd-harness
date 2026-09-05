@@ -1,8 +1,28 @@
 """标准工具集 + 工具箱装配的回归测试（std_tools 全离线，不碰模型）。"""
 
 import unittest
+from datetime import datetime
 
-from src.harness.std_tools import calc, find_text, tree_dir
+from src.harness.std_tools import calc, find_text, now, tree_dir
+
+
+class NowTests(unittest.TestCase):
+    """时钟工具：返回可解析的本地日期时间，且和真实时钟同拍。"""
+
+    def test_now_returns_parseable_local_datetime(self) -> None:
+        """格式是 YYYY-MM-DD HH:MM，能被 strptime 解析——模型能直接用。"""
+
+        parsed = datetime.strptime(now(), "%Y-%m-%d %H:%M")
+        # 解析出的时间距离真实时钟不超过 1 小时：格式对 + 数值对。
+        delta = abs((datetime.now() - parsed).total_seconds())
+        self.assertLess(delta, 3600)
+
+    def test_now_minute_precision_does_not_drop_date(self) -> None:
+        """返回里同时有日期和时刻，不只是几点——模型要知道"今天几号"。"""
+
+        result = now()
+        self.assertRegex(result, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertIn(str(datetime.now().year), result)
 
 
 class CalcTests(unittest.TestCase):

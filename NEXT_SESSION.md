@@ -218,8 +218,9 @@ run() → Model 协议（generate(messages) -> ModelReply）→ ToolRegistry + J
 
 - 首次提交 `a94607f`：18 个文件、1466 行，即前 10 节课的全部成果。
 
-- **从现在起的工作节奏**：改代码 → 跑测试 → `git add -A && git commit -m "..."` 小步提交。
-  每完成一节练习都应该有一次提交，提交信息写清"做了什么"。
+- **工作节奏（2026-09-05 修订）**：改代码 → 跑测试 → 停下，等用户自己提交。
+  **助手绝不主动执行 git add / git commit**——提交权和提交信息都归用户，
+  哪怕一节练习做完了也不提交，最多提醒一句"可以提交了"。
 
 ## 进行中：练习 12 实战文件工具 + 沙箱安全（骨架已建，等我填代码）
 
@@ -518,40 +519,47 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # 冒烟前设置
 ## 已完成：s04\_permission\_hooks 分级信任 + 审批闸门（2026-09-04，由助手写完）
 
 - 提交：21f2f8a。
+
 - 环境热修：项目搬家后 .venv 丢失，用 uv 重建；learn-workbuddy/ 加入
   .gitignore（第三方教材，只读参考不进仓库）。
 
 - permissions.py（工作区里原有的 A 批决策层 + B 批执行层，本次收尾）：
+
   - **PermissionRule 升级为 matches + explain 双调用子**（对齐教材）：
     matches 判命中，explain 只在命中后被调、从请求里提取证据拼人话
     理由——拒绝必须有据可查（测试钉死：理由里要出现 "sudo"）。
     evaluate() 命中返回 PermissionDecision、不命中返回 None，
     decide() first-match-wins + default.deny 兜底；
+
   - 新增 **path.write\_ask** 规则：界内写 -> ASK。排在 outside DENY
     之后——越界写硬拒、界内写才轮到审批（顺序即安全语义）；
+
   - build\_default\_policy 新增 safe\_tools 参数：末尾追加
     tool.allow\_safe 白名单规则；名单外的新工具依旧 default.deny
     （fail-closed 的落点：新工具必须显式配规则才有治理路径）。
 
 - **write\_file**（file\_tools.py，Harness 里唯一改状态的工具）：
+
   - 复用 \_resolve\_safe 沙箱（越界/禁区同一套闸门）+
     MAX\_WRITE\_CHARS = 20000 内容限额；父目录不自动创建
     （FileNotFoundError 走错误回灌）；整文件覆盖，不是追加；
+
   - 分层分工：审批闸门在权限层（write\_ask），工具本体只管
     "被放行之后怎么安全地写"；
 
 - toolbox：SAFE\_TOOLS 免审批白名单（8 个只读/沙箱内工具，write\_file
-  刻意不在内）+ build\_policy()（WorkspaceScope(ALLOWED_ROOT)——决策层
+  刻意不在内）+ build\_policy()（WorkspaceScope(ALLOWED\_ROOT)——决策层
   预判和执行层 \_resolve\_safe 认同一个沙箱根，两层不说两家话）。
   已知边界：策略看见的是桥接工具 ToolSearch/DeferExecuteTool，穿透后
   的延迟工具（tree\_dir）管不到——它只读+沙箱内，风险可接受；
 
 - agent.py：runner 分支统一改用 result.to\_protocol\_block()——
-  "Error [xxx]:" 前缀只有这一个真源，循环不再自己拼拦截文案；
+  "Error \[xxx]:" 前缀只有这一个真源，循环不再自己拼拦截文案；
 
 - chat.py：GovernedToolRunner 接入（build\_policy + cli\_approver y/n
-  + AuditTrail），run\_agent 传 runner。只有 ASK 分支会调审批员；
-  chainlit 的按钮审批是另一个入口另一套 UI（待做）；
+
+  - AuditTrail），run\_agent 传 runner。只有 ASK 分支会调审批员；
+    chainlit 的按钮审批是另一个入口另一套 UI（待做）；
 
 - 已知边界：write\_file(".env") 会先 ASK（scope 只管边界不管禁区），
   批准后执行层 \_resolve\_safe 硬拦、错误回灌——多问一次但绝不放行。
@@ -580,13 +588,16 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # 冒烟前设置
   测试 lambda，三入口同一治理内核。
 
 - 接线三件套：
+
   - on\_chat\_start 存 policy + audit（会话级工件，每个聊天页一份，
     互不串账）；审批员不在这造——它必须闭包住 on\_message 的事件循环；
+
   - ask\_approval 协程：cl.AskActionMessage 画"✅ 允许 / ⛔ 拒绝"卡片。
     chainlit 2.12 的 API 事实（读源码确认）：Action(name, payload, label)
     ——payload 必填；send() 返回 TypedDict（含 name/label），超时返回
     None。判定 bool(response and response.get("name") == "approve")：
     不回应即拒绝，fail-closed；
+
   - web\_approver 同步闭包：run\_coroutine\_threadsafe +
     Future.result()——与练习 15 的 emit\_step 同一座桥、相反用法
     （播报 fire-and-forget，审批必须拿回程票）；except Exception
@@ -607,3 +618,56 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # 冒烟前设置
 - 下一步候选（由用户定）：① s05\_electron\_shell（契约顺位，重）；
   ② s06\_sidecar\_server（教材顺位）；③ 工具设计评审贯穿作业
   （Anthropic 标准过全部工具，轻、见效快）。
+
+## 已完成：工具设计评审 + 命名重构（2026-09-05，用户三选全做）
+
+- 评审标准：Anthropic《Writing effective tools for agents》五原则
+  ——选对工具 / 命名空间 / 返回有意义上下文 / token 效率 / 描述工程。
+  全文 + 社区拆解见会话记录；10 个工具逐一过矩阵，整体偏上
+  （描述带路径约定/示例/副作用、返回可行动、token 限额齐），
+  真正的问题只有 3 个：
+
+1. **add 与 calc 重叠**（Anthropic "similar tools" 陷阱——模型会
+   选错）。calc 是 add 的超集 → **删除 add 工具**（函数一并删）；
+2. **文件工具缺命名空间前缀**（Anthropic 建议 jira\_search 式域前缀）
+   → 四个工具改名：`list_dir→fs_list`、`read_file→fs_read`、
+   `write_file→fs_write`、`find_text→fs\_find`（handler 函数名不动）；
+3. **get\_weather 假数据 = 主动欺骗**（原则③"返回有意义上下文"）
+   → 不接真 API（教学冒烟靠"紫色雪花"当真伪判别），改为**标注模拟
+   数据**：docstring + 发给模型的 description 都写明"演示用模拟数据，
+   不代表真实天气"——模型知道是假的，才不会拿它当真去回答用户。
+
+- 连带改动：
+
+  - toolbox.py：ALL\_TOOLS 删 add、四个 name 字段改名、get\_weather
+    description 标注；SAFE\_TOOLS（删 "add"、改名）、READ\_TOOLS
+    {"fs\_read","fs\_list"}、WRITE\_TOOLS {"fs\_write"}；
+
+  - permissions.py：build\_default\_policy 默认 read/write 集合同步
+    fs\_ 名（教学默认跟着真实命名走），文档示例同步；
+
+  - tests/test\_permissions.py：请求工具名连带更新（走默认策略的
+    请求名 = 默认集合名，一处不跟就 default.deny）。
+
+- **排障实录（重要教训）**：并行发 3 个 Edit 改同一个文件发生写竞态
+  ——只有最后一个 write\_file→fs\_write 替换落盘，list\_dir/read\_file
+  两个"成功返回"但内容被覆盖丢失，跑出 5 个 default.deny 失败。
+  → 改同一文件必须串行编辑，别并行。
+
+- 验收：143 条测试全绿。三个遗留候选不变（s05\_electron\_shell /
+  s06\_sidecar\_server / 更多工具评审），由用户定。
+
+### 追加：新增 now 时钟工具（2026-09-05）
+
+- 动机：Agent 上下文里没有时钟——模型不知道"今天几号"，这是所有
+  Agent 的共同短板（用户从候选工具里只选了 now）。
+
+- 实现：std\_tools.now() 一行 datetime.now().strftime("%Y-%m-%d %H:%M")，
+  零状态纯函数；返回人类可读文本而非时间戳（"有意义上下文"样板）；
+  toolbox 注册进 ALL\_TOOLS + SAFE\_TOOLS（免审批）。
+
+- 测试：+2（strptime 可解析且与真实时钟偏差 <1h / 格式含日期不是只几点）。
+
+- 验收：143 条全绿；冒烟 decide("now") -> tool.allow\_safe ALLOW、
+  注册表含 now、execute 返回真实时间。
+

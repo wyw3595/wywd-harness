@@ -28,7 +28,7 @@ from scripts.toolbox import (
     build_model,
     build_policy,
     build_registry,
-    build_system_prompt,
+    with_system,
 )
 from src.harness.agent import run_agent
 from src.harness.memory import trim_history
@@ -145,11 +145,8 @@ async def on_message(message: cl.Message) -> None:
     if history:
         history = trim_history(history, MAX_HISTORY_MESSAGES)
     # 目录常驻：system 提示（含延迟工具目录）每次调到最前，幂等。
-    system_message = {"role": "system", "content": build_system_prompt()}
-    if not history:
-        history = [system_message]
-    elif history[0].get("role") != "system":
-        history = [system_message] + history
+    # with_system 是 toolbox 的公共件（chat / chainlit / electron 三入口共用）。
+    history = with_system(history)
     # run_agent 是同步的（会阻塞着等 HTTP），扔进线程池跑，界面不卡。
     # runner 就位后，网页和终端过的是同一道闸门：decide -> 审批 -> 执行。
     result = await cl.make_async(run_agent)(

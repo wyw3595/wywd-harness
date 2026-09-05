@@ -183,7 +183,7 @@ class WorkspaceScope:
 
         越界不归这里管:has_forbidden_part 只回答"界内是否撞禁区",越界返回
         False 交给排在前面的 outside 规则。判定沿 file_tools:查整条动线而
-        不只查终点——read_file(".git/config") 撞禁区的是路径中段的 .git。
+        不只查终点——fs_read(".git/config") 撞禁区的是路径中段的 .git。
         """
 
         if not self._forbidden:
@@ -232,8 +232,8 @@ def resolve_permission(
 def build_default_policy(
     scope: WorkspaceScope | None = None,
     safe_tools: Sequence[str] = (),
-    read_tools: Sequence[str] = ("read_file", "list_dir"),
-    write_tools: Sequence[str] = ("write_file",),
+    read_tools: Sequence[str] = ("fs_read", "fs_list"),
+    write_tools: Sequence[str] = ("fs_write",),
 ) -> PermissionPolicy:
     """装配一套默认规则(顺序不可乱)。
 

@@ -189,21 +189,21 @@ class ReadAllowPolicyTests(unittest.TestCase):
     def test_read_inside_is_allowed(self) -> None:
         """界内的只读工具请求命中 read_allow,而不是被 default.deny。"""
 
-        result = self.policy.decide(req("list_dir", {"path": "src"}))
+        result = self.policy.decide(req("fs_list", {"path": "src"}))
         self.assertIs(result.action, PermissionAction.ALLOW)
         self.assertEqual(result.rule_id, "path.read_allow")
 
     def test_read_escape_still_denied(self) -> None:
         """越界的只读请求走 outside 规则 DENY,轮不到 read_allow。"""
 
-        result = self.policy.decide(req("read_file", {"path": "../../etc/passwd"}))
+        result = self.policy.decide(req("fs_read", {"path": "../../etc/passwd"}))
         self.assertIs(result.action, PermissionAction.DENY)
         self.assertEqual(result.rule_id, "path.outside_workspace")
 
     def test_no_scope_fails_closed(self) -> None:
         """没挂 scope 的 policy:read_allow 不启用 -> default.deny。"""
 
-        result = build_default_policy().decide(req("list_dir", {"path": "src"}))
+        result = build_default_policy().decide(req("fs_list", {"path": "src"}))
         self.assertIs(result.action, PermissionAction.DENY)
         self.assertEqual(result.rule_id, "default.deny")
 
@@ -217,20 +217,20 @@ class WriteAskPolicyTests(unittest.TestCase):
     def test_write_inside_is_ask(self) -> None:
         """界内写文件命中 write_ask——改状态必须人点头,不是 ALLOW。"""
 
-        result = self.policy.decide(req("write_file", {"path": "notes/todo.txt"}))
+        result = self.policy.decide(req("fs_write", {"path": "notes/todo.txt"}))
         self.assertIs(result.action, PermissionAction.ASK)
         self.assertEqual(result.rule_id, "path.write_ask")
 
     def test_write_ask_reason_carries_path(self) -> None:
         """ASK 理由带着目标路径——审批人要看证据再点头(explain 的本职)。"""
 
-        result = self.policy.decide(req("write_file", {"path": "notes/todo.txt"}))
+        result = self.policy.decide(req("fs_write", {"path": "notes/todo.txt"}))
         self.assertIn("notes/todo.txt", result.reason)
 
     def test_write_outside_denied_before_ask(self) -> None:
         """越界写走 outside 硬拒,轮不到审批——顺序即安全语义。"""
 
-        result = self.policy.decide(req("write_file", {"path": "../evil.txt"}))
+        result = self.policy.decide(req("fs_write", {"path": "../evil.txt"}))
         self.assertIs(result.action, PermissionAction.DENY)
         self.assertEqual(result.rule_id, "path.outside_workspace")
 
@@ -238,7 +238,7 @@ class WriteAskPolicyTests(unittest.TestCase):
         """没挂 scope:写规则不启用 -> default.deny(而不是悄悄放行)。"""
 
         result = build_default_policy().decide(
-            req("write_file", {"path": "notes/todo.txt"})
+            req("fs_write", {"path": "notes/todo.txt"})
         )
         self.assertIs(result.action, PermissionAction.DENY)
         self.assertEqual(result.rule_id, "default.deny")
@@ -283,7 +283,7 @@ class ForbiddenZonePolicyTests(unittest.TestCase):
     def test_read_forbidden_is_denied_not_allowed(self) -> None:
         """读禁区:不再被 read_allow 放行——DENY 且拒绝理由带目标路径。"""
 
-        result = self.policy.decide(req("read_file", {"path": ".env/secret"}))
+        result = self.policy.decide(req("fs_read", {"path": ".env/secret"}))
         self.assertIs(result.action, PermissionAction.DENY)
         self.assertEqual(result.rule_id, "path.forbidden_zone")
         self.assertIn(".env/secret", result.reason)
@@ -291,21 +291,21 @@ class ForbiddenZonePolicyTests(unittest.TestCase):
     def test_write_forbidden_is_denied_not_ask(self) -> None:
         """写禁区:不升级成 ASK——改 .git 没得商量,直接 DENY。"""
 
-        result = self.policy.decide(req("write_file", {"path": ".git/config"}))
+        result = self.policy.decide(req("fs_write", {"path": ".git/config"}))
         self.assertIs(result.action, PermissionAction.DENY)
         self.assertEqual(result.rule_id, "path.forbidden_zone")
 
     def test_forbidden_zone_beats_read_allow(self) -> None:
         """顺序:禁区规则排在 read_allow 之前,界内禁区漏不进免审批白名单。"""
 
-        result = self.policy.decide(req("list_dir", {"path": ".git"}))
+        result = self.policy.decide(req("fs_list", {"path": ".git"}))
         self.assertIs(result.action, PermissionAction.DENY)
         self.assertEqual(result.rule_id, "path.forbidden_zone")
 
     def test_clean_path_unchanged(self) -> None:
         """没撞禁区的正常读,照旧 read_allow——禁区只拦禁区。"""
 
-        result = self.policy.decide(req("read_file", {"path": "src/main.py"}))
+        result = self.policy.decide(req("fs_read", {"path": "src/main.py"}))
         self.assertIs(result.action, PermissionAction.ALLOW)
         self.assertEqual(result.rule_id, "path.read_allow")
 

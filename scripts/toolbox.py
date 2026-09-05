@@ -21,7 +21,7 @@ from src.harness.permissions import (
     build_default_policy,
 )
 from src.harness.real_model import RealModel
-from src.harness.std_tools import calc, find_text, tree_dir
+from src.harness.std_tools import calc, find_text, now, tree_dir
 from src.harness.tools import Tool, ToolRegistry
 
 # 历史窗口大小（练习 19）：按"条数"计（一条 = 一条消息，一轮工具往返
@@ -35,46 +35,39 @@ def get_weather(city: str) -> str:
 
     Args:
         city: 城市名，中文或拼音均可，如 "北京" 或 "beijing"。
+
+    注意：本工具返回的是**演示用模拟数据**（"下紫色雪花"），不代表真实
+    天气——只供冒烟验证工具往返（真实值独有的"紫色雪花"可当真伪判别），
+    模型必须知道数据是假的，才不会拿它当真去回答用户。
     """
 
     return f"{city}今天下紫色雪花，气温零下 42 度。"
-
-
-def add(a: int, b: int) -> int:
-    """计算两个整数的和。
-
-    Args:
-        a: 第一个加数，整数。
-        b: 第二个加数，整数。
-    """
-
-    return a + b
 
 
 # 即时工具：高频、短 schema，直接全量进模型上下文。
 ALL_TOOLS: list[Tool] = [
     Tool(
         name="get_weather",
-        description="查询一个城市今天的天气",
+        description="查询一个城市今天的天气（演示用模拟数据，不代表真实天气）",
         handler=get_weather,
     ),
     Tool(
-        name="add",
-        description="计算两个整数的和",
-        handler=add,
+        name="now",
+        description="获取当前日期和时间（本地时区），返回格式 YYYY-MM-DD HH:MM",
+        handler=now,
     ),
     Tool(
-        name="list_dir",
+        name="fs_list",
         description="列出项目里某个目录的内容（path 是相对项目根的路径，默认 . ）",
         handler=list_dir,
     ),
     Tool(
-        name="read_file",
+        name="fs_read",
         description="读取项目里某个文本文件（path 相对项目根；超长自动截断）",
         handler=read_file,
     ),
     Tool(
-        name="write_file",
+        name="fs_write",
         description="写入或覆盖项目里某个文本文件（path 相对项目根，整文件覆盖；"
         "需用户审批后才会真正执行）",
         handler=write_file,
@@ -85,7 +78,7 @@ ALL_TOOLS: list[Tool] = [
         handler=calc,
     ),
     Tool(
-        name="find_text",
+        name="fs_find",
         description="在项目里搜索文件内容（正则；返回 文件:行号:行内容 命中）",
         handler=find_text,
     ),
@@ -102,22 +95,22 @@ DEFERRED_TOOLS: list[Tool] = [
     ),
 ]
 
-# 免审批白名单（练习 s04）：只读 / 沙箱内的工具显式放行。write_file
+# 免审批白名单（练习 s04）：只读 / 沙箱内的工具显式放行。fs_write
 # 刻意不在名单里——它由 path.write_ask 规则拦成 ASK，执行前必须人点头。
 # 新工具默认 default.deny：必须有人把它加进某条规则才算"有了治理路径"。
 # 注意：策略看见的是桥接工具 ToolSearch / DeferExecuteTool 本身，不是
 # 延迟工具 tree_dir——延迟加载把执行藏在桥后面，策略管不到穿透后的
 # 那一层（已知边界：tree_dir 只读 + 沙箱内，风险可接受）。
 SAFE_TOOLS: frozenset[str] = frozenset({
-    "get_weather", "add", "list_dir", "read_file",
-    "calc", "find_text", "ToolSearch", "DeferExecuteTool",
+    "get_weather", "now", "fs_list", "fs_read",
+    "calc", "fs_find", "ToolSearch", "DeferExecuteTool",
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions
 # 只提供通用规则框架。新增写工具只改这里一处（加进 WRITE_TOOLS 并确认
 # 不在 SAFE_TOOLS 里），build_policy 会把集合喂给 build_default_policy。
-READ_TOOLS: frozenset[str] = frozenset({"read_file", "list_dir"})
-WRITE_TOOLS: frozenset[str] = frozenset({"write_file"})
+READ_TOOLS: frozenset[str] = frozenset({"fs_read", "fs_list"})
+WRITE_TOOLS: frozenset[str] = frozenset({"fs_write"})
 
 
 def build_policy() -> PermissionPolicy:
@@ -158,6 +151,25 @@ def build_system_prompt() -> str:
         " 按名称或用途搜索、拿到完整 schema，再用 DeferExecuteTool 执行。\n"
         f"当前可用的延迟工具：\n{deferred_directory}"
     )
+
+
+def with_system(history: list[dict] | None) -> list[dict]:
+    """把系统提示（工具目录）放到会话最前，且幂等——不重复添加。
+
+    对齐 s03 的目录设计：目录是独立工件，常驻模型上下文；历史截断
+    可能把 system 切出窗口（窗口比消息少时），这里自动补回；若
+    history 第一条已是 system（上一轮的 result.messages 带回来的），
+    直接原样返回。谁也不用特判。
+
+    chat.py / chainlit_app.py / electron_shell.py 三个入口共用。
+    """
+
+    system_message = {"role": "system", "content": build_system_prompt()}
+    if not history:
+        return [system_message]
+    if history[0].get("role") == "system":
+        return history
+    return [system_message] + history
 
 # 桥接工具的手写 schema（lambda 参数无类型注解，反射会给 string 兜底，
 # 而 queries 明明是数组；形状与 tests/test_deferred_tools.py 一致）。

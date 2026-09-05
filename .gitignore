@@ -34,6 +34,7 @@ htmlcov/
 
 # 编辑器：与 .idea 同类的个人配置
 .vscode/
+.trae/
 
 # 学习教材：第三方参考仓库（自带上游 LICENSE），只读参考不进本仓库
 learn-workbuddy/

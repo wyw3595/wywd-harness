@@ -21,7 +21,7 @@ from scripts.toolbox import (
     build_model,
     build_policy,
     build_registry,
-    build_system_prompt,
+    with_system,
 )
 from src.harness.agent import run_agent
 from src.harness.memory import trim_history
@@ -43,23 +43,6 @@ def cli_approver(decision: PermissionDecision) -> bool:
     print(f"  ⚠️ 需要审批 [{decision.rule_id}] {decision.reason}")
     answer = input("     允许这次工具调用吗？(y/n) ").strip().lower()
     return answer == "y"
-
-
-def _with_system(history: list[dict] | None) -> list[dict]:
-    """把系统提示（工具目录）放到会话最前，且幂等——不重复添加。
-
-    对齐 s03 的目录设计：目录是独立工件，常驻模型上下文；历史截断
-    可能把 system 切出窗口（窗口比消息少时），这里自动补回；若
-    history 第一条已是 system（上一轮的 result.messages 带回来的），
-    直接原样返回。谁也不用特判。
-    """
-
-    system_message = {"role": "system", "content": build_system_prompt()}
-    if not history:
-        return [system_message]
-    if history[0].get("role") == "system":
-        return history
-    return [system_message] + history
 
 
 def _format_messages(messages: list[dict]) -> str:
@@ -189,7 +172,7 @@ def main() -> None:
         if history:
             history = trim_history(history, MAX_HISTORY_MESSAGES)
         # 目录常驻：system 提示（含延迟工具目录）每次调到最前，幂等。
-        history = _with_system(history)
+        history = with_system(history)
         # 透明化：发出前展示这次"发给模型的所有东西"——请求体由两部分
         # 组成：tools（模型能调用的说明书）+ messages（对话内容）。
         # 与 /msgs 的 messages 渲染共用 _format_messages。
