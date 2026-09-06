@@ -671,3 +671,68 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # 冒烟前设置
 - 验收：143 条全绿；冒烟 decide("now") -> tool.allow\_safe ALLOW、
   注册表含 now、execute 返回真实时间。
 
+## 已完成：s05 Electron 桌面壳（2026-09-05~06，Python 模拟三进程架构）
+
+- 用 multiprocessing 模拟 Electron 的 main/renderer/preload 三进程隔离；
+  纯 Python，不引入 Node。UI 不卡、崩溃不连带、受限 API 桥。
+
+- src/harness/electron.py（可测核心，14 个单测）：
+  - IPC 协议常量 INCOMING\_RENDERER / OUTGOING\_MAIN（类型集合冻结）；
+  - ElectronMain：route 路由（ping/session/list/agent/message），
+    \_make\_approver 回程票闭包（request\_id 对齐审批请求与回执）；
+  - PreloadBridge：收信分派环（result/pong 返回，approval/request 弹
+    y/n 回执，event 消费，None 抛 PreloadBridgeClosed 抬走）；
+  - 机制三件套：收信分派环 / 审批回程票 / 单线程顺序嵌套（写进注释）。
+
+- scripts/electron\_shell.py（进程编排 + 终端 UI，不配单测）：
+  - 模块级 main\_process / renderer\_process / choose\_model（无 key
+    FakeModel，有 key RealModel）；Windows spawn 四守则落点；
+  - 事件直播：run\_agent 的 on\_event 打包成 event 消息穿 IPC 到
+    renderer 打印（⚠️ 坑：事件名放 "event" 键，data 里 name 是工具名，
+    用 name 存事件名会被覆盖）。
+
+- 验收：157 条测试全绿（+14 electron）；无 key 冒烟三进程跑通 +
+  事件直播；有 key 真模型工具调用直播；实验 D（杀 main 子进程）
+  renderer 存活不连带——同时暴露"无重连逻辑"边界（s06 的动机）。
+
+## 已完成：s06 Sidecar Server（2026-09-06，真多进程 + JSON-RPC）
+
+- "主进程不跑 agent，Sidecar 来跑"：把 agent 从壳里拆到独立子进程。
+  壳（main）只负责路由，JSON-RPC over socket 通信。s05 的下一层。
+
+- src/harness/sidecar.py（可测核心，23 个单测）：
+  - RingBuffer：有界环形日志（bytearray + write\_pos 绕圈 + 锁），
+    满了覆盖最旧——捕获 sidecar 日志，不是数据库（AuditTrail 才是）；
+  - RPCConnection：newline-delimited JSON framing（send/recv 按 \n 切帧）；
+  - SidecarServer：领域路由 sidecar/*、session/*、agent/*、tool/*；
+    handle\_connection 里 per-connection 装配 GovernedToolRunner
+    （approver 闭包住 conn——socket 是连接才知道的，不能构造期装配）；
+    agent/send 接现有 run\_agent + 权限闸门，session 存 history 回写；
+    on\_event 打包成 event 通知（"event" 键防 name 冲突）；
+  - MainProcessClient：call + 收信分派环（method 帧就地消费：审批弹
+    y/n 回 approval/response、event 打印；无 method 且 id 匹配返回）；
+    ConnectionClosed 诚实失败（对端关闭 send/recv 都兜 OSError）。
+
+- 协议要点（教学核心，写进注释）：
+  - 外层请求用 id 配对（request id=1 → response id=1）；响应帧没有
+    method，只能靠 id 认领；
+  - 审批/事件用 id:null 通知 + params.request\_id 回程票——为什么不用
+    id？响应无 method 靠 id 认领，若审批也用响应，main 和 sidecar 两套
+    id 计数在一条线上会撞号，分派环分不清；通知有 method 天然分流；
+  - 死锁四违约：①分派环把审批/事件当结果；②user\_prompt 重入 call；
+    ③双线程同 recv（非线程安全）；④不消费 event（event 挡住 result）。
+
+- scripts/sidecar\_shell.py（进程编排 + 终端 UI）：
+  - socketpair 一端传 mp.Process args（Windows 官方 socket reducer
+    支持 pickle，源码级验证过）；父进程 start() 后 srv.close()；
+  - 交互 /status /sessions /logs + 提问；
+  - 收尾顺序定死：call(shutdown) → close()（EOF 才让 sidecar 退出）
+    → join(timeout=5) → terminate()。
+
+- 冒烟：无 key 全链路（ping → session/create → 提问直播 → /status
+  ringBuffer/handlers → q 干净退出无残留）；**已知边界：FakeModel 只读
+  第一条消息，被 system 起步抢位会"回答系统提示"（无 key 冒烟现象，
+  真模型 RealModel 正确区分 system/user，不受影响）**。
+
+- 测试：180 条全绿（+23 sidecar）。待提交。
+
