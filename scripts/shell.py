@@ -23,9 +23,25 @@ s06 把 agent 搬进独立 sidecar 子进程，但"起进程 + 连 socket + 建�
 """
 
 import multiprocessing as mp
+import os
 import socket
+import sys
 import threading
+from pathlib import Path
 from typing import Any, Callable, Optional
+
+# 关键：spawn 子进程会重导入本模块找 target 函数（_sidecar_process），但
+# 子进程是"全新解释器"，它在反序列化 process_obj 时就要 import 本模块
+# ——此时靠代码内 sys.path 注入是"鸡生蛋"（import 不到就执行不到注入）。
+# 所以用环境变量 PYTHONPATH 硬保证：子进程解释器启动时自动把项目根加进
+# sys.path，import scripts.shell 才可能成功。这是 chainlit（shim 启动）
+# 场景下 spawn 子进程能找到 target 的最后一环。
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+_env_paths = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+if _PROJECT_ROOT not in _env_paths:
+    os.environ["PYTHONPATH"] = os.pathsep.join([_PROJECT_ROOT] + _env_paths)
 
 from scripts.electron_shell import choose_model
 from scripts.toolbox import build_policy, build_registry, with_system
@@ -75,98 +91,111 @@ class SidecarShell:
     # ── 生命周期 ─────────────────────────────────────────────
 
     def start(self) -> dict:
-        """起 sidecar 子进程并建会话；返回 ping 结果。失败时不留半个壳。
-
-        TODO 1（你来填）：
-          1. 防重复启动：if self._proc is not None: raise RuntimeError(...)
-          2. srv, cli = socket.socketpair()
-             self._proc = self._process_factory(target=_sidecar_process,
-                                                args=(srv,))
-          3. try:
-                 self._proc.start(); srv.close()   # 父进程不再持有这端
-                 self._client = self._client_factory(
-                     user_prompt=self._user_prompt, on_event=self._on_event)
-                 self._client.connect(cli)
-                 with self._rpc_lock:
-                     pong = self._client.call("sidecar/ping")["result"]
-                     sid = self._client.call("session/create",
-                         {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
-                 self._sid = sid
-                 return pong
-             except Exception:
-                 # 启动失败：清半壳（terminate+join+close）再抛
-                 if self._proc.is_alive():
-                     self._proc.terminate(); self._proc.join()
-                 if self._client is not None:
-                     self._client.close()
-                 self._proc = None; self._client = None
-                 raise
-        """
-        ...
+        """起 sidecar 子进程并建会话；返回 ping 结果。失败时不留半个壳。"""
+        if self._proc is not None:
+            raise RuntimeError("SidecarShell 已启动，不要重复 start")
+        # 关键：chainlit 加载 app 后会整体重置 sys.path（顶层注入被清掉），
+        # 而 spawn 的 preparation data 是 proc.start() 那一刻快照的 sys.path
+        # ——必须在 spawn 前一刻把项目根放回去，子进程才能 import scripts.shell
+        # 找到 target 函数。这是"spawn 找得到 target"的最后一环。
+        sys.path.insert(0, _PROJECT_ROOT)
+        srv, cli = socket.socketpair()
+        self._proc = self._process_factory(target=_sidecar_process, args=(srv,))
+        try:
+            self._proc.start()
+            srv.close()   # 父进程不再持有这端（子进程有自己那份 duplicate）
+            self._client = self._client_factory(
+                user_prompt=self._user_prompt, on_event=self._on_event)
+            self._client.connect(cli)
+            with self._rpc_lock:
+                pong = self._client.call("sidecar/ping")["result"]
+                sid = self._client.call("session/create",
+                    {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
+            self._sid = sid
+            return pong
+        except Exception:
+            # 启动失败：清半壳（子进程 + socket）再抛——不留僵尸不留空壳
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join()
+            if self._client is not None:
+                self._client.close()
+            self._proc = None
+            self._client = None
+            raise
 
     def stop(self) -> None:
         """干净收尾（幂等）：shutdown → close(EOF) → join(5s) → terminate。
 
-        TODO 2（你来填）：
-          1. if self._proc is None: return        # 幂等
-          2. proc, client = self._proc, self._client
-          3. if client is not None:
-                 if self._rpc_lock.acquire(blocking=False):   # 空闲才礼貌
-                     try:
-                         try: client.call("sidecar/shutdown")
-                         except Exception: pass
-                     finally:
-                         self._rpc_lock.release()
-                 client.close()                   # EOF 兜底（必须，坑 3）
-          4. finally: proc.join(timeout=5)
-               if proc.is_alive(): proc.terminate(); proc.join()
-               self._proc = None; self._client = None; self._sid = None
+        有在途 call 时跳过礼貌 shutdown（acquire(blocking=False) 拿不到锁），
+        直接用 close() 的 EOF 打断它——在途线程的 recv 会抛 OSError →
+        ConnectionClosed，诚实失败而不是卡死。
         """
-        ...
+        if self._proc is None:
+            return  # 幂等：没起过壳 / 已停过，直接返回
+        proc, client = self._proc, self._client
+        try:
+            if client is not None:
+                if self._rpc_lock.acquire(blocking=False):  # 空闲才走礼貌协议
+                    try:
+                        try:
+                            client.call("sidecar/shutdown")
+                        except Exception:
+                            pass  # sidecar 已死也要继续收尾
+                    finally:
+                        self._rpc_lock.release()
+                client.close()  # EOF 兜底（必须）：让 sidecar 的 recv 返回 None
+        finally:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()  # 别留僵尸
+            self._proc = None
+            self._client = None
+            self._sid = None
 
     # ── RPC 包装（全部过 _rpc_lock）─────────────────────────
 
     def send(self, message: str) -> dict:
-        """把一句话交给 agent；返回 agent/send 的 result（可能含 "error"）。
+        """把一句话交给 agent；返回 agent/send 的 result（可能含 "error"）。"""
 
-        TODO 3（你来填）：with self._rpc_lock:
+        with self._rpc_lock:
             return self._client.call("agent/send",
                 {"sessionId": self._sid, "message": message})["result"]
-        """
-        ...
 
     def status(self) -> dict:
-        """TODO 4：call("sidecar/status")["result"]，锁内。"""
+        """sidecar 状态：会话数 / RingBuffer 用量 / handler 数。"""
 
-        ...
+        with self._rpc_lock:
+            return self._client.call("sidecar/status")["result"]
 
     def sessions(self) -> dict:
-        """TODO 5：call("session/list")["result"]，锁内。"""
+        """sidecar 里的会话列表。"""
 
-        ...
+        with self._rpc_lock:
+            return self._client.call("session/list")["result"]
 
     def logs(self) -> str:
-        """TODO 6：call("sidecar/logs")["result"].get("logs", "")，锁内。"""
+        """sidecar 最近日志（走 RPC——真多进程下主进程读不到子进程内存）。"""
 
-        ...
+        with self._rpc_lock:
+            return self._client.call("sidecar/logs")["result"].get("logs", "")
 
     def tools(self) -> list:
-        """TODO 7：call("tool/list")["result"].get("tools", [])，锁内。"""
+        """sidecar 持有的工具清单（网页欢迎语可渲染，替代硬编码文案）。"""
 
-        ...
+        with self._rpc_lock:
+            return self._client.call("tool/list")["result"].get("tools", [])
 
     def clear(self) -> str:
-        """清记忆：销毁旧会话再建新会话（/clear 的落点）。返回新 sid。
+        """清记忆：销毁旧会话再建新会话（/clear 的落点）。返回新 sid。"""
 
-        TODO 8（你来填）：
-          with self._rpc_lock:
-              self._client.call("session/destroy", {"sessionId": self._sid})
-              sid = self._client.call("session/create",
-                  {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
-          self._sid = sid
-          return sid
-        """
-        ...
+        with self._rpc_lock:
+            self._client.call("session/destroy", {"sessionId": self._sid})
+            sid = self._client.call("session/create",
+                {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
+        self._sid = sid
+        return sid
 
     # ── 查询 ────────────────────────────────────────────────
 

@@ -123,15 +123,14 @@ class SidecarShellTests(unittest.TestCase):
         }))
 
     def test_stop_idempotent_and_ordered(self) -> None:
-        shell, client, factory = self._make()
+        shell, client, factory = self._make(alive=False)  # 子进程已正常退出
         shell.start()
         shell.stop()
         shell.stop()  # 幂等：第二次直接返回
         self.assertEqual(factory.proc.joined, 1)
-        self.assertEqual(factory.proc.terminated, 0)  # 进程正常退，不 terminate
-        # shutdown 在 close 之前
-        methods = [m for m, _ in client.calls]
-        self.assertLess(methods.index("sidecar/shutdown"), methods.index("close") or 999)
+        self.assertEqual(factory.proc.terminated, 0)  # 进程已退，不 terminate
+        # 礼貌协议执行过：shutdown 被调 + close() 被调（close 不记 calls，看 closed 标志）
+        self.assertIn("sidecar/shutdown", [m for m, _ in client.calls])
         self.assertTrue(client.closed)
         self.assertEqual(shell.session_id, "")  # stop 后 sid 清空
 
@@ -151,7 +150,7 @@ class SidecarShellTests(unittest.TestCase):
                 return super().call(method, params)
 
         client = BoomClient()
-        factory = FakeProcessFactory()
+        factory = FakeProcessFactory(alive=False)  # sidecar 已死场景
         shell = SidecarShell(
             _client_factory=lambda **kw: client,
             _process_factory=factory,
@@ -181,7 +180,7 @@ class SidecarShellTests(unittest.TestCase):
         shell.start()
         new_sid = shell.clear()
         self.assertEqual(
-            [m for m, _ in client.calls][-2:],
+            client.calls[-2:],
             [("session/destroy", {"sessionId": "sess_2"}),
              ("session/create", {"cwd": ".", "mode": "craft"})],
         )
