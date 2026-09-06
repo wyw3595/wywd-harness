@@ -734,5 +734,148 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # 冒烟前设置
   第一条消息，被 system 起步抢位会"回答系统提示"（无 key 冒烟现象，
   真模型 RealModel 正确区分 system/user，不受影响）**。
 
-- 测试：180 条全绿（+23 sidecar）。待提交。
+- 测试：180 条全绿（+23 sidecar）。提交：4d4d0d6。
+
+## 已完成：s06.5 三壳归一 + 填 TODO（2026-09-06，代码由我填，助手验收改测试）
+
+- 提交：378106e。
+
+- 主题：把"起 sidecar 进程 + 连接 + 建会话 + 收尾"的编排从各入口抽出，
+  收敛成 `scripts/shell.py` 的 **SidecarShell**（s06 建的 TODO 骨架，本次填完）。
+  终端 / 网页 / 桌面三个 UI 从此共用同一个壳。
+
+- scripts/shell.py（SidecarShell，+13 条测试在 tests/test_shell.py）：
+
+  - start()：防重复启动；socketpair 一端传子进程；失败清半壳再抛
+    （terminate + join + close，不留半个壳）；
+
+  - **spawn 找 target 的两层修复（本课核心坑）**：chainlit 用 console
+    shim 启动，加载 app 后会重置 sys.path，而 spawn 的 preparation data
+    是 proc.start() 那一刻快照的 sys.path——子进程"全新解释器"反序列化
+    时就要 import 本模块找 target，靠代码内注入是"鸡生蛋"。修复：
+    ① 模块顶层注入 sys.path + 把项目根写进环境变量 PYTHONPATH
+    （子进程解释器启动时就生效）；② start() 里 spawn 前一刻再插一次
+    sys.path（对付 chainlit 的重置）；③ 红利规则：任何 mp target 都
+    不要定义在 chainlit_app.py，target 一律住 scripts/shell.py；
+
+  - stop() 幂等且有序：shutdown → close()（EOF 才让 sidecar 退出）→
+    join(timeout=5) → 还活着才 terminate；stop 后 session_id 清空；
+
+  - clear() = session/destroy + session/create，返回新 sid
+    （/clear 免费获得——三个 UI 一起有）；
+
+  - user_prompt()：agent/send 包一层， sidecar 已死时 ConnectionClosed
+    诚实失败（不静默装没事）。
+
+- scripts/sidecar_shell.py 瘦身（143 行改动，净减）：编排逻辑全删，
+  只剩"终端展示"——show_event 直播打印 + main 交互循环（UI 归 UI），
+  多了 /clear 命令。
+
+- scripts/chainlit_app.py 重写为第三个 UI（终端 sidecar_shell、
+  桌面 electron_shell、网页本文件）：不再直跑 run_agent，网页接线
+  变成"审批按钮 → shell.user_prompt；事件 → 步骤卡片"。两处新知：
+
+  - 审批签名零适配：sidecar 跨进程只传 rule_id + reason 两个字符串
+    （_make_approver 拆好的），网页审批员直接收 (rule_id, reason)，
+    不用造 PermissionDecision/ToolRequest——比 s04-b 的 web_approver 干净；
+
+  - **chainlit 生命周期坑**：F5 刷新触发 on_chat_end（停壳）但
+    on_chat_start 不重跑——会话里留下死壳。解法 \_ensure_shell() 惰性
+    重建（is_alive 检查）。代价：刷新 = 失忆（新壳新 sid，旧历史随
+    进程销毁），可接受边界。
+
+- tests/test_shell.py：验收改了 3 处——stop 幂等测试补 alive=False
+  （子进程已正常退出的场景，断言"不 terminate"才成立）；shutdown
+  协议断言改成"shutdown 被调 + closed 标志"（close 不记 calls）；
+  clear 的 calls 断言去掉多余的切片包装。
+
+- 验收：189 条测试全绿（+9）。
+
+- 当前下一步：s07_session_management（用户已定）。
+
+## 进行中：s07 Session Management（骨架已建，等我填代码）
+
+设计：s06 的 session 是字典里的一行，身份和运行时混在一起（destroy 一删
+全没、崩溃后 status=running 僵尸、无恢复入口）。s07 拆成两类对象——
+**SessionRecord**（逻辑会话：id/cwd/mode/transcript/runtime_generation，
+可跨 runtime 存活，能进 Store）和 **SessionProcess**（一代运行时：turn
+锁/abort 信号/turn_runner 执行入口，只能重建不能序列化）。恢复语义：
+resume 不是复活旧进程，而是用旧记录造新运行时（generation+1）。
+四操作：create（新 id+第 1 代）/ close（释放运行时留记录，幂等）/
+resume（旧 id+generation+1，live 拒绝）/ forget（真删除，必须先 close）。
+六态状态机 _ALLOWED_TRANSITIONS 唯一真源。
+
+架构适配（与教材的差异）：不做 per-session HTTP listener——transport
+只保留一套（s06 JSON-RPC sidecar）；运行时资源 = 锁+信号+注入的
+turn_runner（(message, history) -> (output, messages)，session 层不
+import run_agent，离线测试给假 runner）。"端口课"由 sidecar 进程/RPC
+连接充当：resume 后一样全部重建、一样不进 Record。
+
+- src/harness/session.py（新建）：TODO 1 _ALLOWED_TRANSITIONS 迁移表；
+  TODO 2 SessionRecord 可变 dataclass + summary()；TODO 3
+  InMemorySessionStore（RLock + deepcopy 存取边界）；TODO 4
+  _transition/_publish/_commit 三件套（RLock 同线程重入的原因）；
+  TODO 5 start（creating→idle）；TODO 6 run_turn（非阻塞抢锁拒绝并发
+  turn + 晚到结果 _commit 拒收）；TODO 7 close（幂等）；TODO 8 计数器
+  （rpartition 摸最大编号）+create；TODO 9 resume/close/forget/
+  shutdown_all。
+
+- tests/test_session.py（新建，测试由助手写）：28 条全离线——Record
+  不含运行时资源 / str-mixin Enum（== "idle"、json 直出）/ store
+  deepcopy 双向防渗透 / 状态机正反迁移 / 并发 turn 拒绝不排队 /
+  close 竞态晚到结果拒收（线程+Event 精确编排，不靠 sleep）/ 四操作
+  语义 / 僵尸 running 关掉后复活 / Manager 换代共享 store 续号 /
+  cwd+mode 校验。
+
+当前测试状态：189 条通过；新 28 条中 27 条报错（TODO 未填），
+SessionStateTests 1 条绿（Enum 是现成代码）。
+
+验收标准：217 条全绿 + 教材 README 五问能口头回答（①会话存在≠进程
+活着 ②四操作各改什么 ③端口/线程/锁/client 不能序列化复活 ④
+transcript≠memory ⑤running 不是存活证明，Manager._runtimes 才是权威）。
+
+路线调整（2026-09-06，用户定）：**s09 持久化提前，排在 s08 之前**——
+刚学完 resume，紧接着让 resume 扛住进程重启（s09 = JSONL 事件日志 +
+重放重建，Claude Code 同款；它正好回答"resume 的新运行时从哪拿历史"）。
+s08 模型路由与这两课无依赖，顺延到 s09 之后；s10~s12 不受影响。
+顺序：s07 填完（217 全绿）→ s07-b sidecar 接线 → s09 持久化 → s08。
+
+s07-b（接线）：sidecar.py 的 sessions dict → SessionManager，
+session/destroy 语义修正为 close，新增 session/resume / session/forget
+路由，shell UI 加 /resume /forget。
+
+### s07 设计调研结论（2026-09-06，用户问"这样做是最好的吗"）
+
+逐家对照真实系统，结论：**Record/Process 分离 + resume=重建 是业界共识，
+s07 是它的微缩全景模型**。对应物：
+
+- OpenAI Agents SDK：Session 就是"按 session_id 存取的历史 + 可插拔
+  后端"（SQLite/Redis/SQLAlchemy/MongoDB），比我们更极端——**根本没有
+  常驻运行时**，每轮 run 都重新拉历史、全新执行；"同一 session_id +
+  同一后端换实例续跑"就是我们的 Manager 换代测试；SessionSettings
+  (limit) 对应 trim_history；in-memory 后端进程结束即丢（同我们的边界）。
+- LangGraph：thread_id 为主键，checkpointer 逐步存档（Memory/SQLite/
+  Postgres），resume=同 thread_id 新调用；跨线程长期记忆是独立的
+  Store 概念——transcript≠memory 原样成立。
+- Claude Code：会话=项目目录下的 JSONL transcript（~/.claude/projects/）；
+  --continue 接最近一次、--resume 按 id 挑，都是"新进程重放 transcript"；
+  /clear 退出但不删 transcript（close≠forget 的产品化）；Agent SDK
+  暴露的适配器接口就叫 **SessionStore**（和我们的端口同名同职）。
+- Cloudflare Agents/Durable Objects：actor 模型，空闲即休眠（零成本）、
+  消息到达即唤醒；休眠时**内存变量全丢、storage/attachment 存活**，
+  唤醒=从 storage 重建——"记录活、运行时重建"的工业版；单实例写
+  同一 session 由平台保证（我们的 resume 拒绝 live 是手动版）。
+- Zed ACP：协议层就有 session/new 与 session/load（恢复）两个方法，
+  loadSession 是能力协商项；教材"ACP-like"出处即此。
+- Google ADK：SessionService 端口 + 三后端（InMemory 教学/Database/
+  VertexAi 托管），InMemory"重启即丢"写进官方文档——我们只做
+  InMemory 的教学定位与 Google 同款。
+
+我们刻意简化（=教材练习①②的生产化补丁，设计本身不用改）：
+① 只有 InMemory 后端（业界同款端口形态：Claude SessionStore adapter /
+LangGraph checkpointer 后端 / ADK SessionService）；② 无 startup
+reconciliation（僵尸 running 启动时清理——我们靠 close 第三步手动抹）；
+③ 按 turn 提交 transcript，而 Claude Code/LangGraph 逐消息追加/存档，
+崩溃丢最后一轮（教学规模可接受）。generation 的学术对应：分布式系统
+的 epoch / fencing token（防僵尸执行器写旧状态）。
 
