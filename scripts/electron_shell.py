@@ -35,13 +35,7 @@ from src.harness.models import FakeModel
 
 
 def choose_model():
-    """离线可切：设了 DEEPSEEK_API_KEY 走真模型，否则 FakeModel。
-
-    TODO 1（你来填）：
-      if os.getenv("DEEPSEEK_API_KEY"):
-          return build_model()      # scripts.toolbox 的 RealModel
-      return FakeModel()            # 离线假模型，无 key 也能跑教学演示
-    """
+    """离线可切：设了 DEEPSEEK_API_KEY 走真模型，否则 FakeModel。"""
     if os.getenv("DEEPSEEK_API_KEY"):
         return build_model()
     else:
@@ -51,25 +45,9 @@ def choose_model():
 def main_process(renderer_to_main: mp.Queue, main_to_renderer: mp.Queue) -> None:
     """Electron Main 进程：装配自己的零件，然后 while 收消息路由。
 
-    TODO 2（你来填）：
-      1. 装配（都在子进程内部做，见模块 docstring 守则②）：
-           model    = choose_model()
-           registry = build_registry()
-           policy   = build_policy()
-           main     = ElectronMain(
-               model, registry, policy,
-               send=lambda m: main_to_renderer.put(m),   # 唯一"发给 renderer"的出口
-               recv=renderer_to_main.get,                # 唯一"收 renderer 消息"的入口
-           )
-      2. while True: 收信路由循环
-           msg = renderer_to_main.get()
-           if msg is None: break               # 关停哨兵（守则④）
-           outgoing = main.route(msg)
-           if outgoing is not None:
-               main_to_renderer.put(outgoing)
-      说明：send/recv 两个注入点让 ElectronMain 只认识"发/收"两个回调，
-      进程循环只负责"取一条 → 路由 → 回一条"。approver 的审批回执
-      也是从 renderer_to_main.get 里"嵌套接管"取到的（单线程，非并发）。
+    send/recv 两个注入点让 ElectronMain 只认识"发/收"两个回调，进程
+    循环只负责"取一条 → 路由 → 回一条"；approver 的审批回执也是从
+    renderer_to_main.get 里"嵌套接管"取到的（单线程，非并发）。
     """
     model = choose_model()
     registry = build_registry()
@@ -94,20 +72,7 @@ def main_process(renderer_to_main: mp.Queue, main_to_renderer: mp.Queue) -> None
 
 
 def renderer_process(send_queue: mp.Queue, recv_queue: mp.Queue) -> None:
-    """Electron Renderer（主线程 UI）：只能走 PreloadBridge，碰不到别的东西。
-
-    TODO 3（你来填）：
-      1. bridge = PreloadBridge(send_queue, recv_queue)
-      2. 先 ping 验活：
-           try:    pong = bridge.ping()
-           except: print 提示 main 无响应后返回
-      3. while True: 终端输入循环
-           query = input(...)  （EOFError / KeyboardInterrupt → break）
-           if query 是 q/exit/空 → break
-           result = bridge.send_message(query)   # 阻塞；途中审批/直播由
-           print(result)                         # 分派环就地处理
-      4. 退出前发关停哨兵：send_queue.put(None)
-    """
+    """Electron Renderer（主线程 UI）：只能走 PreloadBridge，碰不到别的东西。"""
     def show_event(data: dict) -> None:
         """把 main 直播过来的事件打印到终端（对齐 chat.py 的 on_event 风格）。
 
@@ -150,21 +115,7 @@ def renderer_process(send_queue: mp.Queue, recv_queue: mp.Queue) -> None:
 
 
 def main() -> None:
-    """启动与清理：两条队列 + 一个子进程 + 主线程跑 renderer。
-
-    TODO 4（你来填，Windows spawn 守则③④的落点）：
-      1. renderer_to_main = mp.Queue(); main_to_renderer = mp.Queue()
-      2. proc = mp.Process(target=main_process,
-                          args=(renderer_to_main, main_to_renderer))
-         proc.start()
-      3. try:
-             renderer_process(renderer_to_main, main_to_renderer)
-         finally:
-             renderer_to_main.put(None)          # 兜底再放一次（幂等）
-             proc.join(timeout=5)
-             if proc.is_alive():
-                 proc.terminate(); proc.join()   # 别留僵尸进程
-    """
+    """启动与清理：两条队列 + 一个子进程 + 主线程跑 renderer。"""
     renderer_to_main = mp.Queue()
     main_to_renderer = mp.Queue()
     proc = mp.Process(target=main_process, args=(renderer_to_main, main_to_renderer))

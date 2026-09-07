@@ -1,9 +1,10 @@
 """s06.5 SidecarShell 的编排单测：不真起子进程，注入假 client/假 process。
 
 与 test_sidecar.py 同哲学：进程边界只到"编排逻辑"为止——start 的顺序、
-stop 的幂等与收尾顺序、clear 的 destroy→create、并发串行化都是可测的
-核心；真 spawn 留给 scripts 冒烟（Windows spawn 重跑主模块，进单测是
-自找麻烦）。scripts/shell.py 是 scripts 里唯一配单测的文件（可测编排件）。
+stop 的幂等与收尾顺序、clear 的 close→forget→create（s07-b 编舞）、
+并发串行化都是可测的核心；真 spawn 留给 scripts 冒烟（Windows spawn
+重跑主模块，进单测是自找麻烦）。scripts/shell.py 是 scripts 里唯一
+配单测的文件（可测编排件）。
 """
 
 import threading
@@ -22,6 +23,7 @@ class FakeClient:
         self.calls: list[tuple[str, dict | None]] = []
         self.closed = False
         self._id = 0
+        self.resume_result = None   # 测试可改罐头（resume 失败场景）
 
     def connect(self, sock) -> None:
         sock.close()
@@ -33,7 +35,12 @@ class FakeClient:
             result = {"status": "ok"}
         elif method == "session/create":
             result = {"sessionId": f"sess_{self._id}"}
-        elif method == "session/destroy":
+        elif method == "session/close":
+            result = {"status": "ok", "closed": True}
+        elif method == "session/resume":
+            result = self.resume_result or {
+                "sessionId": (params or {}).get("sessionId"), "generation": 2}
+        elif method == "session/forget":
             result = {"status": "ok"}
         else:
             result = {}
@@ -175,17 +182,47 @@ class SidecarShellTests(unittest.TestCase):
         self.assertTrue(client.closed)                 # EOF 兜底
         self.assertEqual(factory.proc.terminated, 1)   # 进程已被收掉
 
-    def test_clear_destroys_then_creates(self) -> None:
+    def test_clear_closes_forgets_then_creates(self) -> None:
+        """s07-b：/clear 编舞从 destroy→create 升级为 close→forget→create。"""
+
         shell, client, _ = self._make()
         shell.start()
         new_sid = shell.clear()
         self.assertEqual(
-            client.calls[-2:],
-            [("session/destroy", {"sessionId": "sess_2"}),
+            client.calls[-3:],
+            [("session/close", {"sessionId": "sess_2"}),
+             ("session/forget", {"sessionId": "sess_2"}),
              ("session/create", {"cwd": ".", "mode": "craft"})],
         )
-        self.assertEqual(new_sid, "sess_4")
-        self.assertEqual(shell.session_id, "sess_4")
+        self.assertEqual(new_sid, "sess_5")
+        self.assertEqual(shell.session_id, "sess_5")
+
+    def test_close_session_defaults_to_current(self) -> None:
+        shell, client, _ = self._make()
+        shell.start()
+        shell.close_session()
+        self.assertEqual(client.calls[-1], ("session/close", {"sessionId": "sess_2"}))
+        # 关掉当前会话后 sid 保留——它就是之后 /resume 的靶子
+        self.assertEqual(shell.session_id, "sess_2")
+
+    def test_resume_session_takes_over_only_on_success(self) -> None:
+        shell, client, _ = self._make()
+        shell.start()
+        shell.resume_session("sess_0009")
+        self.assertEqual(client.calls[-1],
+                         ("session/resume", {"sessionId": "sess_0009"}))
+        self.assertEqual(shell.session_id, "sess_0009")   # 成功：壳接管
+        client.resume_result = {"error": "already has a live runtime"}
+        failed = shell.resume_session("sess_0002")
+        self.assertIn("error", failed)
+        self.assertEqual(shell.session_id, "sess_0009")   # 失败：不接管
+
+    def test_forget_session_delegates(self) -> None:
+        shell, client, _ = self._make()
+        shell.start()
+        shell.forget_session()   # 不传参 = 当前会话
+        self.assertEqual(client.calls[-1],
+                         ("session/forget", {"sessionId": "sess_2"}))
 
     def test_send_serialized_under_concurrency(self) -> None:
         """双线程 send：锁保证同一时刻最多一个 call 在途（坑 2 的锁）。"""

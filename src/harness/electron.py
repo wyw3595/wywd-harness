@@ -102,41 +102,19 @@ class ElectronMain:
         )
 
     def route(self, msg: dict) -> Optional[dict]:
-        """主路由：按 type 分派，返回"对本次请求的终结回复"dict 或 None。
-
-        TODO 1（你来填）：
-          - "ping"        → {"type": "pong", "data": "main alive"}
-          - "session/list"→ {"type": "result", "data": list(self._sessions.keys())}
-          - "agent/message"→ 交给自己写的 _handle_agent_message(msg["data"])
-          - "approval/response" → 返回 None（正常不会到主路由——
-            它由 approver 的回程票循环直接消费，防御性忽略即可）
-          - 其他任何 type → {"type": "result", "data": f"未知消息类型 {type!r}"}
-            不炸、给可调试文案，和 default.deny 的 fail-closed 同理。
-        """
+        """主路由：按 type 分派，返回"对本次请求的终结回复"dict 或 None。"""
         match msg["type"]:
             case "ping": return {"type": "pong", "data": "main alive"}
             case "session/list": return {"type": "result", "data": list(self._sessions.keys())}
             case "agent/message": return self._handle_agent_message(msg["data"])
+            # 防御性忽略：回执由 approver 的回程票循环直接消费，正常到不了这
             case "approval/response": return None
+            # 未知类型不炸、给可调试文案——和 default.deny 的 fail-closed 同理
             case _type: return {"type": "result", "data": f"未知消息类型 {msg['type']!r}"}
 
 
     def _handle_agent_message(self, text: str) -> dict:
-        """跑一轮 run_agent，延续会话记忆，返回 {"type":"result","data":...}。
-
-        TODO 2（你来填）：
-          result = run_agent(
-              text, model=self._model, registry=self._registry,
-              history=self._history, on_event=self._on_event,
-              runner=self._runner,
-          )
-          然后：
-          - self._history = result.messages      # 会话延续（练习 10）
-          - self._sessions[text] = result.output # 记账，session/list 用
-          - 返回 result：status == "completed" 时 data 就是 output；
-            否则（failed / max_steps / truncated）给 f"[{status}] {output}"
-            一样的"失败是结果不是异常"诚实（练习 16）
-        """
+        """跑一轮 run_agent，延续会话记忆，返回 {"type":"result","data":...}。"""
         result = run_agent(
             text, model=self._model, registry=self._registry,
             history=self._history, on_event=self._on_event,
@@ -152,27 +130,7 @@ class ElectronMain:
 
 
     def _make_approver(self) -> Approver:
-        """审批闭包（回程票是核心）：发审批到 renderer，等"同一张票"的回执。
-
-        TODO 3（你来填）：
-          def approver(decision) -> bool:
-              ticket = str(uuid4())          # 开一张票
-              self._send({"type": "approval/request", "data": {
-                  "request_id": ticket,
-                  "rule_id": decision.rule_id,
-                  "reason": decision.reason,
-              }})
-              while True:                    # 回程票循环
-                  msg = self._recv()         # 顺序嵌套接管（见模块 docstring ③）
-                  if msg is None:            # main 已关停 → 视为拒绝
-                      return False
-                  data = msg.get("data") or {}
-                  if (msg.get("type") == "approval/response"
-                          and data.get("request_id") == ticket):
-                      return bool(data.get("approved"))  # 只兑自己这张票
-          返回这个 approver（Approver = Callable[[PermissionDecision], bool]）
-        """
-        ...
+        """审批闭包（回程票是核心）：发审批到 renderer，等"同一张票"的回执。"""
         def approver(decision) -> bool:
             ticket = str(uuid.uuid4())
             self._send({"type": "approval/request", "data": {
@@ -265,14 +223,11 @@ class PreloadBridge:
         return self._dispatch(timeout=5)
 
     def send_message(self, text: str) -> str:
-        """发一条 agent 任务并等最终回答（阻塞；途中审批/直播被分派环消费）。
-
-        TODO 5（你来填）：put 一条 agent/message，再 return self._dispatch()
-        """
+        """发一条 agent 任务并等最终回答（阻塞；途中审批/直播被分派环消费）。"""
         self._send.put({"type": "agent/message", "data": text})
         return self._dispatch()
 
     def list_sessions(self) -> list:
-        """列会话（main 的 session/list）。TODO 6（你来填），同 send_message。"""
+        """列会话（main 的 session/list）。"""
         self._send.put({"type": "session/list"})
         return self._dispatch()

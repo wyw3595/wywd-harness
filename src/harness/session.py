@@ -96,14 +96,8 @@ class SessionState(str, Enum):
     ERROR = "error"         # 当前 generation 失败，原因在 last_error
 
 
-# TODO 1（你来填）：合法迁移表——状态机的唯一真源（防各处随手改字符串）。
-#   按下面的表写 dict[str, frozenset[str]]（键值用 SessionState 常量）：
-#     creating → {idle, closing, error}
-#     idle     → {running, closing, error}
-#     running  → {idle, closing, error}
-#     closing  → {closed, error}
-#     closed   → {}            （终点；复活的唯一途径是 Manager resume）
-#     error    → {closing, closed}
+# 合法迁移表——状态机的唯一真源（防各处随手改字符串）。
+# closed 是终点：复活的唯一途径是 Manager resume（换代重建，不走迁移）。
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     SessionState.CREATING: frozenset({SessionState.IDLE, SessionState.CLOSING, SessionState.ERROR}),
     SessionState.IDLE: frozenset({SessionState.RUNNING, SessionState.CLOSING, SessionState.ERROR}),
@@ -131,25 +125,10 @@ class SessionAlreadyRunningError(SessionLifecycleError):
 # SessionRecord — 可以跨 runtime 存活的"恢复事实"
 # ═══════════════════════════════════════════════════════════════
 
-# TODO 2（你来填）：可变 dataclass。注意：这次**不是** frozen=True——
-#   Record 会被运行时随时改 status / messages，冻结就没法改了
-#   （前几课 frozen 的是值对象 Tool/PermissionDecision；Record 是状态载体）。
-# 字段（除 id / cwd 外都有默认值）：
-#   id: str                          —— "sess_0001" 式逻辑身份
-#   cwd: str                         —— 工作目录（resume 时要重新校验）
-#   mode: str = SessionState 所在模块顶部的 MODE_CRAFT
-#   title: str = "未命名会话"
-#   status: str = SessionState.CREATING   （str 混血：枚举成员就是字符串）
-#   created_at: float = field(default_factory=time.time)
-#   updated_at: float = field(default_factory=time.time)
-#   runtime_generation: int = 1      —— 第几代运行时；resume 时 +1
-#   messages: list[dict] = field(default_factory=list)
-#   last_error: Optional[str] = None
-# ⚠️ 刻意没有的字段：锁、线程、端口、server、provider client、abort 信号
-#   ——它们属于 SessionProcess，只能重建、不能序列化（本课主旨）。
-# 再加一个 summary() 方法：返回 UI 安全的 dict（不含任何运行时对象）：
-#   {"id", "cwd", "title", "status", "mode", "runtimeGeneration",
-#    "messages": len(self.messages), "lastError"}
+# 可变 dataclass（刻意不是 frozen）：Record 是状态载体，运行时要随时改
+# status / messages——前几课 frozen 的是值对象（Tool/PermissionDecision），
+# Record 不是。锁、线程、端口、abort 信号这些运行时资源刻意没有字段：
+# 它们属于 SessionProcess，只能重建、不能序列化（本课主旨）。
 @dataclass
 class SessionRecord:
     """可跨 runtime 存活的逻辑会话：只有可持久化字段，没有运行时对象。"""
@@ -204,22 +183,10 @@ class SessionStore(Protocol):
 class InMemorySessionStore:
     """线程安全的教学存储：证明生命周期契约，不冒充磁盘持久化。
 
-    TODO 3（你来填）——五个方法 + __init__，全部在锁内干活：
-      __init__：self._records: dict[str, SessionRecord] = {}
-                self._lock = threading.RLock()
-      create(record)：id 已存在 raise SessionLifecycleError(f"session
-                already exists: {record.id}")；存 copy.deepcopy(record)
-      save(record)：  id 不在 raise SessionNotFoundError(record.id)；
-                存 deepcopy
-      load(id)：      KeyError 翻译成 SessionNotFoundError(id) ... from exc
-                （低级异常链——练习 16/17 的老规矩）；返回 deepcopy
-      list()：        返回 [copy.deepcopy(r) for r in self._records.values()]
-      delete(id)：    return self._records.pop(id, None) is not None
-
-    ⚠️ deepcopy 是防串账的关键：存取两端都是副本，调用方改自己手里那份
-    record 不会渗透进 store。这是练习 10"防御性复制"的升级——浅拷贝
-    list() 挡不住 messages 里 dict 的共享，deepcopy 连内层一起复制。
-    （ScriptedModel 的浅拷贝快照 bug 就是这类的活教材。）
+    deepcopy 是防串账的关键：存取两端都是副本，调用方改自己手里那份
+    record 不会渗透进 store（练习 10"防御性复制"的升级——浅拷贝挡不住
+    messages 里 dict 的共享，deepcopy 连内层一起复制；ScriptedModel 的
+    浅拷贝快照 bug 就是这类的活教材）。
 
     为什么 RLock 不是 Lock：SessionProcess._publish 的注释（同线程重入）。
     """
@@ -310,7 +277,7 @@ class SessionProcess:
     # ── 记录写回三件套：状态机的唯一通道 ────────────────────────
 
     def _transition(self, next_state: str) -> None:
-        """迁移状态：查表（TODO 1）→ 改 record.status → _publish。"""
+        """迁移状态：查表 → 改 record.status → _publish。"""
 
         with self._state_lock:
             current = self.record.status

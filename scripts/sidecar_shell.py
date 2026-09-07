@@ -38,7 +38,8 @@ def main() -> None:
         pong = shell.start()
         print(f"[main] sidecar/ping → {pong['status']}")
         print(f"[main] session/create → {shell.session_id}")
-        print("输入问题回车发送。特殊命令：/status /sessions /logs /clear。q 退出。\n")
+        print("输入问题回车发送。特殊命令：/status /sessions /logs /clear "
+              "/close /resume <id> /forget <id>。q 退出。\n")
 
         while True:
             try:
@@ -58,8 +59,12 @@ def main() -> None:
                 continue
 
             if query == "/sessions":
+                # s07-b：清单多了 live（运行时活着吗）和 gen（第几代）两列
+                # ——closed 的会话还在清单里，live=False（记录 ≠ 运行时）。
                 for s in shell.sessions()["sessions"]:
-                    print(f"  {s['id']}  {s['status']}  {s['cwd']}")
+                    print(f"  {s['id']}  {s['status']:<7}  "
+                          f"live={s['live']}  gen={s['runtimeGeneration']}  "
+                          f"{s['cwd']}")
                 print()
                 continue
 
@@ -70,6 +75,29 @@ def main() -> None:
 
             if query == "/clear":
                 print(f"  ↳ 新会话 {shell.clear()}\n")
+                continue
+
+            if query == "/close":
+                # TODO 13a（你来填）：调 shell.close_session()（不传参=当前
+                #   会话），打印返回的 closed 标志；提醒用户 /resume <id>
+                #   可复活、/clear 可开新会话。关闭后 send 会先拿到
+                #   "session not found or closed" 的诚实报错（教学现场）。
+                print("  （TODO 13a 待填：调 shell.close_session()）\n")
+                continue
+
+            if query.startswith("/resume"):
+                # TODO 13b（你来填）：parts = query.split() 取第二段当 sid，
+                #   缺参数提示用法 "/resume sess_0001"；调
+                #   shell.resume_session(sid)，成功打印 generation（换代），
+                #   失败把 error 打出来（live 的会被拒绝）。
+                print("  （TODO 13b 待填：调 shell.resume_session(sid)）\n")
+                continue
+
+            if query.startswith("/forget"):
+                # TODO 13c（你来填）：同 /resume 取 sid；调
+                #   shell.forget_session(sid)；live 的会被拒绝——把 error
+                #   原样打出来，这就是"forget 前必须先 close"的教学现场。
+                print("  （TODO 13c 待填：调 shell.forget_session(sid)）\n")
                 continue
 
             result = shell.send(query)

@@ -188,14 +188,60 @@ class SidecarShell:
             return self._client.call("tool/list")["result"].get("tools", [])
 
     def clear(self) -> str:
-        """清记忆：销毁旧会话再建新会话（/clear 的落点）。返回新 sid。"""
+        """清记忆（s07-b 升级）：完整编舞 close → forget → create。
 
-        with self._rpc_lock:
-            self._client.call("session/destroy", {"sessionId": self._sid})
-            sid = self._client.call("session/create",
-                {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
-        self._sid = sid
-        return sid
+        老 destroy→create 只换 id 不动记录；现在四操作里三个在同一命令里
+        跑一遍：close（释放运行时）→ forget（删记录）→ create（新身份）。
+
+        TODO 12（你来填）：
+          with self._rpc_lock:
+              if self._sid:
+                  self._client.call("session/close", {"sessionId": self._sid})
+                  self._client.call("session/forget", {"sessionId": self._sid})
+              sid = self._client.call("session/create",
+                  {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
+          self._sid = sid
+          return sid
+        """
+        raise NotImplementedError("TODO 12: clear 编舞升级")
+
+    def close_session(self, sid: str = "") -> dict:
+        """关掉一个会话的运行时（记录保留——之后可 resume / forget）。
+
+        TODO 11a（你来填）：
+          target = sid or self._sid        # 不传 = 当前会话（or 短路兜底）
+          with self._rpc_lock:
+              return self._client.call("session/close",
+                  {"sessionId": target})["result"]
+        注意：关掉当前会话后 self._sid **保留不动**——记录还在，它就是
+        /resume 的靶子；之后的 send 会拿到 sidecar 的诚实报错（教学现场：
+        closed ≠ 消失，send 会告诉你运行时没了）。
+        """
+        raise NotImplementedError("TODO 11a: close_session")
+
+    def resume_session(self, sid: str) -> dict:
+        """复活一个 closed 会话（generation+1 的新运行时，历史接着用）。
+
+        TODO 11b（你来填）：
+          with self._rpc_lock:
+              result = self._client.call("session/resume",
+                  {"sessionId": sid})["result"]
+          if "error" not in result:
+              self._sid = sid      # 接管成功才换靶；失败保持原样
+          return result
+        """
+        raise NotImplementedError("TODO 11b: resume_session")
+
+    def forget_session(self, sid: str = "") -> dict:
+        """真删一个会话记录；live 的必须先 close（sidecar 会拒绝）。
+
+        TODO 11c（你来填）：
+          target = sid or self._sid
+          with self._rpc_lock:
+              return self._client.call("session/forget",
+                  {"sessionId": target})["result"]
+        """
+        raise NotImplementedError("TODO 11c: forget_session")
 
     # ── 查询 ────────────────────────────────────────────────
 

@@ -879,3 +879,62 @@ reconciliation（僵尸 running 启动时清理——我们靠 close 第三步�
 崩溃丢最后一轮（教学规模可接受）。generation 的学术对应：分布式系统
 的 epoch / fencing token（防僵尸执行器写旧状态）。
 
+## 已完成：s07 填完（2026-09-07，代码由我填，助手验收）
+
+- 提交：2be871a。会话生命周期全部 TODO 落地（Record/Process 分离、
+  状态机、四操作、InMemory store），217 条测试全绿。
+
+## 进行中：s07-b Sidecar 会话接线（骨架已建，等我填代码）
+
+设计：把 s07 的 SessionManager 接进 sidecar——`self.sessions` 裸字典
+退役；session/destroy（一删全没）换成 **session/close**（释放运行时、
+留记录、幂等）；新增 **session/resume**（旧 id + generation+1 的新
+运行时，live 拒绝）和 **session/forget**（真删除，必须先 close）；
+agent/send 改走 **run_turn**——并发拒绝、晚到结果拒收由状态机接管，
+不再手工回写字典。壳层跟上：SidecarShell 加三个薄包装，/clear 编舞
+升级 close→forget→create，终端 UI 加 /close /resume /forget。
+
+两个关键设计判断（骨架注释里都有展开）：
+
+1. **TurnRunner 协议装不下 status**：协议返回值只有 (output, messages)，
+   而 agent/send 的 RPC 响应要诚实汇报 max_steps/failed → turn_runner
+   闭包里记 `self._last_turn_status`（协议接缝记账）。安全前提：同一
+   时刻至多一个 turn（handle_connection 单线程 + 壳 _rpc_lock 串行化）；
+   跨连接并发 turn 是已知边界（status 可能串台，output 走返回值不受影响）。
+2. **起步历史要播进两个副本**：create 后 runtime 工作副本（run_turn
+   从它拿历史）和 store 存档（resume 从它拿历史）是两份 deepcopy——
+   只写一个 = 另一条路丢 system 提示。这是 s07 deepcopy 防串账的代价
+   现场课。
+
+- `src/harness/sidecar.py`：TODO 1 `_make_turn_runner`（闭包 run_agent：
+  trim_history + on_event + 权限 runner，调用那一刻才读 per-connection
+  属性 + status 记账）；TODO 2 `__init__` 换 SessionManager；TODO 3 路由
+  表（destroy 退役，close/resume/forget 上岗）；TODO 4 create（+播种
+  两个副本）；TODO 5~8 list/close/resume/forget handler（领域异常
+  SessionLifecycleError/ValueError/OSError 翻译成 {"error": 人话}）；
+  TODO 9 agent/send 走 run_turn；TODO 10 /status 会话计数改记录口径。
+
+- `scripts/shell.py`：TODO 11a~c 三个薄包装（close 后 _sid 保留 =
+  resume 的靶子；resume 成功才接管）；TODO 12 clear 编舞升级。
+
+- `scripts/sidecar_shell.py`：TODO 13a~c 三个 UI 命令（/close、
+  /resume <id>、/forget <id>，用 query.split() 取 sid）；/sessions 列
+  已升级 live + gen 两列（助手直接改的，纯展示）。
+
+- 测试（助手写，全离线）：test_sidecar 会话测试按新契约重写 + 新增
+  （close 幂等留记录 / resume 跨 close 记忆延续 + 换代 / live 拒绝 /
+  forget 先 close / closed 会话 send 报错 / status 记录口径）；
+  test_shell 新包装 + clear 编舞；3 条 dispatch 集成测试跟着红灯
+  （它们靠 session/create + agent/send 驱动审批/事件分派，跨过了
+  重接的边界，填完自动回绿；其中 reject 测试的 transcript 读取已
+  从 server.sessions 改为 manager.load_record）。
+
+当前测试状态：225 条中 17 红（全部钉在 TODO 上），208 绿
+（未动的机制全绿）。
+
+验收标准：225 条全绿 + 终端冒烟剧本——提问 → /close 后再 send 拿到
+"closed" 报错 → /resume 接着聊历史还在 → /forget live 被拒、close 后
+真删 → /sessions 里 closed 会话 live=False 且记录还在。
+
+顺序不变：s07-b 填完 → s09 持久化 → s08 模型路由。
+

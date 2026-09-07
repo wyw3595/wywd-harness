@@ -126,7 +126,11 @@ class RPCConnectionTests(unittest.TestCase):
 
 
 class SidecarServerTests(unittest.TestCase):
-    """领域路由 + 会话生命周期 + agent/send（审批两路 / 历史延续 / max_steps）。"""
+    """领域路由 + 会话生命周期（s07-b：close/resume/forget）+ agent/send。
+
+    会话语义已换代：close 释放运行时但留记录（幂等）、resume 换代重建、
+    forget 才真删——测试全部按 SessionManager 的新契约写（s07-b 红灯）。
+    """
 
     def _make_registry(self, tmp: str, tracked: dict) -> ToolRegistry:
         """带"写工具"的注册表（handler 必须带类型注解——s04 教训）。"""
@@ -189,21 +193,29 @@ class SidecarServerTests(unittest.TestCase):
         self.assertEqual(resp["error"]["code"], -32601)
         conn.close()
 
-    def test_session_create_list_destroy_lifecycle(self) -> None:
+    def test_session_close_lifecycle(self) -> None:
+        """s07-b 新语义：close 释放运行时但记录保留；幂等；未知 id 报错。"""
+
         server = SidecarServer(model=None, registry=ToolRegistry(),
                                policy=build_default_policy())
         conn, _ = self._spawn(server)
-        created = self._request(conn, "session/create", {"cwd": "."})["result"]
-        sid = created["sessionId"]
+        sid = self._request(conn, "session/create", {"cwd": "."})["result"]["sessionId"]
         self.assertTrue(sid.startswith("sess_"))
+        # close：关运行时，记录还在（区别于老 destroy 的一删全没）
+        closed = self._request(conn, "session/close", {"sessionId": sid})["result"]
+        self.assertEqual(closed["status"], "ok")
+        self.assertTrue(closed["closed"])
         listed = self._request(conn, "session/list")["result"]["sessions"]
-        self.assertTrue(any(s["id"] == sid for s in listed))
-        destroyed = self._request(conn, "session/destroy", {"sessionId": sid})["result"]
-        self.assertEqual(destroyed["status"], "ok")
-        listed2 = self._request(conn, "session/list")["result"]["sessions"]
-        self.assertFalse(any(s["id"] == sid for s in listed2))
-        again = self._request(conn, "session/destroy", {"sessionId": sid})
-        self.assertIn("error", again["result"])
+        row = next(s for s in listed if s["id"] == sid)
+        self.assertEqual(row["status"], "closed")
+        self.assertFalse(row["live"])       # 记录在、运行时没了
+        # 幂等：二次 close 不报错（老 destroy 二次会 not found）
+        again = self._request(conn, "session/close", {"sessionId": sid})["result"]
+        self.assertEqual(again["status"], "ok")
+        self.assertFalse(again["closed"])
+        # 未知 id：诚实报错
+        missing = self._request(conn, "session/close", {"sessionId": "nope"})["result"]
+        self.assertIn("error", missing)
         conn.close()
 
     def test_session_create_seeds_system_prompt(self) -> None:
@@ -214,7 +226,83 @@ class SidecarServerTests(unittest.TestCase):
         )
         conn, _ = self._spawn(server)
         sid = self._request(conn, "session/create")["result"]["sessionId"]
-        self.assertEqual(server.sessions[sid]["messages"][0]["role"], "system")
+        # 从 store 存档看（resume 走的就是这条路——两个副本都得有 system）
+        record = server._manager.load_record(sid)
+        self.assertEqual(record.messages[0]["role"], "system")
+        conn.close()
+
+    def test_session_resume_continues_history(self) -> None:
+        """close 后 resume：新运行时接着旧 transcript 聊（s07 的招牌语义）。"""
+
+        scripted = ScriptedModel([
+            ModelReply(kind="final", text="甲"),
+            ModelReply(kind="final", text="乙"),
+        ])
+        server = SidecarServer(model=scripted, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        sid = self._request(conn, "session/create", {"cwd": "."})["result"]["sessionId"]
+        self._request(conn, "agent/send", {"sessionId": sid, "message": "任务甲"})
+        self._request(conn, "session/close", {"sessionId": sid})
+        resumed = self._request(conn, "session/resume", {"sessionId": sid})["result"]
+        self.assertEqual(resumed["generation"], 2)   # 换代：第 2 代运行时
+        self._request(conn, "agent/send", {"sessionId": sid, "message": "任务乙"})
+        second = scripted.received_inputs[1]
+        self.assertIn("任务甲", str(second))   # 跨 close/resume 的记忆延续
+        conn.close()
+
+    def test_session_resume_live_rejected(self) -> None:
+        """live 会话 resume 会被拒——两个执行器写同一段 transcript 是竞争。"""
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        sid = self._request(conn, "session/create", {"cwd": "."})["result"]["sessionId"]
+        resp = self._request(conn, "session/resume", {"sessionId": sid})["result"]
+        self.assertIn("error", resp)
+        conn.close()
+
+    def test_session_forget_requires_close_then_deletes(self) -> None:
+        """forget：live 拒绝；close 后真删；不存在报错。"""
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        sid = self._request(conn, "session/create", {"cwd": "."})["result"]["sessionId"]
+        live = self._request(conn, "session/forget", {"sessionId": sid})["result"]
+        self.assertIn("error", live)          # live：必须先 close
+        self._request(conn, "session/close", {"sessionId": sid})
+        forgot = self._request(conn, "session/forget", {"sessionId": sid})["result"]
+        self.assertEqual(forgot.get("status"), "ok")
+        listed = self._request(conn, "session/list")["result"]["sessions"]
+        self.assertFalse(any(s["id"] == sid for s in listed))   # 真消失
+        again = self._request(conn, "session/forget", {"sessionId": sid})["result"]
+        self.assertIn("error", again)         # 不存在：诚实报错
+        conn.close()
+
+    def test_agent_send_closed_session_returns_error(self) -> None:
+        """closed 的会话 send 报错——"记录还在"和"运行时活着"是两回事。"""
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        sid = self._request(conn, "session/create", {"cwd": "."})["result"]["sessionId"]
+        self._request(conn, "session/close", {"sessionId": sid})
+        resp = self._request(conn, "agent/send",
+                             {"sessionId": sid, "message": "hi"})["result"]
+        self.assertIn("error", resp)
+        conn.close()
+
+    def test_status_counts_records_not_live(self) -> None:
+        """/status 的 sessions 口径 = 记录总数（closed 未 forget 也计入）。"""
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        sid = self._request(conn, "session/create", {"cwd": "."})["result"]["sessionId"]
+        self._request(conn, "session/close", {"sessionId": sid})
+        status = self._request(conn, "sidecar/status")["result"]
+        self.assertEqual(status["sessions"], 1)   # 记录还在，只是运行时没了
         conn.close()
 
     def test_agent_send_unknown_session_returns_error(self) -> None:
@@ -356,8 +444,9 @@ class MainProcessClientTests(unittest.TestCase):
             ])
             resp = client.call("agent/send", {"sessionId": sid, "message": "写文件"})
             self.assertEqual(tracked["calls"], 0)  # 拒绝：不碰 handler
+            # s07-b：transcript 从 store 存档读（server.sessions 裸字典已退役）
             tool_msgs = " ".join(
-                m.get("content", "") for m in server.sessions[sid]["messages"]
+                m.get("content", "") for m in server._manager.load_record(sid).messages
                 if m["role"] == "tool"
             )
             self.assertIn("permission_blocked", tool_msgs)
