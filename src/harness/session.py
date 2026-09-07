@@ -104,7 +104,14 @@ class SessionState(str, Enum):
 #     closing  → {closed, error}
 #     closed   → {}            （终点；复活的唯一途径是 Manager resume）
 #     error    → {closing, closed}
-_ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = ...
+_ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
+    SessionState.CREATING: frozenset({SessionState.IDLE, SessionState.CLOSING, SessionState.ERROR}),
+    SessionState.IDLE: frozenset({SessionState.RUNNING, SessionState.CLOSING, SessionState.ERROR}),
+    SessionState.RUNNING: frozenset({SessionState.IDLE, SessionState.CLOSING, SessionState.ERROR}),
+    SessionState.CLOSING: frozenset({SessionState.CLOSED, SessionState.ERROR}),
+    SessionState.CLOSED: frozenset(),   # 终点;复活的唯一途径是 Manager resume
+    SessionState.ERROR: frozenset({SessionState.CLOSING, SessionState.CLOSED}),
+}
 
 
 class SessionLifecycleError(RuntimeError):
@@ -145,7 +152,32 @@ class SessionAlreadyRunningError(SessionLifecycleError):
 #    "messages": len(self.messages), "lastError"}
 @dataclass
 class SessionRecord:
-    ...
+    """可跨 runtime 存活的逻辑会话：只有可持久化字段，没有运行时对象。"""
+
+    id: str
+    cwd: str
+    mode: str = MODE_CRAFT
+    title: str = "未命名会话"
+    status: str = SessionState.CREATING
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    runtime_generation: int = 1
+    messages: list[dict] = field(default_factory=list)
+    last_error: Optional[str] = None
+
+    def summary(self) -> dict:
+        """UI 安全的视图：不含任何运行时对象，messages 只给条数。"""
+
+        return {
+            "id": self.id,
+            "cwd": self.cwd,
+            "title": self.title,
+            "status": self.status,
+            "mode": self.mode,
+            "runtimeGeneration": self.runtime_generation,
+            "messages": len(self.messages),
+            "lastError": self.last_error,
+        }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -193,7 +225,35 @@ class InMemorySessionStore:
     """
 
     def __init__(self) -> None:
-        raise NotImplementedError("TODO 3")
+        self._records: dict[str, SessionRecord] = {}
+        self._lock = threading.RLock()
+
+    def create(self, record: SessionRecord) -> None:
+        with self._lock:
+            if record.id in self._records:
+                raise SessionLifecycleError(f"session already exists: {record.id}")
+            self._records[record.id] = copy.deepcopy(record)
+
+    def save(self, record: SessionRecord) -> None:
+        with self._lock:
+            if record.id not in self._records:
+                raise SessionNotFoundError(record.id)
+            self._records[record.id] = copy.deepcopy(record)
+
+    def load(self, session_id: str) -> SessionRecord:
+        with self._lock:
+            try:
+                return copy.deepcopy(self._records[session_id])
+            except KeyError as exc:
+                raise SessionNotFoundError(session_id) from exc
+
+    def list(self) -> list[SessionRecord]:
+        with self._lock:
+            return [copy.deepcopy(r) for r in self._records.values()]
+
+    def delete(self, session_id: str) -> bool:
+        with self._lock:
+            return self._records.pop(session_id, None) is not None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -250,88 +310,79 @@ class SessionProcess:
     # ── 记录写回三件套：状态机的唯一通道 ────────────────────────
 
     def _transition(self, next_state: str) -> None:
-        """迁移状态：查表（TODO 1）→ 改 record.status → _publish。
+        """迁移状态：查表（TODO 1）→ 改 record.status → _publish。"""
 
-        TODO 4a（你来填）：
-          整个读改写在 with self._state_lock 内：
-            1. next_state == 现状 → return（同值迁移幂等，不算违法）；
-            2. allowed = _ALLOWED_TRANSITIONS.get(现状, frozenset())；
-               next_state 不在 allowed → raise SessionLifecycleError(
-                   f"invalid session transition: {现状} -> {next_state}")；
-            3. self.record.status = next_state；调 self._publish()。
-        """
+        with self._state_lock:
+            current = self.record.status
+            if next_state == current:
+                return  # 同值迁移幂等，不算违法
+            allowed = _ALLOWED_TRANSITIONS.get(current, frozenset())
+            if next_state not in allowed:
+                raise SessionLifecycleError(
+                    f"invalid session transition: {current} -> {next_state}")
+            self.record.status = next_state
+            self._publish()
 
     def _publish(self) -> None:
-        """把 record 的最新样子回写给 store（record_sink）。
+        """把 record 的最新样子回写给 store（record_sink）。"""
 
-        TODO 4b（你来填）：
-          with self._state_lock 内：
+        with self._state_lock:
             self.record.updated_at = time.time()
             self._record_sink(copy.deepcopy(self.record))
 
-        ⚠️ 为什么 _state_lock 用 RLock 而不是 Lock：_transition **拿着**
-        这把锁调 _publish，_publish 还要再拿同一把锁。普通 Lock 同线程
-        重入会当场死锁（自己等自己）；RLock 内部计数，同线程可重入，
-        不同线程照样互斥。这里必须 RLock。
-        """
-
     def _commit_transcript_if_running(self, messages: list[dict]) -> bool:
-        """turn 结果落盘的原子闸门：只有还处于 RUNNING 才收。
+        """turn 结果落盘的原子闸门：只有还处于 RUNNING 才收。"""
 
-        TODO 4c（你来填）：
-          with self._state_lock 内：
-            1. status 不是 RUNNING → return False（close 抢先了，
-               晚到的结果被拒之门外——本课最精妙的竞态防线）；
-            2. record.messages = messages；record.last_error = None；
-               _publish()；return True。
-        """
+        with self._state_lock:
+            if self.record.status != SessionState.RUNNING:
+                return False  # close 抢先了，晚到的结果被拒之门外
+            self.record.messages = messages
+            self.record.last_error = None
+            self._publish()
+            return True
 
     # ── 生命周期：start / run_turn / abort / close ─────────────
 
     def start(self) -> None:
-        """把一代新运行时点亮：creating → idle。
+        """把一代新运行时点亮：creating → idle。"""
 
-        TODO 5（你来填）：
-          1. status 不是 creating → raise SessionLifecycleError(
-                 f"cannot start session {self.id} from {self.status}")；
-          2. （教材这里 bind 端口 0 起 HTTP listener；我们的运行时资源
-             ——锁和信号——构造期已就位，无需再分配，直接下一步）
-          3. self._transition(SessionState.IDLE)。
-        """
-        raise NotImplementedError("TODO 5")
+        if self.record.status != SessionState.CREATING:
+            raise SessionLifecycleError(
+                f"cannot start session {self.id} from {self.status}")
+        # 教材这里 bind 端口 0 起 HTTP listener；我们的运行时资源
+        # （锁和信号）构造期已就位，无需再分配，直接下一步。
+        self._transition(SessionState.IDLE)
 
     def run_turn(self, user_message: str) -> str:
-        """执行一个 turn：idle → running → idle 的封闭旅行。
+        """执行一个 turn：idle → running → idle 的封闭旅行。"""
 
-        TODO 6（你来填）：
-          1. if not self._turn_lock.acquire(blocking=False):   # 非阻塞抢锁
-                 raise SessionLifecycleError(
-                     f"session {self.id} already has a running turn")
-             （抢不到 = 已有 turn 在跑：拒绝并发输入，绝不排队）
-          2. try: ... finally: self._turn_lock.release()       # 锁必放
-             try 体里依次：
-             a. status 不是 idle → raise SessionLifecycleError(
+        if not self._turn_lock.acquire(blocking=False):
+            # 抢不到 = 已有 turn 在跑：拒绝并发输入，绝不排队
+            raise SessionLifecycleError(
+                f"session {self.id} already has a running turn")
+        try:
+            if self.record.status != SessionState.IDLE:
+                raise SessionLifecycleError(
                     f"session {self.id} cannot accept input while {self.status}")
-             b. self._abort_requested.clear()  # 上一轮的 abort 不传染
-             c. self._transition(SessionState.RUNNING)
-             d. 内层 try/except：
-                try:
-                    output, new_messages = self._turn_runner(
-                        user_message, list(self.record.messages))
-                    if not self._commit_transcript_if_running(new_messages):
-                        raise SessionLifecycleError(
-                            "turn discarded: session runtime closed mid-turn")
-                    if self.status == SessionState.RUNNING:
-                        self._transition(SessionState.IDLE)
-                    return output
-                except Exception as exc:
-                    # 只有还处于 RUNNING 才算本代失败（close 竞态不算）：
-                    if self.status == SessionState.RUNNING:
-                        self.record.last_error = str(exc)
-                        self._transition(SessionState.ERROR)
-                    raise          # 原样再抛，翻译留给调用方
-        """
-        raise NotImplementedError("TODO 6")
+            self._abort_requested.clear()  # 上一轮的 abort 不传染
+            self._transition(SessionState.RUNNING)
+            try:
+                output, new_messages = self._turn_runner(
+                    user_message, list(self.record.messages))
+                if not self._commit_transcript_if_running(new_messages):
+                    raise SessionLifecycleError(
+                        "turn discarded: session runtime closed mid-turn")
+                if self.status == SessionState.RUNNING:
+                    self._transition(SessionState.IDLE)
+                return output
+            except Exception as exc:
+                # 只有还处于 RUNNING 才算本代失败（close 竞态不算）：
+                if self.status == SessionState.RUNNING:
+                    self.record.last_error = str(exc)
+                    self._transition(SessionState.ERROR)
+                raise          # 原样再抛，翻译留给调用方
+        finally:
+            self._turn_lock.release()
 
     def abort(self) -> None:
         """请求协作式中断：只置信号，不删记录、不动其他资源。
@@ -344,19 +395,16 @@ class SessionProcess:
         self._abort_requested.set()
 
     def close(self) -> None:
-        """释放运行时资源，保留逻辑记录。幂等：重复 close 直接返回。
+        """释放运行时资源，保留逻辑记录。幂等：重复 close 直接返回。"""
 
-        TODO 7（你来填）：
-          1. status 已是 CLOSED → return（幂等的关键一行，在最先）；
-          2. status 不是 CLOSING 也不是 ERROR → _transition(CLOSING)；
-          3. self._abort_requested.set()（先请正在跑的 turn 合作停下）；
-          4. status 不是 CLOSED → _transition(CLOSED)。
-          （教材这里还要 shutdown HTTP server + join 线程；我们没有
-          listener，锁和信号随对象回收。新一代 SessionProcess 会拿到
-          全新的锁和 Event——旧信号天然不传染，这也是 run_turn 里
-          还要 clear 一次的双保险原因。）
-        """
-        raise NotImplementedError("TODO 7")
+        if self.record.status == SessionState.CLOSED:
+            return  # 幂等：已在 CLOSED，什么都不做
+        if self.record.status != SessionState.CLOSING and \
+                self.record.status != SessionState.ERROR:
+            self._transition(SessionState.CLOSING)
+        self._abort_requested.set()  # 先请正在跑的 turn 合作停下
+        if self.record.status != SessionState.CLOSED:
+            self._transition(SessionState.CLOSED)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -384,15 +432,14 @@ class SessionManager:
 
     @staticmethod
     def _highest_existing_counter(records: list[SessionRecord]) -> int:
-        """从已有 id 里摸出最大编号："sess_0007" → 7。
+        """从已有 id 里摸出最大编号："sess_0007" → 7。"""
 
-        TODO 8a（你来填）：
-          "sess_0007".rpartition("_") → ("sess", "_", "0007")（三段元组：
-          分隔符左边、分隔符本身、右边；找不到分隔符则左边两个为空串）。
-          遍历 records：prefix == "sess" 且 suffix.isdigit() 的收 int(suffix)；
-          return max(计数列表, default=0)（store 空时返回 0）。
-        """
-        raise NotImplementedError("TODO 8a")
+        counters: list[int] = []
+        for record in records:
+            prefix, _, suffix = record.id.rpartition("_")
+            if prefix == "sess" and suffix.isdigit():
+                counters.append(int(suffix))
+        return max(counters, default=0)
 
     def create_session(
         self,
@@ -400,17 +447,15 @@ class SessionManager:
         mode: str = MODE_CRAFT,
         title: str = "未命名会话",
     ) -> str:
-        """创建新逻辑身份 + 第 1 代运行时，返回 session id。
+        """创建新逻辑身份 + 第 1 代运行时，返回 session id。"""
 
-        TODO 8b（你来填）：
-          1. resolved = self._validate_options(cwd, mode)
-          2. self._counter += 1；sid = f"sess_{self._counter:04d}"
-          3. record = SessionRecord(id=sid, cwd=resolved, mode=mode, title=title)
-          4. self.store.create(record)      # 先有身份
-          5. self._start_runtime(record)    # 再有第 1 代运行时
-          6. return sid
-        """
-        raise NotImplementedError("TODO 8b")
+        resolved = self._validate_options(cwd, mode)
+        self._counter += 1
+        sid = f"sess_{self._counter:04d}"
+        record = SessionRecord(id=sid, cwd=resolved, mode=mode, title=title)
+        self.store.create(record)      # 先有身份
+        self._start_runtime(record)    # 再有第 1 代运行时
+        return sid
 
     @staticmethod
     def _validate_options(cwd: str, mode: str) -> str:
@@ -438,59 +483,50 @@ class SessionManager:
         self._runtimes[record.id] = runtime
 
     def resume_session(self, session_id: str) -> str:
-        """用旧身份造新运行时：generation + 1，资源和信号全新。
+        """用旧身份造新运行时：generation + 1，资源和信号全新。"""
 
-        TODO 9a（你来填）：
-          1. session_id in self._runtimes → raise
-             SessionAlreadyRunningError(session_id)
-             （两个执行器写同一段 transcript = 竞争与副作用失序）；
-          2. record = self.store.load(session_id)
-          3. self._validate_options(record.cwd, record.mode)
-          4. record.status = SessionState.CREATING
-             （Manager 直写——此刻没有 runtime 持有它，不走 _transition）
-          5. record.runtime_generation += 1；record.last_error = None
-          6. self.store.save(record)
-          7. self._start_runtime(record)；return session_id
-        """
-        raise NotImplementedError("TODO 9a")
+        if session_id in self._runtimes:
+            # 两个执行器写同一段 transcript = 竞争与副作用失序
+            raise SessionAlreadyRunningError(session_id)
+        record = self.store.load(session_id)
+        self._validate_options(record.cwd, record.mode)
+        record.status = SessionState.CREATING
+        # Manager 直写——此刻没有 runtime 持有它，不走 _transition
+        record.runtime_generation += 1
+        record.last_error = None
+        self.store.save(record)
+        self._start_runtime(record)
+        return session_id
 
     def close_session(self, session_id: str) -> bool:
-        """关掉 live runtime，保留记录和 transcript。返回是否真关了一个。
+        """关掉 live runtime，保留记录和 transcript。返回是否真关了一个。"""
 
-        TODO 9b（你来填）：
-          1. runtime = self._runtimes.pop(session_id, None)
-          2. runtime 不为 None → runtime.close()；return True
-          3. 没有 live runtime（可能早已关闭，也可能只是记录还标着
-             running 的僵尸）：record = self.store.load(session_id)；
-             if record.status != SessionState.CLOSED:
-                 record.status = SessionState.CLOSED
-                 record.updated_at = time.time()
-                 self.store.save(record)
-             return False
-             ⚠️ 第 3 步就是"running 不是存活证明"的落点：僵尸 running
-             被抹成 closed，之后才能 resume。幂等：重复 close 已关会话
-             走第 3 步，status 已 closed，不再改写。
-        """
-        raise NotImplementedError("TODO 9b")
+        runtime = self._runtimes.pop(session_id, None)
+        if runtime is not None:
+            runtime.close()
+            return True
+        # 没有 live runtime（可能早已关闭，也可能只是记录还标着
+        # running 的僵尸）：把记录抹成 closed，以后才能 resume。
+        record = self.store.load(session_id)
+        if record.status != SessionState.CLOSED:
+            record.status = SessionState.CLOSED
+            record.updated_at = time.time()
+            self.store.save(record)
+        return False
 
     def forget_session(self, session_id: str) -> bool:
-        """真正删除逻辑记录；live 的必须先 close。
+        """真正删除逻辑记录；live 的必须先 close。"""
 
-        TODO 9c（你来填）：
-          1. session_id in self._runtimes → raise SessionLifecycleError(
-                 f"close session {session_id} before forgetting its record")
-          2. return self.store.delete(session_id)
-        """
-        raise NotImplementedError("TODO 9c")
+        if session_id in self._runtimes:
+            raise SessionLifecycleError(
+                f"close session {session_id} before forgetting its record")
+        return self.store.delete(session_id)
 
     def shutdown_all(self) -> None:
-        """关掉全部 live runtime；记录全留，都可 resume。
+        """关掉全部 live runtime；记录全留，都可 resume。"""
 
-        TODO 9d（你来填）：
-          for sid in list(self._runtimes):   # list() 快照——边遍历边删会炸
-              self.close_session(sid)
-        """
-        raise NotImplementedError("TODO 9d")
+        for sid in list(self._runtimes):   # list() 快照——边遍历边删会炸
+            self.close_session(sid)
 
     # ── 只读视图 ──────────────────────────────────────────────
 
