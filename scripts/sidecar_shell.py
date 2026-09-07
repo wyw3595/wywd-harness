@@ -78,26 +78,42 @@ def main() -> None:
                 continue
 
             if query == "/close":
-                # TODO 13a（你来填）：调 shell.close_session()（不传参=当前
-                #   会话），打印返回的 closed 标志；提醒用户 /resume <id>
-                #   可复活、/clear 可开新会话。关闭后 send 会先拿到
-                #   "session not found or closed" 的诚实报错（教学现场）。
-                print("  （TODO 13a 待填：调 shell.close_session()）\n")
-                continue
+                # 关当前会话（不传参=当前）：记录保留，closed ≠ 消失。
+                result = shell.close_session()   # {"status","closed"} 或 {"error"}
+                if "error" in result:
+                    print(f"Error: {result['error']}\n")
+                else:
+                    print(f"  ↳ 会话 {result.get('closed')} 已关闭（记录保留）\n")
+                    print("    /resume <id> 可复活，/clear 可开新会话\n")
+                continue   # 别把 "/close" 当普通消息发给 agent
+
+
 
             if query.startswith("/resume"):
-                # TODO 13b（你来填）：parts = query.split() 取第二段当 sid，
-                #   缺参数提示用法 "/resume sess_0001"；调
-                #   shell.resume_session(sid)，成功打印 generation（换代），
-                #   失败把 error 打出来（live 的会被拒绝）。
-                print("  （TODO 13b 待填：调 shell.resume_session(sid)）\n")
+                parts = query.split()
+                if len(parts) < 2:
+                    print('  用法：/resume sess_0001\n')
+                    continue
+                sid = parts[1]
+                result = shell.resume_session(sid)   # 成功 {"sessionId","generation"}；live 被拒
+                if "error" in result:
+                    print(f"Error: {result['error']}\n")
+                else:
+                    print(f"  ↳ 已复活 {sid}（generation {result['generation']}）\n")
                 continue
 
+
             if query.startswith("/forget"):
-                # TODO 13c（你来填）：同 /resume 取 sid；调
-                #   shell.forget_session(sid)；live 的会被拒绝——把 error
-                #   原样打出来，这就是"forget 前必须先 close"的教学现场。
-                print("  （TODO 13c 待填：调 shell.forget_session(sid)）\n")
+                parts = query.split()
+                if len(parts) < 2:
+                    print('  用法：/forget sess_0001\n')
+                    continue
+                sid = parts[1]
+                result = shell.forget_session(sid)   # live 的会被拒绝：先 close 再 forget
+                if "error" in result:
+                    print(f"Error: {result['error']}\n")
+                else:
+                    print(f"  ↳ 已遗忘 {sid}\n")
                 continue
 
             result = shell.send(query)

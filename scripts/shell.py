@@ -203,7 +203,14 @@ class SidecarShell:
           self._sid = sid
           return sid
         """
-        raise NotImplementedError("TODO 12: clear 编舞升级")
+        with self._rpc_lock:
+            if self._sid:
+                self._client.call("session/close", {"sessionId": self._sid})
+                self._client.call("session/forget", {"sessionId": self._sid})
+            sid = self._client.call("session/create",
+                {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
+        self._sid = sid
+        return sid
 
     def close_session(self, sid: str = "") -> dict:
         """关掉一个会话的运行时（记录保留——之后可 resume / forget）。
@@ -217,7 +224,10 @@ class SidecarShell:
         /resume 的靶子；之后的 send 会拿到 sidecar 的诚实报错（教学现场：
         closed ≠ 消失，send 会告诉你运行时没了）。
         """
-        raise NotImplementedError("TODO 11a: close_session")
+        target = sid or self._sid
+        with self._rpc_lock:
+            return self._client.call("session/close",
+                  {"sessionId": target})["result"]
 
     def resume_session(self, sid: str) -> dict:
         """复活一个 closed 会话（generation+1 的新运行时，历史接着用）。
@@ -230,7 +240,12 @@ class SidecarShell:
               self._sid = sid      # 接管成功才换靶；失败保持原样
           return result
         """
-        raise NotImplementedError("TODO 11b: resume_session")
+        with self._rpc_lock:
+            result = self._client.call("session/resume",
+                  {"sessionId": sid})["result"]
+        if "error" not in result:
+            self._sid = sid
+        return result
 
     def forget_session(self, sid: str = "") -> dict:
         """真删一个会话记录；live 的必须先 close（sidecar 会拒绝）。
@@ -241,7 +256,25 @@ class SidecarShell:
               return self._client.call("session/forget",
                   {"sessionId": target})["result"]
         """
-        raise NotImplementedError("TODO 11c: forget_session")
+        target = sid or self._sid
+        with self._rpc_lock:
+            return self._client.call("session/forget",
+                  {"sessionId": target})["result"]
+
+    def new_session(self) -> str:
+        """另开一个新会话并切换为当前——旧的只 close（记录保留），不 forget。
+
+        与 clear()（close→forget→create 全清）的区别：新建是"开个新的，
+        旧的留档"；旧记录还要不要，留给用户用 /forget 决定。
+        """
+
+        with self._rpc_lock:
+            if self._sid:
+                self._client.call("session/close", {"sessionId": self._sid})
+            sid = self._client.call("session/create",
+                {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
+        self._sid = sid
+        return sid
 
     # ── 查询 ────────────────────────────────────────────────
 

@@ -32,7 +32,13 @@ if PROJECT_ROOT not in sys.path:
 import chainlit as cl
 
 from scripts.shell import SidecarShell
+from scripts import sidecar_panel
 from src.harness.sidecar import ConnectionClosed
+
+# 面板后端：进程内 HTTP 小服务（8765）。custom_js 侧边栏要拉/操作会话，
+# fetch 到这个服务——请求进度里的 chainlit 进程才能触达跑的 SidecarShell。
+# 幂等：模块被 chainlit 加载一次启一次（daemon 线程，进程退出自动收）。
+sidecar_panel.ensure_server()
 
 # 审批卡片的超时秒数：5 分钟没人点 = 拒绝。审批的默认答案必须是"不"
 # （fail-closed）——沉默和"点了个拒绝"在这里是同一个结局。
@@ -119,6 +125,9 @@ def _ensure_shell() -> SidecarShell:
     shell = _make_web_shell(cl.user_session.get("loop"))
     shell.start()
     cl.user_session.set("shell", shell)
+    # 登记进面板注册表（thread 标识来自 chainlit 的 user_session["id"]）：
+    # 侧边栏靠它找到本页面这个壳，才能拉清单/做操作。
+    sidecar_panel.register(cl.user_session.get("id"), shell)
     return shell
 
 
@@ -141,6 +150,18 @@ async def on_chat_start() -> None:
         await cl.Message(content=f"⚠️ sidecar 启动失败：{error}").send()
 
 
+def _session_list_text(shell: SidecarShell) -> str:
+    """当前会话清单文本——/resume、/forget 缺参数时给用户指路。
+
+    closed 的会话也在清单里（live=False）：记录 ≠ 运行时，s07 的核心一课。
+    """
+
+    lines = []
+    for s in shell.sessions()["sessions"]:
+        lines.append(f"  `{s['id']}`  {s['status']}（live={s['live']}，gen={s['runtimeGeneration']}）")
+    return "\n".join(lines) or "  （暂无会话）"
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     """用户发来一条消息时执行：交给 sidecar 里的 agent，直播事件、显示结果。"""
@@ -151,6 +172,49 @@ async def on_message(message: cl.Message) -> None:
     if task == "/clear":
         shell.clear()
         await cl.Message(content="记忆已清空（sidecar 里换了新会话）。").send()
+        return
+
+    if task == "/close":
+        # 关当前会话（不传参=当前）：记录保留，closed ≠ 消失。
+        result = shell.close_session()
+        if "error" in result:
+            await cl.Message(content=f"⚠️ {result['error']}").send()
+        else:
+            await cl.Message(
+                content=f"会话 {result.get('closed')} 已关闭（记录保留）。\n"
+                "`/resume <id>` 可复活，`/clear` 可开新会话。").send()
+        return
+
+    if task.startswith("/resume"):
+        parts = task.split()
+        if len(parts) < 2:
+            await cl.Message(
+                content=f"用法：`/resume sess_0001`\n当前会话清单：\n{_session_list_text(shell)}"
+            ).send()
+            return
+        sid = parts[1]
+        result = shell.resume_session(sid)   # 成功侧 shell._sid 已换成它；live 的会被拒
+        if "error" in result:
+            await cl.Message(content=f"⚠️ {result['error']}").send()
+        else:
+            await cl.Message(
+                content=f"✅ 已复活 `{sid}`（generation {result['generation']}）。现在直接发消息就行。"
+            ).send()
+        return
+
+    if task.startswith("/forget"):
+        parts = task.split()
+        if len(parts) < 2:
+            await cl.Message(
+                content=f"用法：`/forget sess_0001`\n当前会话清单：\n{_session_list_text(shell)}"
+            ).send()
+            return
+        sid = parts[1]
+        result = shell.forget_session(sid)   # live 的会被拒：先 /close 再 /forget
+        if "error" in result:
+            await cl.Message(content=f"⚠️ {result['error']}").send()
+        else:
+            await cl.Message(content=f"✅ 已遗忘 `{sid}`。").send()
         return
 
     try:
@@ -176,3 +240,5 @@ async def on_chat_end() -> None:
     if shell is not None:
         shell.stop()
     cl.user_session.set("shell", None)
+    # 从面板注册表注销：这个 tab 的壳没了，侧边栏别再指向它
+    sidecar_panel.unregister(cl.user_session.get("id"))
