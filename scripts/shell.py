@@ -45,17 +45,24 @@ if _PROJECT_ROOT not in _env_paths:
 
 from scripts.electron_shell import choose_model
 from scripts.toolbox import build_policy, build_registry, with_system
+from src.harness.jsonl_store import JsonlSessionStore
 from src.harness.sidecar import MainProcessClient, RPCConnection, SidecarServer
 
 
 def _sidecar_process(sock: socket.socket) -> None:
-    """Sidecar 子进程入口（spawn 守则①：必须模块级函数）。装配全在子进程内。"""
+    """Sidecar 子进程入口（spawn 守则①：必须模块级函数）。装配全在子进程内。
 
+    store 用 JSONL 证据文件（s09）：会话活过进程重启。教学版放项目内
+    .sessions/（.gitignore 已挡）；Claude Code 同款思路是
+    ~/.claude/projects/<工作区>/<会话id>.jsonl——每会话一个文件，文件名
+    即身份。测试传 tmp 目录（root 是唯一注入点）。
+    """
     server = SidecarServer(
         model=choose_model(),
         registry=build_registry(),
         policy=build_policy(),
         history_seed=lambda: with_system([]),   # system 常驻起步
+        store=JsonlSessionStore(root=Path(_PROJECT_ROOT) / ".sessions"),
     )
     server.handle_connection(RPCConnection(sock))
 
@@ -190,18 +197,8 @@ class SidecarShell:
     def clear(self) -> str:
         """清记忆（s07-b 升级）：完整编舞 close → forget → create。
 
-        老 destroy→create 只换 id 不动记录；现在四操作里三个在同一命令里
-        跑一遍：close（释放运行时）→ forget（删记录）→ create（新身份）。
-
-        TODO 12（你来填）：
-          with self._rpc_lock:
-              if self._sid:
-                  self._client.call("session/close", {"sessionId": self._sid})
-                  self._client.call("session/forget", {"sessionId": self._sid})
-              sid = self._client.call("session/create",
-                  {"cwd": self._cwd, "mode": "craft"})["result"]["sessionId"]
-          self._sid = sid
-          return sid
+        四操作里三个在同一命令里跑一遍：close（释放运行时）→
+        forget（删记录）→ create（新身份）。
         """
         with self._rpc_lock:
             if self._sid:
@@ -215,14 +212,8 @@ class SidecarShell:
     def close_session(self, sid: str = "") -> dict:
         """关掉一个会话的运行时（记录保留——之后可 resume / forget）。
 
-        TODO 11a（你来填）：
-          target = sid or self._sid        # 不传 = 当前会话（or 短路兜底）
-          with self._rpc_lock:
-              return self._client.call("session/close",
-                  {"sessionId": target})["result"]
-        注意：关掉当前会话后 self._sid **保留不动**——记录还在，它就是
-        /resume 的靶子；之后的 send 会拿到 sidecar 的诚实报错（教学现场：
-        closed ≠ 消失，send 会告诉你运行时没了）。
+        关掉当前会话后 self._sid 保留不动——记录还在，它就是 /resume 的
+        靶子；之后的 send 会拿到 sidecar 的诚实报错（closed ≠ 消失）。
         """
         target = sid or self._sid
         with self._rpc_lock:
@@ -230,16 +221,7 @@ class SidecarShell:
                   {"sessionId": target})["result"]
 
     def resume_session(self, sid: str) -> dict:
-        """复活一个 closed 会话（generation+1 的新运行时，历史接着用）。
-
-        TODO 11b（你来填）：
-          with self._rpc_lock:
-              result = self._client.call("session/resume",
-                  {"sessionId": sid})["result"]
-          if "error" not in result:
-              self._sid = sid      # 接管成功才换靶；失败保持原样
-          return result
-        """
+        """复活一个 closed 会话（generation+1 的新运行时，历史接着用）。"""
         with self._rpc_lock:
             result = self._client.call("session/resume",
                   {"sessionId": sid})["result"]
@@ -248,14 +230,7 @@ class SidecarShell:
         return result
 
     def forget_session(self, sid: str = "") -> dict:
-        """真删一个会话记录；live 的必须先 close（sidecar 会拒绝）。
-
-        TODO 11c（你来填）：
-          target = sid or self._sid
-          with self._rpc_lock:
-              return self._client.call("session/forget",
-                  {"sessionId": target})["result"]
-        """
+        """真删一个会话记录；live 的必须先 close（sidecar 会拒绝）。"""
         target = sid or self._sid
         with self._rpc_lock:
             return self._client.call("session/forget",

@@ -50,7 +50,12 @@ from typing import Any, Callable, Optional
 from src.harness.agent import run_agent
 from src.harness.memory import trim_history
 from src.harness.permissions import Approver, AuditTrail, GovernedToolRunner
-from src.harness.session import SessionLifecycleError, SessionManager
+from src.harness.session import (
+    SessionLifecycleError,
+    SessionManager,
+    SessionState,
+    SessionStore,
+)
 from src.harness.tools import ToolRegistry
 
 
@@ -176,6 +181,7 @@ class SidecarServer:
         policy: Any,
         max_history: int = 20,
         history_seed: Optional[Callable[[], list[dict]]] = None,
+        store: Optional[SessionStore] = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -183,13 +189,18 @@ class SidecarServer:
         self._max_history = max_history
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
-        # TODO 2（你来填）：s07-b 接线——裸字典退役，会话控制面换成 s07 的
-        #   SessionManager（Record/Process 分离的唯一真源）：
-        #     self._manager = SessionManager(turn_runner=self._make_turn_runner())
-        #     self._last_turn_status = "completed"
-        #   （_last_turn_status 的用途见 TODO 1 的"协议接缝"注释。骨架期
-        #   先占位 None / 默认值，各 handler 的 TODO 会报 NotImplementedError 指路。）
-        self._manager = SessionManager(turn_runner=self._make_turn_runner())
+        # s09：持久化注入 + 启动清账。
+        # 1. store 透传（None → Manager 自己落 InMemory，离线测试零感知）：
+        self._manager = SessionManager(
+            turn_runner=self._make_turn_runner(), store=store)
+        # 2. 启动清账（startup reconciliation）：崩溃/直接退出遗留的
+        #    creating/idle/running/closing 记录没有 runtime，证据文件却写着
+        #    "活着"。close_session 对不 live 的记录会把状态抹成 closed（s07
+        #    写好的幂等路径），正好用。放过 error：它是有效终态（原因留在
+        #    last_error 里，resume 可直接接管）。InMemory 下 list() 为空清账空转。
+        for record in self._manager.store.list():
+            if record.status not in (SessionState.CLOSED, SessionState.ERROR):
+                self._manager.close_session(record.id)
         self._last_turn_status = "completed"
         self.rpc_handlers: dict[str, Callable] = {}
         # 实例属性，不是类属性（教材的坑：类属性多实例共享）。
@@ -212,31 +223,17 @@ class SidecarServer:
         self.rpc_handlers["sidecar/logs"] = self._handle_logs
         self.rpc_handlers["session/create"] = self._handle_session_create
         self.rpc_handlers["session/list"] = self._handle_session_list
+        # s07-b 四操作路由（老 session/destroy"一删全没"已退役）
         self.rpc_handlers["session/close"] = self._handle_session_close
         self.rpc_handlers["session/resume"] = self._handle_session_resume
         self.rpc_handlers["session/forget"] = self._handle_session_forget
-        # TODO 3（你来填）：路由表升级（s07-b 四操作）。老 session/destroy
-        #   （"一删全没"）已从这里退役，注册三条新路由：
-        #       self.rpc_handlers["session/close"] = self._handle_session_close
-        #       self.rpc_handlers["session/resume"] = self._handle_session_resume
-        #       self.rpc_handlers["session/forget"] = self._handle_session_forget
         self.rpc_handlers["agent/send"] = self._handle_agent_send
         self.rpc_handlers["tool/list"] = self._handle_tool_list
 
     def _make_turn_runner(self):
         """造 turn_runner 闭包：session 层的执行入口 → 本文件的 run_agent。
 
-        TODO 1（你来填）：
-          def turn_runner(message: str, history: list[dict]):
-              result = run_agent(
-                  message, model=self._model, registry=self._registry,
-                  history=trim_history(history, self._max_history),
-                  on_event=self._on_event, runner=self._runner)
-              self._last_turn_status = result.status
-              return result.output, result.messages
-          return turn_runner
-
-        两个设计点（写进闭包注释或记住即可）：
+        两个设计点：
           - 闭包捕获 self、调用那一刻才读 self._runner / self._on_event：
             这俩是 per-connection 的，构造期还是 None，连接建立才有值
             （s06 handle_connection 的装配顺序决定了只能这么写）；
@@ -357,22 +354,9 @@ class SidecarServer:
     def _handle_session_create(self, params: dict) -> dict:
         """建会话：新身份 + 第 1 代运行时 + 起步历史（system 常驻）。
 
-        TODO 4（你来填）：
-          1. sid = self._manager.create_session(
-                 cwd=params.get("cwd", "."),
-                 mode=params.get("mode", "craft"),
-                 title=params.get("title", "未命名会话"))
-             （cwd/mode 校验在 Manager 里做，非法值走异常翻译；老字典里
-              存的 "model" 字段退役——模型归装配层，Record 刻意不存它）
-          2. 播种起步历史。history_seed 的结果要写进**两个副本**——
-             live runtime 的工作副本（run_turn 从它拿历史）和 store 存档
-             （resume 从它拿历史）。只写一个 = 另一条路丢 system 提示：
-               runtime = self._manager.get_session(sid)
-               runtime.record.messages = self._history_seed()
-               self._manager.store.save(runtime.record)
-             （两个副本是 deepcopy 防串账的代价——s07 Store 边界的现场课）
-          3. self._log(f"session created: {sid}")
-          4. return {"sessionId": sid}
+        起步历史写进两个副本——live runtime 的工作副本（run_turn 从它
+        拿历史）和 store 存档（resume 从它拿历史）；只写一个 = 另一条路
+        丢 system 提示（两个副本是 deepcopy 防串账的代价）。
         """
         sid = self._manager.create_session(
             cwd=params.get("cwd", "."),
@@ -387,27 +371,16 @@ class SidecarServer:
     def _handle_session_list(self, params: dict) -> dict:
         """会话清单：Record.summary() + live 标志（s07 的 UI 安全视图）。
 
-        TODO 5（你来填）：
-          return {"sessions": self._manager.list_sessions()}
-        语义变化：close 过的会话**还在清单里**（status="closed"、live=False）
-        ——记录保留正是 close 的本意；真正消失只有 forget。
+        close 过的会话还在清单里（status="closed"、live=False）——记录
+        保留正是 close 的本意；真正消失只有 forget。
         """
         return {"sessions": self._manager.list_sessions()}
 
     def _handle_session_close(self, params: dict) -> dict:
         """close：释放运行时，记录和 transcript 保留（幂等）。
 
-        与老 destroy 的行为差异（s07-b 的核心一课）：
-          - destroy 一删全没；close 后 session/list 里**还在**（closed）
-          - 二次 close 不报错（幂等）；对不存在的 id 才报错
-
-        TODO 6（你来填）：
-          try:
-              closed = self._manager.close_session(params.get("sessionId", ""))
-          except (SessionLifecycleError, ValueError, OSError) as exc:
-              return {"error": str(exc)}
-          self._log(f"session closed: {params.get('sessionId', '')} ({closed})")
-          return {"status": "ok", "closed": closed}
+        与老 destroy 的行为差异：destroy 一删全没，close 后清单里还在
+        （closed）；二次 close 不报错，对不存在的 id 才报错。
         """
         try:
             closed = self._manager.close_session(params.get("sessionId", ""))
@@ -417,18 +390,7 @@ class SidecarServer:
         return {"status": "ok", "closed": closed}
 
     def _handle_session_resume(self, params: dict) -> dict:
-        """resume：旧身份 + generation+1 的新运行时；该 id 已 live 则拒绝。
-
-        TODO 7（你来填）：
-          sid = params.get("sessionId", "")
-          try:
-              self._manager.resume_session(sid)
-          except (SessionLifecycleError, ValueError, OSError) as exc:
-              return {"error": str(exc)}
-          generation = self._manager.load_record(sid).runtime_generation
-          self._log(f"session resumed: {sid} (generation {generation})")
-          return {"sessionId": sid, "generation": generation}
-        """
+        """resume：旧身份 + generation+1 的新运行时；该 id 已 live 则拒绝。"""
         sid = params.get("sessionId", "")
         try:
             self._manager.resume_session(sid)
@@ -439,19 +401,7 @@ class SidecarServer:
         return {"sessionId": sid, "generation": generation}
 
     def _handle_session_forget(self, params: dict) -> dict:
-        """forget：真删除逻辑记录；live 的必须先 close（防手滑丢历史）。
-
-        TODO 8（你来填）：
-          sid = params.get("sessionId", "")
-          try:
-              forgot = self._manager.forget_session(sid)
-          except SessionLifecycleError as exc:
-              return {"error": str(exc)}      # live：先 close 再 forget
-          if not forgot:
-              return {"error": f"session not found: {sid}"}
-          self._log(f"session forgotten: {sid}")
-          return {"status": "ok"}
-        """
+        """forget：真删除逻辑记录；live 的必须先 close（防手滑丢历史）。"""
         sid = params.get("sessionId", "")
         try:
             forgot = self._manager.forget_session(sid)
@@ -473,27 +423,14 @@ class SidecarServer:
     def _handle_agent_send(self, params: dict) -> dict:
         """跑一个 turn：状态机接管（并发拒绝 / close 竞态拒收都在里面）。
 
-        TODO 9（你来填）：
-          sid = params.get("sessionId",""); text = params.get("message","")
-          runtime = self._manager.get_session(sid)
-          if runtime is None:
-              return {"error": f"session not found or closed: {sid}"}
-          try:
-              output = runtime.run_turn(text)
-          except SessionLifecycleError as exc:
-              return {"error": str(exc)}
-          return {"output": output, "status": self._last_turn_status}
-
-        三个语义变化（对照 s06 的老实现）：
-          - get_session 只回 live 运行时：closed 的会话在这里就是 None——
-            "记录还在"和"运行时活着"是两回事（s07 学习目标⑤），RPC 层
-            如实翻译，不区分两种情况的报错文案（UI 用 session/list 看）
-          - run_turn 内部走 turn_runner 闭包（TODO 1）：run_agent +
-            trim_history + 权限 runner + 事件直播的拼装全在里面，这里
-            不再手工拼；历史回写由 _commit_transcript_if_running 原子落账
-          - status 从 _last_turn_status 接缝读（TODO 1 的注释）；run_turn
-            抛 SessionLifecycleError = 并发 turn 被拒 / close 竞态丢结果，
-            翻译成 {"error"} 人话
+        - get_session 只回 live 运行时：closed 的会话在这里就是 None——
+          "记录还在"和"运行时活着"是两回事（s07 学习目标⑤）
+        - run_turn 内部走 turn_runner 闭包（_make_turn_runner）：run_agent +
+          trim_history + 权限 runner + 事件直播的拼装全在里面；历史回写由
+          _commit_transcript_if_running 原子落账
+        - status 从 _last_turn_status 接缝读；run_turn 抛
+          SessionLifecycleError = 并发 turn 被拒 / close 竞态丢结果，
+          翻译成 {"error"} 人话
         """
         sid = params.get("sessionId","")
         text = params.get("message","")

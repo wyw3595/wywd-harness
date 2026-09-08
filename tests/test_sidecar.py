@@ -12,8 +12,10 @@ import unittest
 from pathlib import Path
 from typing import Callable
 
+from src.harness.jsonl_store import JsonlSessionStore
 from src.harness.models import ModelReply, ScriptedModel, ToolCall
 from src.harness.permissions import WorkspaceScope, build_default_policy
+from src.harness.session import SessionRecord
 from src.harness.sidecar import (
     ConnectionClosed,
     MainProcessClient,
@@ -304,6 +306,50 @@ class SidecarServerTests(unittest.TestCase):
         status = self._request(conn, "sidecar/status")["result"]
         self.assertEqual(status["sessions"], 1)   # 记录还在，只是运行时没了
         conn.close()
+
+    def test_reconciles_zombie_records_on_start(self) -> None:
+        """s09 启动清账：证据里"活着"的僵尸记录，新 sidecar 起来就抹成 closed。"""
+
+        with tempfile.TemporaryDirectory() as root:
+            # 预先埋一个"崩溃现场"：记录声称 running，但没有 runtime
+            store = JsonlSessionStore(root)
+            store.create(SessionRecord(id="sess_0001", cwd=".", status="running"))
+            server = SidecarServer(model=None, registry=ToolRegistry(),
+                                   policy=build_default_policy(),
+                                   store=JsonlSessionStore(root))
+            record = server._manager.store.load("sess_0001")
+            self.assertEqual(record.status, "closed")   # 清账落地
+
+    def test_sessions_survive_sidecar_restart(self) -> None:
+        """s09 招牌：sidecar"崩溃"重启后，会话清单还在、resume 能接着聊。"""
+
+        with tempfile.TemporaryDirectory() as root:
+            # 第一代 sidecar：建会话、聊一轮、连接直接断（不 shutdown = 崩溃）
+            scripted1 = ScriptedModel([ModelReply(kind="final", text="甲")])
+            server1 = SidecarServer(model=scripted1, registry=ToolRegistry(),
+                                    policy=build_default_policy(),
+                                    store=JsonlSessionStore(root))
+            conn1, _ = self._spawn(server1)
+            sid = self._request(conn1, "session/create", {"cwd": "."})["result"]["sessionId"]
+            self._request(conn1, "agent/send", {"sessionId": sid, "message": "任务甲"})
+            conn1.close()   # EOF：第一代死亡，证据文件留在磁盘
+
+            # 第二代 sidecar：同目录新 store，重启后一切从证据重建
+            scripted2 = ScriptedModel([ModelReply(kind="final", text="乙")])
+            server2 = SidecarServer(model=scripted2, registry=ToolRegistry(),
+                                    policy=build_default_policy(),
+                                    store=JsonlSessionStore(root))
+            conn2, _ = self._spawn(server2)
+            listed = self._request(conn2, "session/list")["result"]["sessions"]
+            self.assertEqual([s["id"] for s in listed], [sid])
+            self.assertEqual(listed[0]["status"], "closed")   # 启动清账抹过
+            self.assertFalse(listed[0]["live"])               # 记录在，运行时没了
+            resumed = self._request(conn2, "session/resume", {"sessionId": sid})["result"]
+            self.assertEqual(resumed["generation"], 2)        # 换代重建
+            self._request(conn2, "agent/send", {"sessionId": sid, "message": "任务乙"})
+            second = scripted2.received_inputs[0]
+            self.assertIn("任务甲", str(second))   # 跨进程死亡的记忆延续
+            conn2.close()
 
     def test_agent_send_unknown_session_returns_error(self) -> None:
         server = SidecarServer(model=None, registry=ToolRegistry(),

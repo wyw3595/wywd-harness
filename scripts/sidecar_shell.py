@@ -87,8 +87,6 @@ def main() -> None:
                     print("    /resume <id> 可复活，/clear 可开新会话\n")
                 continue   # 别把 "/close" 当普通消息发给 agent
 
-
-
             if query.startswith("/resume"):
                 parts = query.split()
                 if len(parts) < 2:
@@ -101,7 +99,6 @@ def main() -> None:
                 else:
                     print(f"  ↳ 已复活 {sid}（generation {result['generation']}）\n")
                 continue
-
 
             if query.startswith("/forget"):
                 parts = query.split()
