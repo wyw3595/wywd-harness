@@ -15,6 +15,17 @@
   - 只绑 127.0.0.1 + 无鉴权：教学/本机工具口径，别暴露到局域网。
   - 多 tab：HTTP 请求不带 thread 时就作用于"最近注册的壳"（_default_thread），
     多窗口混用时的已知边界，注释写清楚即可。
+
+⚠️ s09 共享证据目录的多进程边界（.sessions/ 被所有 sidecar 进程共享）：
+  - 去重：_collect_sessions 按 sid 去重（每个壳看到的是同一份全量清单）。
+  - 清账误伤：新 sidecar 启动清账会把**别的 tab 正在用的** idle 会话在
+    证据里抹成 closed——对方运行时还活着，下次 save 会写回，证据来回翻；
+    侧边栏上表现为状态短暂显示 closed（装饰性问题）。
+  - 双运行时：resume 只查本进程的 _runtimes——B tab 可以 resume A tab
+    正在用的会话，两个运行时写同一份证据（append 交错，前缀检查可能
+    报警）。根治需要跨进程文件锁（教学边界，单 tab 使用无此问题）。
+  - 计数器竞态：两个 tab 的 sidecar 在同一瞬间启动，可能都从 store 摸到
+    同一个最大编号 → 第二个 "session already exists" 启动失败，重开即可。
 """
 
 import json
@@ -83,26 +94,38 @@ def _target_shell(thread: Optional[str]) -> Any:
 
 
 def _collect_sessions(thread: Optional[str]) -> list[dict]:
-    """把所有在线壳的会话清单聚合成一张表（侧边栏渲染用）。
+    """把在线壳的会话清单聚合成一张表（侧边栏渲染用）。
 
-    每个壳的 sidecar 是独立 store（各 tab 历史互不可见），这里按 thread
-    标注来源，前端按需展示；单 tab 场景只有一行来源，不碍事。
+    s09 之后所有 sidecar 进程共享同一个 .sessions/ 证据目录——每个壳的
+    session/list 返回的都是**同一份**全量清单。所以这里按 sid 去重：
+    N 个 tab 在线 ≠ 清单重复 N 遍；"current" 行优先保留（它带着正确的
+    归属 thread 标注），其余重复行丢弃。
     """
 
     with _shells_lock:
         snapshot = dict(_shells)  # 锁内快照，handler 线程间安全
     sessions: list[dict] = []
+    seen: dict[str, dict] = {}    # sid → 已收的行（去重用）
     for tid, shell in snapshot.items():
         try:
             rows = shell.sessions().get("sessions", [])
-            for row in rows:
-                row["thread"] = tid
-                row["current"] = (tid == _default_thread
-                                  and row.get("live", False)
-                                  and row.get("id") == shell.session_id)
-            sessions.extend(rows)
         except Exception as exc:  # 壳刚死/连接断：整行标注来源错误，别炸请求
             sessions.append({"thread": tid, "error": str(exc)})
+            continue
+        for row in rows:
+            row["thread"] = tid
+            row["current"] = (tid == _default_thread
+                              and row.get("live", False)
+                              and row.get("id") == shell.session_id)
+            sid = row.get("id")
+            first = seen.get(sid)
+            if first is None:
+                seen[sid] = row
+                sessions.append(row)
+            elif row["current"]:
+                # 后来者才是"当前"（默认靶子换 tab 了）：替换并保持只一份
+                sessions[sessions.index(first)] = row
+                seen[sid] = row
     return sessions
 
 

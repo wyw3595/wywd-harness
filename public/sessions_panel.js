@@ -63,8 +63,12 @@
     document.body.appendChild(panel);
     listEl = panel.querySelector(".sp-body");
     panel.querySelector(".sp-head").addEventListener("click", function (e) {
-      // 点了按钮不折叠；点空白标题条才折叠
-      if (e.target.tagName === "BUTTON") return;
+      // ＋/↻ 是操作按钮：走统一的 onOpClick（create/refresh），不折叠；
+      // 点空白标题条才折叠
+      if (e.target.tagName === "BUTTON") {
+        onOpClick(e);
+        return;
+      }
       collapsed = !collapsed;
       panel.classList.toggle("sp-collapsed", collapsed);
     });

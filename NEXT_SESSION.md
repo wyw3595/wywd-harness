@@ -884,57 +884,89 @@ reconciliation（僵尸 running 启动时清理——我们靠 close 第三步�
 - 提交：2be871a。会话生命周期全部 TODO 落地（Record/Process 分离、
   状态机、四操作、InMemory store），217 条测试全绿。
 
-## 进行中：s07-b Sidecar 会话接线（骨架已建，等我填代码）
+## 已完成：网页侧边栏修复（2026-09-08，由助手修）
 
-设计：把 s07 的 SessionManager 接进 sidecar——`self.sessions` 裸字典
-退役；session/destroy（一删全没）换成 **session/close**（释放运行时、
-留记录、幂等）；新增 **session/resume**（旧 id + generation+1 的新
-运行时，live 拒绝）和 **session/forget**（真删除，必须先 close）；
-agent/send 改走 **run_turn**——并发拒绝、晚到结果拒收由状态机接管，
-不再手工回写字典。壳层跟上：SidecarShell 加三个薄包装，/clear 编舞
-升级 close→forget→create，终端 UI 加 /close /resume /forget。
+- 现象：网页侧边栏整个不出现。根因：custom_js 加载链路断在仓库外——
+  链路 = .chainlit/config.toml 的 [UI] custom_js 指路 + 项目根 public/
+  供文件（chainlit 2.12 源码核实：public_dir = APP_ROOT/public，**不是**
+  .chainlit/public）；.chainlit/ 被 gitignore 整体忽略，config.toml 从没
+  进过仓库，换棵树一跑 chainlit 就生成默认配置（无 custom_js）。
+- 修复四件：① config.toml 进仓库（.gitignore 改"内容忽略 + config
+  例外"）；② 侧边栏 JS 留在项目根 public/（2.12 的正确位置）；③ 面板
+  后端 _collect_sessions 按 sid 去重——s09 后所有壳共享 .sessions/，
+  每个壳的 session/list 都是同一份全量清单，不去重会按在线壳数重复
+  N 遍；死壳错误行不炸请求；④ 前端 ＋/↻ 头部按钮接上 onOpClick
+  （原只挂在 .sp-body，头部按钮被"不折叠"分支吞掉，纯摆设）。
+- 验证：headless chainlit + 浏览器实测——JS 200、页面注入、面板渲染
+  （sess_0001 ◀当前 / idle·live·gen）、关/活/删操作全链路生效（合成
+  点击验证 DOM 事件；坐标自动化点击因 IAB 内部缩放偏移不可靠，非网页
+  bug——真实浏览器光标命中不受影响）。248 条测试全绿（+5 面板测试）。
+- 多 tab 已知边界（写进 sidecar_panel 模块头）：共享 .sessions/ 下，
+  新 sidecar 启动清账会把别的 tab 活会话在证据里抹成 closed（对方下次
+  save 写回，装饰性抖动）；跨进程 resume 可造出双运行时写同一证据；
+  同时启动有计数器竞态。根治需跨进程文件锁，教学边界。
 
-两个关键设计判断（骨架注释里都有展开）：
+## 已完成：s09 JSONL 持久化（2026-09-08，代码由我填，助手验收修复+讲解）
 
-1. **TurnRunner 协议装不下 status**：协议返回值只有 (output, messages)，
-   而 agent/send 的 RPC 响应要诚实汇报 max_steps/failed → turn_runner
-   闭包里记 `self._last_turn_status`（协议接缝记账）。安全前提：同一
-   时刻至多一个 turn（handle_connection 单线程 + 壳 _rpc_lock 串行化）；
-   跨连接并发 turn 是已知边界（status 可能串台，output 走返回值不受影响）。
-2. **起步历史要播进两个副本**：create 后 runtime 工作副本（run_turn
-   从它拿历史）和 store 存档（resume 从它拿历史）是两份 deepcopy——
-   只写一个 = 另一条路丢 system 提示。这是 s07 deepcopy 防串账的代价
-   现场课。
+- 提交待做。JsonlSessionStore（SessionStore 协议的 JSONL 落地）上线：
+  每会话一个 .sessions/\<sid\>.jsonl，append-only 证据流（record 元数据
+  迁移留痕 + messages_appended 增量），sequence 信封 + event_id 证据
+  指针，flush+fsync 两连落盘；损坏策略：partial tail 放过并报告，
+  完整坏行/跳号/前缀改写 raise TranscriptCorruptionError。
+  sidecar 启动清账补上（s07 欠的账）：僵尸记录抹 closed，error 放过。
 
-- `src/harness/sidecar.py`：TODO 1 `_make_turn_runner`（闭包 run_agent：
-  trim_history + on_event + 权限 runner，调用那一刻才读 per-connection
-  属性 + status 记账）；TODO 2 `__init__` 换 SessionManager；TODO 3 路由
-  表（destroy 退役，close/resume/forget 上岗）；TODO 4 create（+播种
-  两个副本）；TODO 5~8 list/close/resume/forget handler（领域异常
-  SessionLifecycleError/ValueError/OSError 翻译成 {"error": 人话}）；
-  TODO 9 agent/send 走 run_turn；TODO 10 /status 会话计数改记录口径。
+- 验收修复实录（教学现场，三处 bug + 一个结构事故）：
+  ① **类头被删**：class JsonlSessionStore 一行连同 banner 误删，全部
+     方法缩进进 SessionTranscript 类体——`-> SessionTranscript` 注解在
+     类定义未完成时求值 → NameError → 整个模块导入失败（199 条 ≠ 243
+     条的第一现场：两个测试文件加载失败）。
+  ② **docstring 转义坑**：伪代码里的 `\\n`（渲染显示用）被照抄进代码，
+     写进文件的是"反斜杠+n 两个字符"而不是换行符——行不分、partial
+     tail 判定全歪。（骨架在 docstring 里写 \\n 是渲染需要，抄进代码
+     必须是 \n——这个坑记住了。）
+  ③ **异常张冠李戴**：append 的保留字防御写成 CorruptionError——
+     Corruption 是"读证据发现证据坏了"，Validation 才是"写入方违反
+     协议"，方向相反。
+  ④ TODO 4a（create）和 TODO 8（shell 接线）漏填，由助手验收时补。
 
-- `scripts/shell.py`：TODO 11a~c 三个薄包装（close 后 _sid 保留 =
-  resume 的靶子；resume 成功才接管）；TODO 12 clear 编舞升级。
+- 验收：243 条全绿；终端冒烟两段满分——第一段聊天退出，证据文件 8 行
+  （creating→idle→system 播种→running→提交对话→idle，全程留痕）；
+  第二段重启 sidecar：/sessions 显示旧会话（closed，启动清账抹过，
+  证据第 9 行）+ 新会话续号 sess_0002，/resume 换代 gen=2。
 
-- `scripts/sidecar_shell.py`：TODO 13a~c 三个 UI 命令（/close、
-  /resume <id>、/forget <id>，用 query.split() 取 sid）；/sessions 列
-  已升级 live + gen 两列（助手直接改的，纯展示）。
+- 顺序：s09 完成 → 下一步 s08 模型路由。s10~s12 不变。
 
-- 测试（助手写，全离线）：test_sidecar 会话测试按新契约重写 + 新增
-  （close 幂等留记录 / resume 跨 close 记忆延续 + 换代 / live 拒绝 /
-  forget 先 close / closed 会话 send 报错 / status 记录口径）；
-  test_shell 新包装 + clear 编舞；3 条 dispatch 集成测试跟着红灯
-  （它们靠 session/create + agent/send 驱动审批/事件分派，跨过了
-  重接的边界，填完自动回绿；其中 reject 测试的 transcript 读取已
-  从 server.sessions 改为 manager.load_record）。
+## 已完成：s07-b Sidecar 会话接线（2026-09-08，代码由我填，助手写测试+验收）
 
-当前测试状态：225 条中 17 红（全部钉在 TODO 上），208 绿
-（未动的机制全绿）。
+- sessions 裸字典退役，SidecarServer 的会话控制面 = s07 的 SessionManager；
+  session/destroy（一删全没）→ session/close（释放运行时、留记录、幂等）；
+  新增 session/resume（旧 id + generation+1 新运行时，live 拒绝）与
+  session/forget（真删除，必须先 close）；agent/send 改走 run_turn——
+  并发拒绝、晚到结果拒收由状态机接管。SidecarShell 加三个薄包装，
+  /clear 编舞升级 close→forget→create，终端 UI 加 /close /resume /forget。
 
-验收标准：225 条全绿 + 终端冒烟剧本——提问 → /close 后再 send 拿到
-"closed" 报错 → /resume 接着聊历史还在 → /forget live 被拒、close 后
-真删 → /sessions 里 closed 会话 live=False 且记录还在。
+- 两个接缝设计（实现注释里有完整版）：
+  1. **TurnRunner 协议装不下 status** → turn_runner 闭包记
+     `self._last_turn_status`（协议接缝记账）。安全前提：同一时刻至多
+     一个 turn；跨连接并发 turn 时 status 可能串台（output 走返回值
+     不受影响）——已知边界。
+  2. **起步历史播两个副本**：runtime 工作副本（run_turn 用）+ store
+     存档（resume 用），只写一个 = 另一条路丢 system 提示。
 
-顺序不变：s07-b 填完 → s09 持久化 → s08 模型路由。
+- 领域异常翻译约定：SessionLifecycleError 家族 / ValueError（mode 非法）/
+  OSError（cwd 没了，resolve(strict=True)）→ {"error": 人话} 进 result；
+  其他异常穿透给 handle_connection 兜底 → JSON-RPC error。
+
+- 验收：225 条测试全绿（17 条红灯一次回绿，零修补）；终端冒烟剧本
+  满分通过——提问 → /close（记录保留）→ send 报 "not found or closed"
+  → /resume（generation 2）→ /sessions 显示 idle live=True gen=2 →
+  live /forget 被拒 → close 后 forget 真删 → 清单空 → q 干净退出。
+
+- 验收收尾：填完的 TODO 指令块已清（沿用 041bb94 惯例，设计要点收编
+  进 docstring）；上一轮杂务顺带清了 s05/s06/s07 的 19 处旧 TODO 块
+  （含 electron.py _make_approver 里骨架期遗留的一行 `...`）。
+
+- 已知边界：跨 close 的记忆延续由离线测试盯着（FakeModel 只读第一条
+  消息，终端展示不了这个语义）；/status 的 sessions 口径 = 记录总数
+  （closed 未 forget 也计入）。
 

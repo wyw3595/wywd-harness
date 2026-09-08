@@ -15,8 +15,12 @@ __pycache__/
 # 轨迹页生成物：每次运行都会产出的临时快照
 trace-*.html
 
-# Chainlit 网页端的生成物
-.chainlit/
+# Chainlit 网页端的生成物。例外：config.toml 必须进仓库——custom_js 的
+# 指路牌在它里面，缺了侧边栏整个消失（2026-09-08 事故：目录被整体
+# ignore，换棵树/清个目录链路就断）。侧边栏 JS 在项目根 public/
+# （chainlit 2.12 的 public_dir = APP_ROOT/public，正常跟踪）。
+.chainlit/*
+!.chainlit/config.toml
 .files/
 
 # ---------- 以下为生产级整理（2026-09-02）新增 ----------
@@ -38,3 +42,6 @@ htmlcov/
 
 # 学习教材：第三方参考仓库（自带上游 LICENSE），只读参考不进本仓库
 learn-workbuddy/
+
+# s09 会话证据文件：运行时持久化数据（每会话一个 .jsonl），本地数据不进仓库
+.sessions/
