@@ -227,6 +227,7 @@ class SidecarServer:
         self.rpc_handlers["session/close"] = self._handle_session_close
         self.rpc_handlers["session/resume"] = self._handle_session_resume
         self.rpc_handlers["session/forget"] = self._handle_session_forget
+        self.rpc_handlers["session/messages"] = self._handle_session_messages
         self.rpc_handlers["agent/send"] = self._handle_agent_send
         self.rpc_handlers["tool/list"] = self._handle_tool_list
 
@@ -427,6 +428,22 @@ class SidecarServer:
             {"name": tool.name, "description": tool.description}
             for tool in self._registry._tools.values()
         ]}
+
+    def _handle_session_messages(self, params: dict) -> dict:
+        """读一个会话的完整消息历史（历史重放/审计的只读通道）。
+
+        与 session/list（摘要）的区别：这里回传 record.messages 全量——
+        closed 的会话一样能读（记录还在，Store 里存的就是它）；id 不存在
+        抛 SessionNotFoundError → 翻译成 {"error"} 人话（s07-b 惯例）。
+        """
+
+        sid = params.get("sessionId", "")
+        try:
+            record = self._manager.load_record(sid)
+        except SessionLifecycleError as exc:
+            return {"error": str(exc)}
+        self._log(f"session messages requested: {sid}")
+        return {"sessionId": sid, "messages": record.messages}
 
     def _handle_agent_send(self, params: dict) -> dict:
         """跑一个 turn：状态机接管（并发拒绝 / close 竞态拒收都在里面）。

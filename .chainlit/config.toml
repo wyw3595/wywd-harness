@@ -119,7 +119,7 @@ name = "Assistant"
 # s07-b 会话侧边栏：chainlit 2.12 从 <启动目录>/public/ 服务这个文件
 # （public_dir = APP_ROOT/public，不是 .chainlit/public——源码核实），
 # 并注入页面。注意：必须从项目根启动 chainlit，public/ 才解析对。
-custom_js = "/public/sessions_panel.js"
+custom_js = "/public/sessions_panel.js?v=20260910b"
 
 # default_theme = "dark"
 

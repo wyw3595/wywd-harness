@@ -75,6 +75,10 @@ MODE_PLAN = "plan"     # 先计划再动手
 MODE_ASK = "ask"       # 只聊天，不用工具
 SESSION_MODES = frozenset({MODE_CRAFT, MODE_PLAN, MODE_ASK})
 
+# 默认标题：还没说过话的会话都叫这个。run_turn 拿第一条 user 消息
+# 顶掉它（截 30 字）——侧边栏列表靠 title 分清"哪个会话是哪段对话"。
+DEFAULT_TITLE = "未命名会话"
+
 
 # ═══════════════════════════════════════════════════════════════
 # 状态机 — Manager / 运行时 / UI 共用的状态词汇表
@@ -136,7 +140,7 @@ class SessionRecord:
     id: str
     cwd: str
     mode: str = MODE_CRAFT
-    title: str = "未命名会话"
+    title: str = DEFAULT_TITLE
     status: str = SessionState.CREATING
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -332,6 +336,10 @@ class SessionProcess:
                 raise SessionLifecycleError(
                     f"session {self.id} cannot accept input while {self.status}")
             self._abort_requested.clear()  # 上一轮的 abort 不传染
+            # 第一句话顶掉默认标题（UI 列表的辨识度来源）：只动还是默认
+            # 值的记录——用户/创建方显式起过名的（create 传 title）不碰。
+            if self.record.title == DEFAULT_TITLE:
+                self.record.title = user_message.strip()[:30] or DEFAULT_TITLE
             self._transition(SessionState.RUNNING)
             try:
                 output, new_messages = self._turn_runner(
@@ -412,7 +420,7 @@ class SessionManager:
         self,
         cwd: str,
         mode: str = MODE_CRAFT,
-        title: str = "未命名会话",
+        title: str = DEFAULT_TITLE,
     ) -> str:
         """创建新逻辑身份 + 第 1 代运行时，返回 session id。"""
 

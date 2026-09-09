@@ -176,11 +176,20 @@ class SidecarShell:
     # ── RPC 包装（全部过 _rpc_lock）─────────────────────────
 
     def send(self, message: str) -> dict:
-        """把一句话交给 agent；返回 agent/send 的 result（可能含 "error"）。"""
+        """把一句话交给 agent；返回 agent/send 的 result（可能含 "error"）。
+
+        兼容 JSON-RPC error 响应（sidecar 内部异常走 handle_connection 兜底，
+        返回结构是 {"error": {...}} 而不是 {"result": ...}）——实测现场：
+        turn 内部炸异常时这里会 KeyError，壳必须翻译成人话而不是抛洞。
+        """
 
         with self._rpc_lock:
-            return self._client.call("agent/send",
-                {"sessionId": self._sid, "message": message})["result"]
+            resp = self._client.call("agent/send",
+                {"sessionId": self._sid, "message": message})
+            if "result" in resp:
+                return resp["result"]
+            error = resp.get("error") or {}
+            return {"error": error.get("message", "sidecar 内部错误")}
 
     def status(self) -> dict:
         """sidecar 状态：会话数 / RingBuffer 用量 / handler 数。"""
@@ -193,6 +202,21 @@ class SidecarShell:
 
         with self._rpc_lock:
             return self._client.call("session/list")["result"]
+
+    def messages(self, sid: str = "") -> dict:
+        """读一个会话的完整消息历史（历史重放/审计用；closed 也能读）。
+
+        sid 为空 = 当前会话；id 不存在时 sidecar 回 {"error": 人话}。
+        """
+
+        target = sid or self._sid or ""
+        with self._rpc_lock:
+            resp = self._client.call("session/messages",
+                {"sessionId": target})
+            if "result" in resp:
+                return resp["result"]
+            error = resp.get("error") or {}
+            return {"error": error.get("message", "sidecar 内部错误")}
 
     def logs(self) -> str:
         """sidecar 最近日志（走 RPC——真多进程下主进程读不到子进程内存）。"""

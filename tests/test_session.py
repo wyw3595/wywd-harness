@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from src.harness.session import (
+    DEFAULT_TITLE,
     MODE_ASK,
     InMemorySessionStore,
     SessionAlreadyRunningError,
@@ -167,6 +168,24 @@ class SessionProcessTests(unittest.TestCase):
         self.assertEqual(len(self.proc.messages), 2)     # user + assistant
         self.assertIsNone(self.proc.record.last_error)
         self.assertEqual(self.sink.load("sess_0001").messages, self.proc.messages)
+
+    def test_first_user_message_becomes_title(self) -> None:
+        # 第一句话顶掉默认标题（侧边栏列表的辨识度来源）：超长截 30 字、
+        # 只认第一句、随 RUNNING 迁移一起落盘；显式起过名的不碰。
+        self.proc.start()
+        self.proc.run_turn("一" * 40)                    # 超长 → 截 30 字
+        self.assertEqual(self.proc.record.title, "一" * 30)
+        self.assertEqual(self.sink.load("sess_0001").title, "一" * 30)
+        self.proc.run_turn("第二句不该改标题")
+        self.assertEqual(self.proc.record.title, "一" * 30)  # 只认第一句
+        named = SessionRecord(id="sess_0002", cwd=TESTS_CWD, title="季度复盘")
+        self.sink.create(named)
+        proc2 = SessionProcess(named, self.sink.save, self.runner)
+        proc2.start()
+        proc2.run_turn("随便问点啥")
+        self.assertEqual(named.title, "季度复盘")        # 显式命名不覆盖
+        self.assertEqual(SessionRecord(id="x", cwd=TESTS_CWD).title,
+                         DEFAULT_TITLE)                  # 默认值本身没变
 
     def test_status_is_running_during_turn(self) -> None:
         seen = {}
