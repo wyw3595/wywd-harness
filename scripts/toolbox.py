@@ -15,6 +15,8 @@
 """
 
 from src.harness.file_tools import ALLOWED_ROOT, FORBIDDEN_PARTS, list_dir, read_file, write_file
+from src.harness.model_router import ModelRouter, ModelTier
+from src.harness.models import FakeModel
 from src.harness.permissions import (
     PermissionPolicy,
     WorkspaceScope,
@@ -23,6 +25,9 @@ from src.harness.permissions import (
 from src.harness.real_model import RealModel
 from src.harness.std_tools import calc, find_text, now, tree_dir
 from src.harness.tools import Tool, ToolRegistry
+from src.harness.workspace_memory import FactKind, WorkspaceMemory
+
+import os
 
 # 历史窗口大小（练习 19）：按"条数"计（一条 = 一条消息，一轮工具往返
 # 约占 3 条）。数字越小越省钱、记忆越短——这是取舍题，不是优化题。
@@ -93,7 +98,62 @@ DEFERRED_TOOLS: list[Tool] = [
         handler=tree_dir,
         defer=True,
     ),
+    Tool(
+        name="memory_write",
+        description="往项目工作区记忆追加一条事实（决策/约定/坑/结果）。"
+        "只写原始日志，是否晋升长期记忆由 30 天蒸馏策略决定——"
+        "不要记寒暄、猜测、密钥或原始工具输出。",
+        handler=lambda content, kind="outcome", importance=3:
+            write_memory_fact(content, kind, importance),
+        defer=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "content": {"type": "string",
+                            "description": "一句话的项目事实，如'存储层确定用 SQLite WAL 模式'"},
+                "kind": {"type": "string",
+                         "enum": ["decision", "convention", "pitfall", "outcome"],
+                         "description": "事实类型：决策/约定/坑/结果"},
+                "importance": {"type": "integer",
+                               "description": "重要度 1-5，默认 3；>=4 才可能提前晋升"},
+            },
+            "required": ["content"],
+        },
+    ),
 ]
+
+
+def write_memory_fact(content: str, kind: str = "outcome",
+                      importance: int = 3, root=None) -> str:
+    """memory_write 的 handler 本体（root 可注入——测试喂 tmp 目录）。
+
+    TODO 8a（你来填）：
+      memory = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
+      fact = memory.append_daily_log(
+          content, kind=kind, importance=importance, source="agent")
+      return (f"已记录 [{fact.kind}] {fact.content[:60]}"
+              f"（{fact.recorded_at[:10]} 日志，等待蒸馏策略裁决）")
+    写路径的诚实设计：工具只能**追加**原始事实（要不要记住一辈子，
+    蒸馏策略说了算）——"模型说重要就永久保存"是记忆污染的正门。
+    """
+    raise NotImplementedError("TODO 8a: write_memory_fact")
+
+
+def build_history_seed(root=None) -> list[dict]:
+    """sidecar 会话的起步历史：工具目录 system + 工作区记忆有界视图。
+
+    TODO 8b（你来填）：
+      seed = with_system([])
+      memory = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
+      context = memory.get_context_for_agent()
+      if context and context != "(no workspace memory yet)":
+          seed.append({"role": "system", "content": context})
+      return seed
+    记忆放第二条 system（FakeModel 只读第一条的老怪癖不受影响）；
+    每会话开局读一次（不是每 turn——有界视图的教学取舍，边界写进
+    NEXT_SESSION）。空记忆不追加消息：seed 与 s06.5 完全一致。
+    """
+    raise NotImplementedError("TODO 8b: build_history_seed")
 
 # 免审批白名单（练习 s04）：只读 / 沙箱内的工具显式放行。fs_write
 # 刻意不在名单里——它由 path.write_ask 规则拦成 ASK，执行前必须人点头。
@@ -104,6 +164,7 @@ DEFERRED_TOOLS: list[Tool] = [
 SAFE_TOOLS: frozenset[str] = frozenset({
     "get_weather", "now", "fs_list", "fs_read",
     "calc", "fs_find", "ToolSearch", "DeferExecuteTool",
+    "memory_write",   # 只追加 .memory/ 原始日志，晋升由蒸馏闸门管（s10）
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions
@@ -259,3 +320,16 @@ def build_model() -> RealModel:
     """
 
     return RealModel(tools=build_registry().model_schemas())
+
+
+def build_model_router() -> ModelRouter:
+    """三级槽位装配（s08）：标签 → 具体模型的解析表。
+
+    教学矩阵说明：无 key 三槽全 FakeModel（离线可跑），有 key 三槽全
+    DeepSeek——同一个模型占三个槽看似没分级，但**槽位机制已经立住**：
+    真实分级（lite 换便宜厂商 / craft 换旗舰）只改这张映射表，代码
+    一行不动。这正是教材"标签路由"的意义：用户改配置换模型。
+    """
+    routes = {tier: (build_model() if os.getenv("DEEPSEEK_API_KEY")
+                     else FakeModel()) for tier in ModelTier}
+    return ModelRouter(routes=routes)

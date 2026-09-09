@@ -38,8 +38,8 @@ def main() -> None:
         pong = shell.start()
         print(f"[main] sidecar/ping → {pong['status']}")
         print(f"[main] session/create → {shell.session_id}")
-        print("输入问题回车发送。特殊命令：/status /sessions /logs /clear "
-              "/close /resume <id> /forget <id>。q 退出。\n")
+        print("输入问题回车发送。特殊命令：/status /sessions /logs /cost /memory "
+              "[distill] /clear /close /resume <id> /forget <id>。q 退出。\n")
 
         while True:
             try:
@@ -56,6 +56,34 @@ def main() -> None:
                 print(f"  sessions: {r['sessions']}")
                 print(f"  ringBuffer: {r['ringBufferUsed']}/{r['ringBufferTotal']} bytes")
                 print(f"  handlers: {r['handlers']}\n")
+                continue
+
+            if query == "/cost":
+                # s08：层级成本表（sidecar/status 的 modelCost 段）。
+                rows = shell.status().get("modelCost")
+                if rows is None:
+                    print("  （模型没挂路由器，无成本表）\n")
+                else:
+                    print("  tier          calls  promptTk  completionTk  cost")
+                    for row in rows:
+                        print(f"  {row['tier']:<12}  {row['calls']:>5}  "
+                              f"{row['promptTokens']:>8}  "
+                              f"{row['completionTokens']:>12}  "
+                              f"${row['cost']}")
+                    print()
+                continue
+
+            if query == "/memory":
+                # s10 TODO 10（你来填）：工作区记忆（本地直读，不走 RPC——
+                # 记忆就是文件，任何进程都能读/蒸馏；教学点写进注释）。
+                #   memory = WorkspaceMemory(Path(__file__).resolve().parents[1])
+                #   query == "/memory distill"：跑 report = memory.distill()，
+                #     打印 f"扫描 {report.scanned} / 晋升 {report.created} /
+                #     合并 {report.updated} / 拦下 {report.skipped}"
+                #   否则：md = memory.read_memory_md()，空则提示
+                #     "（暂无长期记忆；agent 可用 memory_write 记事实，
+                #      /memory distill 跑蒸馏）"，非空则打印。
+                print("  （TODO 10 待填：WorkspaceMemory 本地读 + distill）\n")
                 continue
 
             if query == "/sessions":

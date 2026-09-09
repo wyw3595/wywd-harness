@@ -45,3 +45,6 @@ learn-workbuddy/
 
 # s09 会话证据文件：运行时持久化数据（每会话一个 .jsonl），本地数据不进仓库
 .sessions/
+
+# s10 工作区记忆：daily 日志 / curated.json / MEMORY.md 都是本地运行数据
+.memory/

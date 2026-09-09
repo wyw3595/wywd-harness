@@ -884,6 +884,89 @@ reconciliation（僵尸 running 启动时清理——我们靠 close 第三步�
 - 提交：2be871a。会话生命周期全部 TODO 落地（Record/Process 分离、
   状态机、四操作、InMemory store），217 条测试全绿。
 
+## 进行中：s10 工作区记忆（骨架已建，等我填代码）
+
+设计：**transcript 负责忠实记录（s09），memory 负责有损选择（s10）**。
+三个文件三种身份：daily/*.jsonl 只追加的证据；curated.json 机器真相
+（tempfile + os.replace 原子替换——本课新机制）；MEMORY.md 派生视图
+（随时从 canonical 重建）。蒸馏门槛刻意不让 LLM 决定：年龄 ≥30 天
+AND 类型 ∈ {decision/convention/pitfall} AND（重要度 ≥4 OR 重复 ≥2）。
+
+三个架构判断：
+
+1. **keyed supersession（memory_key 冲突域 + 修订链）砍掉留作 s10-b
+  候选**——教材近半代码在那里；本课走"内容寻键"路径（kind+规范化
+  内容 = 稳定 key，同内容新证据只合并，无覆盖语义）。
+2. **写路径是延迟工具**：memory_write 走 ToolSearch 发现（s03 复用），
+   进 SAFE_TOOLS（只追加原始日志，晋升由蒸馏闸门管——"模型说重要就
+   永久保存"是提示注入污染记忆的正门）。读路径 = 会话起步 history_seed
+   注入有界视图（第二条 system；空记忆时 seed 与旧版完全一致）。
+3. **/memory 命令本地直读**（不走 RPC）：记忆就是文件，任何进程都能
+   读/蒸馏——本身是教学点。
+
+- `src/harness/workspace_memory.py`（新建）：TODO 1 __init__（resolve +
+  workspace_id=sha256 路径指纹前 16 位 + 布局）；TODO 2 append_daily_log
+  （校验 + asdict + 一行追加 + fsync）；TODO 3 _read_log/read_all_facts
+  （partial tail + scope 校验——s09 第三次上岗）；TODO 4
+  _atomic_write_text（mkstemp 同目录 + fsync + os.replace + unlink
+  missing_ok）；TODO 5 _render_memory（三节视图）；TODO 6 distill（年龄/
+  类型/重要度重复三闸门 + processed_ids 幂等 + 证据合并）；TODO 7
+  get_context_for_agent（MEMORY.md + 最近 6 条，预算截断）。
+- `scripts/toolbox.py`：TODO 8a write_memory_fact（root 可注入）；TODO 8b
+  build_history_seed（空记忆单 system，有记忆双 system）。memory_write
+  延迟工具注册 + SAFE_TOOLS 已直接给。
+- `scripts/shell.py`：TODO 9 history_seed 换 build_history_seed()（一行）。
+- `scripts/sidecar_shell.py`：TODO 10 /memory [distill]（本地读 + 蒸馏）。
+
+- 测试（助手写，16 条全离线 tmp；时间用注入 recorded_at/as_of 控制）：
+  scope 隔离/串线炸；追加四重校验；读写往返；partial tail 双向；年龄/
+  类型/重要度重复三闸门各一档；幂等（二次跑零新建）；规范化内容合并
+  （大小写+空格）；双文件原子落盘无 .tmp 残骸；有界注入截断；重启
+  恢复；write_memory_fact 落日志；seed 双形态；工具延迟+免审批注册。
+
+当前测试状态：275 条中 15 红（全钉 TODO），260 绿。
+
+验收标准：275 全绿 + 冒烟——无 key 起终端问"记住我们用 uv 管环境"
+（真模型走 memory_write 工具）→ /memory 看到原始事实 → 手工跑一次
+带旧时间戳的 distill（或 API 直写旧事实 + /memory distill）→ MEMORY.md
+出现该决策 → 重开会话起步历史里有记忆段。顺序：s10 填完 → s11/s12
+（或先 s10-b keyed supersession，用户定）。
+
+## 已完成：s08 模型路由（2026-09-09，代码由我填，助手验收修复+讲解）
+
+- 三级路由上线：lite（粗筛）/ default（规划执行）/ craft（用户交互）
+  槽位 + 按 tier 的成本记账。**Router 实现 Model 协议**（generate →
+  craft 槽再转发）——run_agent/sidecar/turn_runner 零改动，装配只换
+  build_model_router() 一处（s01 依赖注入在 s08 兑现成"无感插入"）。
+  价格按输入/输出拆开（对上练习 18 usage 的两个键）；未知 agent 兜底
+  DEFAULT（fail-safe：漏判代价是多花钱，与权限层 default.deny 方向
+  相反）；离线模型 usage 空 → 记 0 tokens 但 calls+1（不撒谎）。
+
+- 验收修复实录（三处）：
+  ① default_agent 类属性被填 TODO 时覆盖 → generate AttributeError
+    （连带 run_agent 变 failed——练习 16 的失败出口把异常吞成状态，
+     教训：状态 failed 时先看 output 里的真异常）；
+  ② /status 在 return 字典之前写 status["modelCost"]（变量未定义）
+    + else 塞空表——空表违反 duck typing 契约（裸模型应完全不带
+    modelCost 键，空表会误导 UI 以为挂了空路由器）；
+  ③ summary() 用 t.name（"LITE"）不是 t.value（"lite"）——str 混血
+    Enum 的 .value 才是当字符串用的那个值。
+  另外 TODO 9 填了主体但占位 print 忘删（两条消息一起打）。
+
+- 验收：259 全绿（含 run_agent 直接吃 router 的结构子类型实锤）；
+  终端冒烟：聊天一轮 → /cost 出层级表（craft calls=1，tokens=0
+  是 FakeModel 无 usage 的诚实零）→ /status 带 modelCost。
+
+- 遗留：MemorySelectorRouter（零工具选择器）留给 s12（需要检索层
+  供给候选）；lite/default 槽位预注册了 explore/planner/compact/
+  title，等 s10/s14 接真调用方；真实分级换模型只改
+  toolbox.build_model_router 的映射表。
+
+## 下一步
+
+s10 workspace memory（工作区记忆：日志追加、主题蒸馏、30 天保留）。
+s11 user memory / s12 cloud memory 排其后。
+
 ## 已完成：网页侧边栏修复（2026-09-08，由助手修）
 
 - 现象：网页侧边栏整个不出现。根因：custom_js 加载链路断在仓库外——

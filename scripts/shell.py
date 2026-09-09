@@ -44,7 +44,13 @@ if _PROJECT_ROOT not in _env_paths:
     os.environ["PYTHONPATH"] = os.pathsep.join([_PROJECT_ROOT] + _env_paths)
 
 from scripts.electron_shell import choose_model
-from scripts.toolbox import build_policy, build_registry, with_system
+from scripts.toolbox import (
+    build_history_seed,
+    build_model_router,
+    build_policy,
+    build_registry,
+    with_system,
+)
 from src.harness.jsonl_store import JsonlSessionStore
 from src.harness.sidecar import MainProcessClient, RPCConnection, SidecarServer
 
@@ -52,13 +58,19 @@ from src.harness.sidecar import MainProcessClient, RPCConnection, SidecarServer
 def _sidecar_process(sock: socket.socket) -> None:
     """Sidecar 子进程入口（spawn 守则①：必须模块级函数）。装配全在子进程内。
 
-    store 用 JSONL 证据文件（s09）：会话活过进程重启。教学版放项目内
-    .sessions/（.gitignore 已挡）；Claude Code 同款思路是
-    ~/.claude/projects/<工作区>/<会话id>.jsonl——每会话一个文件，文件名
-    即身份。测试传 tmp 目录（root 是唯一注入点）。
+    store 用 JSONL 证据文件（s09）：会话活过进程重启（.sessions/，已进
+    .gitignore，测试注 tmp）。model 用路由器（s08）：Router 实现 Model
+    协议（generate → craft 槽），sidecar/run_agent 零改动。choose_model()
+    保留给 electron_shell（s05 直连架构，不走 sidecar——两个入口两套
+    装配，都从 toolbox 出）。
+
+    s10 TODO 9（你来填）：起步历史换成带记忆的种子（一行改动）：
+      history_seed=build_history_seed(),
+    （替代 lambda: with_system([])——空记忆时 build_history_seed 返回
+    的 seed 与它完全一致，行为零变化；有记忆时多一条 system。）
     """
     server = SidecarServer(
-        model=choose_model(),
+        model=build_model_router(),
         registry=build_registry(),
         policy=build_policy(),
         history_seed=lambda: with_system([]),   # system 常驻起步
