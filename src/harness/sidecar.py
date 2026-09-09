@@ -322,13 +322,21 @@ class SidecarServer:
         /status 数的是 Manager 的记录总数——closed 但没 forget 的会话也计入
         "记录还在"和"运行时活着"是两回事（s07 学习目标⑤）。
         """
-        return {
+        status = {
             "sessions": len(self._manager.list_sessions()),
             "ringBufferUsed": self.ring_buffer.used,
             "ringBufferTotal": self.ring_buffer.size,
             "ringBufferFull": self.ring_buffer.is_full,
             "handlers": len(self.rpc_handlers),
         }
+        # s08：模型挂了路由器就捎上成本表。duck typing（getattr 三参：
+        # 读属性，没有就给 None）——裸 FakeModel/RealModel 没有
+        # cost_summary → status 完全不带 modelCost 键（不是空表：空表
+        # 会误导 UI 以为挂了个空路由器），老模型零行为变化。
+        cost = getattr(self._model, "cost_summary", None)
+        if cost is not None:
+            status["modelCost"] = cost()
+        return status
 
     def _handle_logs(self, params: dict) -> dict:
         """日志走 RPC 返回——真多进程下 main 碰不到子进程的 RingBuffer。"""
