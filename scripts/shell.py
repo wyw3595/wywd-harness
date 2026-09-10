@@ -175,21 +175,29 @@ class SidecarShell:
 
     # ── RPC 包装（全部过 _rpc_lock）─────────────────────────
 
-    def send(self, message: str) -> dict:
-        """把一句话交给 agent；返回 agent/send 的 result（可能含 "error"）。
+    def send_to(self, session_id: str, message: str) -> dict:
+        """把一句话交给**指定**会话的 agent（显式 sid）。
 
-        兼容 JSON-RPC error 响应（sidecar 内部异常走 handle_connection 兜底，
-        返回结构是 {"error": {...}} 而不是 {"result": ...}）——实测现场：
+        web_app（C 方案）用：单壳单 sidecar，多 tab 各看各的会话，
+        发消息必须带 sid，不能依赖壳的"当前会话指针"。返回
+        agent/send 的 result（可能含 "error"）。兼容 JSON-RPC error
+        响应（sidecar 内部异常走 handle_connection 兜底，返回结构是
+        {"error": {...}} 而不是 {"result": ...}）——实测现场：
         turn 内部炸异常时这里会 KeyError，壳必须翻译成人话而不是抛洞。
         """
 
         with self._rpc_lock:
             resp = self._client.call("agent/send",
-                {"sessionId": self._sid, "message": message})
+                {"sessionId": session_id, "message": message})
             if "result" in resp:
                 return resp["result"]
             error = resp.get("error") or {}
             return {"error": error.get("message", "sidecar 内部错误")}
+
+    def send(self, message: str) -> dict:
+        """发给自己当前会话（send_to(self._sid, message) 的薄包装）。"""
+
+        return self.send_to(self._sid or "", message)
 
     def status(self) -> dict:
         """sidecar 状态：会话数 / RingBuffer 用量 / handler 数。"""

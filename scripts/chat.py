@@ -93,8 +93,8 @@ def main() -> None:
     registry = build_registry()
     model = build_model()
     # 权限闸门（练习 s04）：每次工具调用先过 runner——决策 -> 审批 ->
-    # 执行，全部调用记账进审计轨迹。审批员是终端 y/n（chainlit 的
-    # 按钮审批是另一个入口另一套 UI，不共用显示代码）。
+    # 执行，全部调用记账进审计轨迹。审批员是终端 y/n（web_app 的
+    # 审批卡是另一个入口另一套 UI，不共用显示代码）。
     runner = GovernedToolRunner(
         policy=build_policy(),
         approver=cli_approver,

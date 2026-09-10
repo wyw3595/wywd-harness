@@ -222,7 +222,7 @@ def with_system(history: list[dict] | None) -> list[dict]:
     history 第一条已是 system（上一轮的 result.messages 带回来的），
     直接原样返回。谁也不用特判。
 
-    chat.py / chainlit_app.py / electron_shell.py 三个入口共用。
+    chat.py / web_app.py / electron_shell.py 三个入口共用。
     """
 
     system_message = {"role": "system", "content": build_system_prompt()}
