@@ -24,6 +24,7 @@ class FakeClient:
         self.closed = False
         self._id = 0
         self.resume_result = None   # 测试可改罐头（resume 失败场景）
+        self.error_for: dict[str, str] = {}   # method → 让它回 JSON-RPC error
 
     def connect(self, sock) -> None:
         sock.close()
@@ -31,6 +32,11 @@ class FakeClient:
     def call(self, method: str, params: dict | None = None) -> dict:
         self._id += 1
         self.calls.append((method, params))
+        # 真 sidecar 内部异常走 handle_connection 兜底，回的是 error 响应
+        # （没有 "result" 键）——壳必须翻译，不能 `["result"]` 硬取。
+        if method in self.error_for:
+            return {"jsonrpc": "2.0", "id": self._id,
+                    "error": {"code": -32000, "message": self.error_for[method]}}
         if method == "sidecar/ping":
             result = {"status": "ok"}
         elif method == "session/create":
@@ -223,6 +229,79 @@ class SidecarShellTests(unittest.TestCase):
         shell.forget_session()   # 不传参 = 当前会话
         self.assertEqual(client.calls[-1],
                          ("session/forget", {"sessionId": "sess_2"}))
+
+    def test_rpc_error_response_translated_not_raised(self) -> None:
+        """sidecar 回 JSON-RPC error 时，壳翻译成 {"error": 人话}，不抛 KeyError。
+
+        现场（前端冒烟抓到的）：forget 撞上删除失败，sidecar 回 error
+        响应，壳直接 `["result"]` → KeyError 穿透到 HTTP handler → 连接
+        被空响应关掉 → 浏览器只看到 "Failed to fetch"。send_to / messages
+        早就有这个分支，四个会话操作当时漏了。
+        """
+
+        shell, client, _ = self._make()
+        shell.start()
+        for method in ("session/close", "session/resume", "session/forget",
+                       "agent/send", "session/messages"):
+            client.error_for[method] = f"boom:{method}"
+
+        self.assertEqual(shell.close_session("sess_0001"),
+                         {"error": "boom:session/close"})
+        self.assertEqual(shell.forget_session("sess_0001"),
+                         {"error": "boom:session/forget"})
+        self.assertEqual(shell.send_to("sess_0001", "hi"),
+                         {"error": "boom:agent/send"})
+        self.assertEqual(shell.messages("sess_0001"),
+                         {"error": "boom:session/messages"})
+        # resume 失败：一样翻译成人话，且不接管当前会话
+        before = shell.session_id
+        self.assertEqual(shell.resume_session("sess_0001"),
+                         {"error": "boom:session/resume"})
+        self.assertEqual(shell.session_id, before)
+
+    def test_rpc_error_without_message_falls_back(self) -> None:
+        """error 对象里没有 message 也要有人话兜底，不能吐 None。"""
+
+        shell, client, _ = self._make()
+        shell.start()
+
+        def bare_error(method, params=None):
+            return {"jsonrpc": "2.0", "id": 1, "error": {}}
+        client.call = bare_error
+        self.assertEqual(shell.forget_session("sess_0001"),
+                         {"error": "sidecar 内部错误"})
+
+    def test_query_rpcs_translate_errors(self) -> None:
+        """查询类端点（status/sessions/logs/tools）也走同一翻译。
+
+        这几个当初漏在新端点外面，而它们现在都从 HTTP 暴露给前端了——
+        硬取 ["result"] 就是"点一下侧栏、handler 崩掉"。
+        """
+
+        shell, client, _ = self._make()
+        shell.start()
+        for method in ("sidecar/status", "session/list", "sidecar/logs",
+                       "tool/list"):
+            client.error_for[method] = f"boom:{method}"
+
+        self.assertEqual(shell.status(), {"error": "boom:sidecar/status"})
+        self.assertEqual(shell.sessions(), {"error": "boom:session/list"})
+        self.assertIn("boom:sidecar/logs", shell.logs())
+        self.assertEqual(shell.tools(), [])
+
+    def test_new_session_raises_human_error_on_failure(self) -> None:
+        """建会话失败抛 RuntimeError（带 sidecar 人话），而不是 KeyError。
+
+        new_session 返回 str，装不下 {"error": …}——所以这里必须抛，把
+        "翻译给用户看"的责任交给调用方（WebApp.action 接住变 ok:false）。
+        """
+
+        shell, client, _ = self._make()
+        shell.start()
+        client.error_for["session/create"] = "磁盘满了"
+        with self.assertRaises(RuntimeError) as ctx:
+            shell.new_session()
+        self.assertIn("磁盘满了", str(ctx.exception))
 
     def test_send_serialized_under_concurrency(self) -> None:
         """双线程 send：锁保证同一时刻最多一个 call 在途（坑 2 的锁）。"""

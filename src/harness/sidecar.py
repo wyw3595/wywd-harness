@@ -202,6 +202,9 @@ class SidecarServer:
             if record.status not in (SessionState.CLOSED, SessionState.ERROR):
                 self._manager.close_session(record.id)
         self._last_turn_status = "completed"
+        # s08 续：每轮 token 账也走同一个接缝（TurnRunner 协议只回
+        # (output, messages)，装不下 usage——和 status 当初一样的处境）。
+        self._last_turn_usage: dict = {}
         self.rpc_handlers: dict[str, Callable] = {}
         # 实例属性，不是类属性（教材的坑：类属性多实例共享）。
         self._start_time = time.time()
@@ -251,6 +254,10 @@ class SidecarServer:
                 history=trim_history(history, self._max_history),
                 on_event=self._on_event, runner=self._runner)
             self._last_turn_status = result.status
+            # usage 是这一轮的账（run_agent 在轮内跨 step 累加出来的 totals）。
+            # dict() 复制是防御习惯：存引用的话，将来谁在返回后动了那个字典，
+            # 这里会跟着变——"快照存的应该是那一刻的值"（练习 08 的老教训）。
+            self._last_turn_usage = dict(result.usage)
             return result.output, result.messages
         return turn_runner
 
@@ -456,6 +463,9 @@ class SidecarServer:
         - status 从 _last_turn_status 接缝读；run_turn 抛
           SessionLifecycleError = 并发 turn 被拒 / close 竞态丢结果，
           翻译成 {"error"} 人话
+        - usage 同路（_last_turn_usage）：金额和轮次都得让前端看得见，
+          "成本可观测"不该只有终端能看。离线模型 usage 是空字典——诚实
+          地回 {}，不编造 0
         """
         sid = params.get("sessionId","")
         text = params.get("message","")
@@ -466,7 +476,8 @@ class SidecarServer:
             output = runtime.run_turn(text)
         except SessionLifecycleError as exc:
             return {"error": str(exc)}
-        return {"output": output, "status": self._last_turn_status}
+        return {"output": output, "status": self._last_turn_status,
+                "usage": self._last_turn_usage}
 
 
 # ═══════════════════════════════════════════════════════════════

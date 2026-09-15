@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from src.harness.jsonl_store import JsonlSessionStore
-from src.harness.models import ModelReply, ScriptedModel, ToolCall
+from src.harness.models import FakeModel, ModelReply, ScriptedModel, ToolCall
 from src.harness.permissions import WorkspaceScope, build_default_policy
 from src.harness.session import SessionRecord
 from src.harness.sidecar import (
@@ -375,6 +375,47 @@ class SidecarServerTests(unittest.TestCase):
         self._request(conn, "agent/send", {"sessionId": sid, "message": "任务乙"})
         second = scripted.received_inputs[1]
         self.assertIn("任务甲", str(second))  # 第一轮的问答还在历史里
+        conn.close()
+
+    def test_agent_send_reports_per_turn_usage(self) -> None:
+        """每轮 token 账：usage 只描述**这一轮**，不是累计值。
+
+        接缝记账的第二笔（第一笔是 status，s07-b）。TurnRunner 协议只回
+        (output, messages)，装不下 usage——老办法照用：在闭包里顺手记一笔，
+        再逐轮返回。
+        """
+
+        scripted = ScriptedModel([
+            ModelReply(kind="final", text="甲",
+                       usage={"prompt_tokens": 100, "completion_tokens": 20}),
+            ModelReply(kind="final", text="乙",
+                       usage={"prompt_tokens": 300, "completion_tokens": 40}),
+        ])
+        server = SidecarServer(model=scripted, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        sid = self._request(conn, "session/create")["result"]["sessionId"]
+
+        first = self._request(conn, "agent/send",
+                              {"sessionId": sid, "message": "甲"})["result"]
+        second = self._request(conn, "agent/send",
+                               {"sessionId": sid, "message": "乙"})["result"]
+        self.assertEqual(first["usage"],
+                         {"prompt_tokens": 100, "completion_tokens": 20})
+        self.assertEqual(second["usage"],
+                         {"prompt_tokens": 300, "completion_tokens": 40})
+        conn.close()
+
+    def test_agent_send_usage_empty_for_offline_model(self) -> None:
+        """离线模型不产生用量：诚实回空字典，不编造 0。"""
+
+        server = SidecarServer(model=FakeModel(), registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        sid = self._request(conn, "session/create")["result"]["sessionId"]
+        result = self._request(conn, "agent/send",
+                               {"sessionId": sid, "message": "你好"})["result"]
+        self.assertEqual(result["usage"], {})
         conn.close()
 
     def test_agent_send_max_steps_honest(self) -> None:

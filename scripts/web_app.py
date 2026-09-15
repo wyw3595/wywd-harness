@@ -7,8 +7,8 @@
 
    浏览器 ──fetch（同源 127.0.0.1:8765）──► web_app（本文件）
                                             ├─ 1 个 SidecarShell（1 个 sidecar 子进程，独占写者）
-                                            ├─ 静态文件服务（public/：index.html + app.js）
-                                            └─ JSON API + 事件轮询 + 审批登记
+                                            ├─ 静态文件服务（public/：index.html + src/）
+                                            └─ JSON API + SSE 事件流 + 审批登记
 
 关键架构决定：单壳单 sidecar。多 tab 只是同一个 backend 的多个浏览器
 视图——"每 tab 一个 sidecar 共享 .sessions/"时代的竞态（启动清账误伤、
@@ -19,9 +19,10 @@
      JsonlSessionStore(root).load(sid).messages（replay fold），不经过
      sidecar RPC、不碰运行中的 turn、closed 会话秒开。零静默失败：
      成功 = 前端自己拿到数组并渲染，没有"桥有没有跑"这种问题。
-  2. 直播/审批 = 事件环（线程安全 deque + seq）+ threading.Event：
+  2. 直播/审批 = 事件环（Condition + 有界 deque + seq）+ threading.Event：
      on_event 回调（sidecar 事件）+ user_prompt 回调（审批请求）都往
-     同一条流里塞；前端轮询 GET /api/events?after=N。审批不用 asyncio
+     同一条流里塞；GET /api/events/stream 用 SSE 长连往外推（早先是
+     前端每 500ms 轮询，现在服务端有事件才写）。审批不用 asyncio
      Future——user_prompt 线程 Event.wait(300)，HTTP 线程 POST 回执
      set()。"loop 已死 / 上下文过期"这两个失败模式从根上不存在。
   3. 发消息带显式 sid：Single 壳下不能靠"当前会话指针"（多 tab 互相
@@ -61,6 +62,9 @@ SESSIONS_ROOT = Path(_PROJECT_ROOT) / ".sessions"
 # 审批超时秒数：沉默 = 拒绝（fail-closed，与 chainlit 版语义一致）
 APPROVAL_TIMEOUT = 300
 EVENT_RING_MAX = 500
+# SSE 心跳间隔：静默这么久就写一行注释保活，同时借此发现对面已经走了。
+# 15 秒是常识区间——小于常见中间设备 60 秒空闲断连，又不至于太吵。
+SSE_HEARTBEAT = 15.0
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -78,31 +82,96 @@ _MIME = {
 # ═══════════════════════════════════════════════════════════════
 
 class EventRing:
-    """有界事件环：on_event 回调 / 审批登记都往里塞，前端按 seq 轮询取。
+    """有界事件环：on_event 回调 / 审批登记都往里塞，SSE 长连往外推。
 
-    写=多线程（sidecar RPC 线程 + HTTP handler 线程），读=HTTP handler
-    线程，所以 append / after 都过锁。超过 maxlen 丢最旧的（直播缺角可
-    接受——历史永远以 messages API 为准，这是写进边界的教学取舍）。
+    写=多线程（sidecar RPC 线程 + HTTP handler 线程），读=每条 SSE 连接
+    一个线程，所以 append / after 都过锁。超过 maxlen 丢最旧的（直播缺角
+    可接受——历史永远以 messages API 为准，这是写进边界的教学取舍）。
+
+    **为什么是 Condition 而不是 Lock**（这一步的核心改动）：轮询时代
+    服务端只会被动应答，锁就够了；要做推送就得"没有事件时睡着、有事件
+    时被叫醒"——Condition 正是这个语义。它复用同一把锁，于是
+    "读游标 + 判空 + 等待"是一个原子动作（用独立 Event 做通知会漏：
+    判完空、还没 wait，事件就到了，然后白睡一整个心跳周期）。
+
+    wait_for 的超时不是错误，是心跳节奏：静默期到点返回空列表，让
+    HTTP 层有机会往连接里写一行注释保活（也是探测"对面还在不在"）。
     """
 
     def __init__(self, maxlen: int = EVENT_RING_MAX) -> None:
         self._deque: deque[dict] = deque(maxlen=maxlen)
         self._seq = 0
         self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)
 
     def append(self, event: str, data: dict) -> int:
-        """追加一条事件并返回它的 seq。data 会被并入条目（event 名独占键）。"""
+        """追加一条事件、唤醒所有等待者，返回它的 seq。data 并入条目。"""
 
-        with self._lock:
+        with self._changed:
             self._seq += 1
             self._deque.append({"seq": self._seq, "event": event, **data})
+            self._changed.notify_all()
             return self._seq
 
     def after(self, after: int = 0) -> tuple[list[dict], int]:
-        """seq > after 的事件（顺序保持）；(事件列表, 当前最大 seq)。"""
+        """seq > after 的事件（顺序保持）；(事件列表, 当前最大 seq)。
+
+        保留给调试端点 /api/events 和直调测试用——前端已经改走 SSE，
+        不再靠它轮询。
+        """
 
         with self._lock:
             return [item for item in self._deque if item["seq"] > after], self._seq
+
+    def latest(self) -> int:
+        """当前最大 seq。SSE 首次连接用它把游标顶到"现在"，跳过历史重放。"""
+
+        with self._lock:
+            return self._seq
+
+    def wait_for(self, after: int, timeout: float) -> tuple[list[dict], int]:
+        """等到有 seq > after 的事件，或超时。返回值形状同 after()。
+
+        被 notify_all 叫醒后重新过滤——多个 SSE 连接各自带不同游标，
+        一个人被叫醒不等于你就有新东西，条件变量必须重查判据。
+        """
+
+        with self._changed:
+            if self._seq <= after:
+                self._changed.wait(timeout)
+            return [item for item in self._deque if item["seq"] > after], self._seq
+
+    def wake_all(self) -> None:
+        """叫醒所有等待者（收尾用）：让 SSE 线程立刻看到 stopping 退出，
+        而不是各自把 15 秒心跳睡完——关服务不该卡在等心跳上。
+        """
+
+        with self._changed:
+            self._changed.notify_all()
+
+
+# ═══════════════════════════════════════════════════════════════
+# SSE 帧编码 — 纯函数，跟 HTTP 无关，所以能单测
+# ═══════════════════════════════════════════════════════════════
+
+def sse_frame(item: dict) -> str:
+    """一条事件 → 一个 SSE 帧。
+
+    两个格式决定：
+      - data 用一层 JSON 把整条事件（含 event 名）装进去。SSE 的 data 行
+        不能有裸换行，json.dumps 天然满足；事件名留在载荷里，前端一个
+        onmessage 就能全收——不必为每种事件 addEventListener（具名事件
+        会让 onmessage 静默失效，是个很容易踩的坑）。
+      - id 必须是事件的 seq：浏览器断线重连时会把它放进 Last-Event-ID
+        头，服务端据此接着推，续传游标不用前端自己管。
+    """
+
+    payload = json.dumps(item, ensure_ascii=False)
+    return f"id: {item['seq']}\ndata: {payload}\n\n"
+
+
+# 心跳帧：SSE 规范里的注释行（冒号开头），客户端直接忽略。
+SSE_HEARTBEAT_FRAME = ": ping\n\n"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -174,6 +243,9 @@ class WebApp:
         self.ring = EventRing()
         self.board = ApprovalBoard(self.ring, approval_timeout)
         self.store = JsonlSessionStore(store_root or SESSIONS_ROOT)
+        # 收尾标志：SSE 是长连，每条约占一个线程。停服务时先竖旗、再
+        # wake_all()，它们醒来看到旗就自己收摊。
+        self.stopping = False
         if shell is not None:
             self.shell = shell
         else:
@@ -195,8 +267,10 @@ class WebApp:
         return self.shell.start()
 
     def stop(self) -> None:
-        """干净收尾（幂等）：shell.stop() 全套（shutdown/EOF/join/terminate）。"""
+        """干净收尾（幂等）：先竖旗叫醒 SSE，再走 shell.stop() 全套。"""
 
+        self.stopping = True
+        self.ring.wake_all()   # 别让 SSE 线程把 15 秒心跳睡完才走
         self.shell.stop()
 
     # ── API：会话清单 / 操作 ────────────────────────────────
@@ -212,15 +286,23 @@ class WebApp:
 
         shell = self.shell
         if action == "create":
-            new_sid = shell.new_session()   # 关旧开新，旧记录保留
+            try:
+                new_sid = shell.new_session()   # 关旧开新，旧记录保留
+            except Exception as exc:
+                # 建会话是硬失败（没有新 id 可用），但也不能让 handler 崩掉——
+                # 翻译成人话，前端摆一张"没能开始"的卡（＋ 按钮点了没反应最糟）
+                return {"ok": False, "detail": f"新建会话失败：{exc}"}
             return {"ok": True, "detail": f"已新建 {new_sid}",
                     "sessionId": new_sid}
         if action == "close":
             result = shell.close_session(sid)
             if "error" in result:
                 return {"ok": False, "detail": result["error"]}
+            # 文案里用请求的 sid，不用 result["closed"]——那是"是否真关了
+            # 一个 runtime"的布尔值（sidecar 契约，test_sidecar 钉着），
+            # 早先照抄成 sid 会吐出"已关闭 False（记录保留）"。
             return {"ok": True,
-                    "detail": f"已关闭 {result.get('closed', sid)}（记录保留）"}
+                    "detail": f"已关闭 {sid or '当前会话'}（记录保留）"}
         if action == "resume":
             result = shell.resume_session(sid)
             if "error" in result:
@@ -233,6 +315,24 @@ class WebApp:
                 return {"ok": False, "detail": result["error"]}
             return {"ok": True, "detail": f"已遗忘 {sid}"}
         return {"ok": False, "detail": f"未知操作: {action}"}
+
+    # ── API：sidecar 自述状态（成本表挂在里面）───────────────
+
+    def status(self) -> dict:
+        """会话数 / RingBuffer 用量 / handler 数（+ modelCost）。
+
+        不另开 /api/cost：成本表本来就是 sidecar/status 的一段（s08 的
+        duck typing——裸模型没有 cost_summary，status 就完全不带这个键）。
+        一个真源，终端 /status 和网页看的是同一份。
+        """
+
+        return self.shell.status()
+
+    def logs(self) -> dict:
+        """sidecar 最近日志（RingBuffer 尾巴）。shell.logs() 签名是 str，
+        且它自己已经把 RPC 失败翻译成一行说明——这里原样装进 dict 给前端。"""
+
+        return {"logs": self.shell.logs()}
 
     # ── API：历史直读（C 的灵魂）─────────────────────────────
 
@@ -261,8 +361,32 @@ class WebApp:
     # ── API：事件轮询 / 审批回执 ─────────────────────────────
 
     def events(self, after: int = 0) -> dict:
+        """一次性取事件（调试端点 /api/events 用；前端已改走 SSE）。"""
+
         events_list, latest = self.ring.after(after)
         return {"events": events_list, "latest": latest}
+
+    def event_stream(self, last_id: int = 0, heartbeat: float = SSE_HEARTBEAT):
+        """无限生成 SSE 帧：有事件就发事件，静默到点就发心跳。
+
+        写成生成器（而不是在 handler 里写循环）是为了可测：喂一个假
+        ring、喂一个短的 heartbeat，就能在单测里断言"第一帧是什么、
+        什么时候结束"，完全不碰 HTTP。
+
+        退出只有一条路：app.stopping 被竖起来。这是长连的收尾契约——
+        main() 的 finally 里 stop() 会竖旗 + wake_all()，睡着的线程
+        立刻醒来看到旗，不会卡住关服务。
+        """
+
+        cursor = max(0, last_id)
+        while not self.stopping:
+            items, _latest = self.ring.wait_for(cursor, heartbeat)
+            if not items:
+                yield SSE_HEARTBEAT_FRAME   # 静默期保活（也是探活）
+                continue
+            for item in items:
+                cursor = item["seq"]
+                yield sse_frame(item)
 
     def approve(self, ticket: str, approved: bool) -> dict:
         if self.board.respond(ticket, approved):
@@ -322,6 +446,49 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # ── SSE 长连 ────────────────────────────────────────────
+
+    def _stream_events(self, app: WebApp, query: dict) -> None:
+        """把事件环推给浏览器（替掉前端每 500ms 一次的轮询）。
+
+        协议要点：
+          - 不写 Content-Length。响应体长度未知，靠连接关闭收尾
+            （HTTP/1.0 语义，BaseHTTPRequestHandler 的默认协议版本），
+            浏览器边收边读，不会等长度。
+          - 续传游标优先取 Last-Event-ID 头：浏览器断线重连时自己带上
+            来的上一帧 id——所以前端一行游标代码都不用写。首次连接没有
+            这个头，才看 ?after=：给数字就从头补，给 "latest" 就顶到当下
+            （事件环常驻，不顶的话 F5 会把环里 500 条旧事件整批重放）。
+          - 每次 write 后立刻 flush：SSE 的时效性全靠它，攒在缓冲区里
+            的"实时"事件等于没推。
+        """
+
+        raw = self.headers.get("Last-Event-ID") or (query.get("after") or ["0"])[0]
+        if raw == "latest":
+            last_id = app.ring.latest()
+        else:
+            try:
+                last_id = int(raw)
+            except (TypeError, ValueError):
+                last_id = 0
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        # 反向代理缓冲会毁掉 SSE；本地开发用不上，写上省得以后接 nginx 时踩
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            for chunk in app.event_stream(last_id):
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # 关页 / 刷新 / 换网络：连接没了就是没了。这不是错误，是常态，
+            # 静默收摊即可（浏览器下次开页会自己重连并带上 Last-Event-ID）。
+            pass
+
     # ── GET ─────────────────────────────────────────────────
 
     def do_GET(self) -> None:
@@ -337,6 +504,12 @@ class _Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/sessions/") and path.endswith("/messages"):
             sid = path[len("/api/sessions/"):-len("/messages")]
             self._send_json(200, app.messages(sid))
+        elif path == "/api/status":
+            self._send_json(200, app.status())
+        elif path == "/api/logs":
+            self._send_json(200, app.logs())
+        elif path == "/api/events/stream":
+            self._stream_events(app, query)
         elif path == "/api/events":
             try:
                 after = int((query.get("after") or ["0"])[0])

@@ -1053,3 +1053,387 @@ s11 user memory / s12 cloud memory 排其后。
   消息，终端展示不了这个语义）；/status 的 sessions 口径 = 记录总数
   （closed 未 forget 也计入）。
 
+## 已完成：前端换 Vue 3（2026-09-15，由助手写完并真机验证）
+
+- 用户定"用 vue3"。路线：**免构建**（ESM 浏览器版 + import map），
+  不引 Vite/npm——`public/vendor/vue.esm-browser.prod.js`（3.5.13，
+  162KB，下载后本地化），保住 web_app 的"离线可用"边界。
+
+- `public/src/` 三层：`api.js`（五个端点收成具名函数，无状态、与 Vue
+  无关，换框架可原样搬）→ `store.js`（模块单例 reactive，免 Pinia；
+  状态 + 动作 + 两条轮询编舞）→ `components.js`（SessionList / ChatArea /
+  ApprovalCard / Toast，模板字符串）→ `main.js`（根组件 + 挂载）。
+  旧 `public/app.js`（415 行 vanilla）已删，git 有底（cb36c8b）。
+
+- 搬家的三个"顺着改对了"：vanilla 的 `findRow()` 靠 querySelector
+  反查 live（拿视图当数据源）→ 直接读 `state.sessions`；散落各处的
+  `setInputEnabled` → 一个 `canSend` computed；手写 `esc()` → `{{ }}`
+  默认转义（**永远别写 v-html**，练习 13 的铁律换了个执行者）。
+
+- **顺手修的三个 s07-c 遗留真 bug（与 Vue 无关，浏览器冒烟挖出来的）**：
+  1. `shell.py` 的 close/resume/forget 直接 `["result"]` 硬取 → sidecar
+     回 JSON-RPC error 时 KeyError 穿透到 HTTP handler，连接被空响应关掉
+     （前端只看到 "Failed to fetch"）。send_to/messages 早有这个分支，
+     四个会话操作漏了 → 抽成 `SidecarShell._result()` 一处，+2 测试。
+  2. `web_app.action("close")` 把 `result["closed"]`（**布尔**）当 sid 拼
+     文案 → toast 显示"已关闭 False（记录保留）"。改成用请求的 sid。
+  3. `tests/test_web_app.py` 的 FakeShell 返回 `closed=sid`，与真 sidecar
+     的布尔契约相反（test_sidecar 断言的就是布尔）——**假实现替真实现
+     圆谎，bug 才活到了浏览器上**。假实现已对齐真契约，并补了文案断言。
+     （教训接练习 17：假的不像真的，测试就是自我安慰。）
+
+- 新增 `scripts/smoke_frontend.cjs`：真 Chromium headless + CDP，**零安装**
+  （系统自带 Chrome/Edge + Node 22 全局 WebSocket，不用下 500MB 的
+  Playwright）。11 条断言：挂载 / 清单行数 == `/api/sessions` 条数 /
+  点会话出历史 / 发送链路（新建→v-model→POST→重拉）/ 关会话锁输入 /
+  布局不横向溢出 / console 干净；`--shot x.png` 可截图。
+  坑：evaluate 必须查 `exceptionDetails`，否则页内 Promise 抛异常时
+  `result.value` 是 `{}`，断言**假通过**。
+
+- 验收：Python 292 条（+2，0 failure，15 条 s10 TODO error 未变）；
+  前端冒烟 11/11，console 零 error/warn；端口 8765 已释放。
+
+- 遗留（按建议顺序）：① `/api/events` 轮询 → SSE（约 20 行，独立可测，
+  换任何前端都受益）；② 审批卡的浏览器实测（需要真模型走 fs_write）；
+  ③ 真要 Vite 时的三件事（dev server 代理 /api 到 8765、产物挂进
+  PUBLIC_DIR、会话切换改成路由参数）；④ `pyproject.toml` 里的 chainlit
+  依赖已无人用，可清。
+
+## 已完成：前端路线图 + Step 1/2（2026-09-15，用户授权"前端归你，一步步做完"）
+
+- 用户定：前端由助手负责，按"完成"清单一步步推进。七步路线图（顺序即
+  依赖）——地基：①SSE 事件推送 ②turn 结局可见；可观测：③成本/token
+  ④运维抽屉（status+logs）⑤记忆面板（s10）；体验：⑥Markdown 与代码块
+  ⑦响应式与可访问性。本次做完 ①②。
+
+### Step 1 · SSE 事件推送（替掉 500ms 轮询）
+
+- `EventRing` 的 `Lock` → `Condition(同一把锁)`。**这是这一步的核心设计
+  点**：`读游标 + 判空 + wait` 必须是一个原子动作；用独立 Event 做通知会
+  漏唤醒（判完空、还没 wait，事件就到了，然后白睡一整个心跳周期）。
+  新增 `wait_for(after, timeout)` / `latest()` / `wake_all()`。
+
+- 新增纯函数 `sse_frame(item)` + 生成器 `WebApp.event_stream(last_id,
+  heartbeat)`。**写成生成器而不是在 handler 里写循环，是为了可测**：喂一个
+  假 ring + 短心跳，就能在单测里断言"第一帧是什么、什么时候退出"，完全不
+  碰 HTTP（HTTP 层于是只剩搬字节）。
+
+- 路由 `GET /api/events/stream`：不写 Content-Length（响应体长度未知，靠
+  连接关闭收尾——HTTP/1.0 语义），每次 write 后立即 flush，续传靠浏览器
+  自带的 `Last-Event-ID` 头（前端一行游标代码都不用写）。
+
+- **关键坑**：事件环是常驻的，首次连接不带游标会把环里最多 500 条旧事件
+  整批重放（F5 后满屏旧卡片）。加了 `?after=latest`：首次连接顶到当下，
+  断线重连时 Last-Event-ID 优先。
+
+- `WebApp.stopping` 标志 + `wake_all()`：SSE 是长连、每条约占一个线程，
+  停服务时若不叫醒，handler 线程会各自把 15 秒心跳睡完才走。
+
+- 前端：`EventSource` 替掉 `pollEvents`/`peekEvents`/`state.lastSeq`；
+  新增 `state.streamUp` + 顶栏指示灯（绿=已连，红闪=重连中）。事件处理
+  加 `if (!state.posting) return` 门：多 tab 不串台，也顺手免疫旧事件重放。
+
+### Step 2 · turn 结局可见
+
+- **真 gap**：`agent/send` 一直返回 `status`（completed/max_steps/failed），
+  前端却只看了 `error` 字段——于是 `status="failed"` 的 turn 在界面上表现
+  为"用户问了一句、什么都没发生"（失败时 transcript 里只有 user 那条，
+  模型那句人话在 output 里，而 output 不落 transcript，重拉历史拿不到）。
+
+- 新增 `state.notice` + 结局卡（`.msg.notice.lv-warn/.lv-error`）；`send`
+  里 `res.error` 也走同一张卡（toast 一闪而过，容易错过）。
+
+- 直播从"只认 tool_start/tool_end"扩到全 5 种事件：`round_start` 画
+  "第 N 轮"、`model_reply` 画"决定调用 / 给出最终回答"、结尾"✅ 本轮完成"、
+  失败"⚠ …"。
+
+- **直播不再在 turn 结束时被抹掉**（原 `finishPosting` 会清空）：刚跑完的
+  一轮正是最该回看的东西，清掉之后只剩历史里那几条 role=tool 的结果，
+  "第几轮、模型决定了什么"全没了。清空时机改到"下一次发送 / 切换会话"。
+
+- 已知边界：`status` 不落 transcript，结局卡 F5 后就没了。要持久化得让
+  session 记录带上它（归后端那一步）。
+
+### 验证
+
+- Python **301 条**（+9：EventRingWait 4 / SseFraming 5），0 failure，
+  15 条 s10 TODO error 未变。
+
+- 前端冒烟扩到 **17 条**（`scripts/smoke_frontend.cjs`）：新增 SSE 指示灯、
+  直播保留（断言出现"第 1 轮"和"本轮完成"）、"不再有轮询请求"、报错可见性
+  （对已关闭会话发消息 → 结局卡出现且写着后端的人话）。
+
+- curl 直观测到 SSE 原始帧：`id: 1` + `data: {"seq":1,"event":
+  "round_start","step":0}`——`data:` 必须是单行，内层换行由 JSON 转义。
+
+- 两个测试坑：①`performance.getEntriesByType('resource')` **不报未完成的
+  EventSource 请求**，要查"到底有没有在轮询"必须用 CDP 的 `Network` 域抓
+  真实请求（`Network.requestWillBeSent`）；②断言写成"计时 ≥ 0.15s"会被
+  定时器精度判失败（实际 0.14999830），改成区间断言（>0.05 且 <1.0），
+  钉的是"确实睡了、也没有死等"。
+
+### 下一步（路线图剩余）
+
+③成本/token ④运维抽屉（status+logs）⑤记忆面板（s10）
+⑥Markdown 与代码块 ⑦响应式与可访问性。
+另有 SSE 的价值兑现点：**流式输出**（模型边生成边推——需要 RealModel 走
+stream 模式，跨前后端，是目前最大的体验缺口）。
+
+## 已完成：前端 Step 3 · 成本/token + Step 6 · Markdown（2026-09-15）
+
+### Step 3 · 每轮 token + 累计成本
+
+- 后端只差"每轮 token 出不来"：`turn_runner` 的协议只回
+  `(output, messages)`，装不下 usage。照 s07-b 给 status 建的**协议接缝记账**
+  套路，在闭包里再记一笔 `_last_turn_usage = dict(result.usage)`，
+  `agent/send` 响应加 `usage` 键。离线模型回 `{}`——诚实，不编造 0。
+
+- `web_app` 新增 `GET /api/status`（直通 `shell.status()`）。成本表不另开
+  端点：它本来就是 `sidecar/status` 的 `modelCost` 段（s08 的 duck typing），
+  一个真源，终端 /status 和网页看的是同一份。
+
+- 前端：`cost` reactive（rows / usage）+ `costLine` / `costTitle` computed。
+  顶栏右对齐"本问 输入 X / 输出 Y · 累计 $0.000000"，悬停看 per-tier 明细；
+  每轮 token 同时进直播。
+
+- **坑（离线测试看不见，真实数据一进门就现形）**：`modelCost[].cost` 是
+  后端**已经格式化好的字符串**（`"0.000000"`，终端直接拼 `$` 打印），前端
+  `reduce(sum + row.cost)` 于是变成了字符串拼接，最后 `toFixed` 抛
+  `total.toFixed is not a function`，顶栏那行整个渲染不出来。求和要先
+  `Number(row.cost)`，再按同精度 `toFixed(6)` 格式化回去。
+
+### Step 6 · Markdown 渲染（零 v-html 路线）
+
+- 设计：**解析成数据树，渲染层用 Vue 的 h() 建 VNode**。全程没有
+  innerHTML / v-html 可写 → 注入面在结构上不存在。练习 13 的铁律"LLM 输出
+  是不可信输入，进 HTML 前必须转义"在这里升级成**物理隔离**——转义是纪律，
+  没有 innerHTML 可写是物理约束。
+
+- `public/src/markdown.js`：**纯函数、零 import**（所以能进 Node 单测）。
+  支撑——块级：围栏代码（含未闭合也闭合）/ 标题 / 引用 / 有序无序列表
+  （缩进续行递归成嵌套）/ 分隔线 / 段落；行内：代码 / 链接 / 粗 / 斜 /
+  粗斜 / 删除。链接有 scheme 白名单：`javascript:` / `data:` 降级成纯文字
+  （**零 v-html 挡不住 `href` 执行**，这是另一个入口）。已知取舍：不支持
+  惰性续行。
+
+- `components.js`：`Markdown` 组件（`render()` 返回 VNode 数组）+ 一张映射表。
+  只有 assistant 走 markdown——用户输入原样显示（别把用户打的字符当语法），
+  工具结果保持原样（缩进敏感）。
+
+- 顺手修：`.t-name` 标签后的空格改用 CSS margin。多行模板里的空白符会被
+  Vue 编译器吃掉（condense），靠"模板里那个空格"迟早断。
+
+- **重大 bug（Node 直接 OOM 崩了）**：`parseInline` 会递归（粗体套斜体），
+  而我起初把行内正则做成了**模块级共享对象**。`g` 标志的 `lastIndex` 挂在
+  RegExp 对象上——内层递归一执行就把外层的游标踩烂，外层拿着被重置的游标
+  从更早的位置重新匹配，同一个标记反复命中，循环永不退出。死循环在
+  `push` token，不只是空转 → 冒烟跑到"行内：代码/粗/斜/删除"这条时
+  **Node 把 4GB 堆吃满崩掉**。前端里触发就是标签页卡死。
+  修法：每次调用 `new RegExp(INLINE_SRC, "g")` 建自己的实例。备用修法
+  （"递归前存下 lastIndex、回来复位"）要求每个递归点都记得，漏一处就复发。
+  教训：**递归函数里不能碰任何带可变状态的共享对象**。
+
+### 验证
+
+- Python **305 条**（+4：sidecar usage 2 / web_app status+usage 2），
+  0 failure，15 条 s10 TODO error 未变。
+
+- 前端冒烟 **35 项**（15 条 markdown 纯函数自检 + 20 条浏览器）全过，
+  console 零 error/warn。纯函数自检用 `data:` URL 把零 import 的
+  markdown.js 直接 import 进 Node 跑——快两个数量级，而且能把它单独钉死。
+
+- 浏览器侧新增：markdown 真渲染（模型回复的缩进列表 → 4 个 `<ul><li>`）、
+  用户输入的 `<b>` 原样躺着没变成标签、聊天区无可执行标签/`on*` 属性、
+  `/api/status` 与顶栏那行账一致（没数据就不编）。
+
+- **测试自身的坑（第二次同类）**：从 `chat-head` 的 textContent 剥 sid，
+  成本数字粘进来把 sid 变成 `sess_00090000000`。加了稳定的 `#chat-sid`。
+  教训同 `#btn-create`：**别靠剥文本取标识，给稳定 id**。
+
+- 残留清理：`.sessions/` 只剩 sess_0001（用户的）+ sess_0006（当前服务的）。
+
+### 下一步（路线图剩余）
+
+④运维抽屉（status + logs，`/api/status` 已就位，还差 `/api/logs`）
+⑤记忆面板（s10——注意 s10 的 TODO 还没填，15 条红灯就是它）
+⑦响应式与可访问性
+**以及最值钱的：流式输出**（SSE 已铺好路，现在模型一次性回全文；改成边生成
+边推要动 RealModel 的 stream 模式，跨前后端，是目前最大的体验缺口）。
+
+## 已完成：前端 Step 4 + 7 + 交互完整性（2026-09-15，用户定"前端全交给助手"）
+
+用户原话："我后端后面再写，你就把前端全写了，以后我就不用写了。"
+于是把路线图剩余项一次做完，并把前端拆成 7 个模块：
+
+```
+public/src/
+  api.js        网络层：五个端点 + /api/status + /api/logs + SSE 工厂
+  store.js      服务端数据：会话 / 历史 / 直播 / 成本账 / 运维快照
+  ui.js         本 tab 的视图偏好：侧栏折叠 / 抽屉开合 / 搜索词
+  markdown.js   纯函数解析器（零 import，能进 Node 单测）
+  components.js SessionList / ChatArea / Markdown / ApprovalCard / Toast
+  drawer.js     运维抽屉（状态 / 成本 / 日志）
+  main.js       根组件 + 挂载 + 全局错误兜底
+```
+
+- **ui.js 存在的理由**：store 放"服务端有对应物"的数据，ui 放本浏览器的视图
+  状态。混在一起的下场是"改个侧栏宽度要不要通知后端"这种问题开始出现。
+  localStorage 只持久化折叠和抽屉——搜索词不记（记住会让下次开页面看到一份
+  被过滤过的列表，像坏了）。
+
+### Step 4 · 运维抽屉
+
+- `GET /api/logs`（`WebApp.logs()` 直通 `shell.logs()`）。成本表不另开端点，
+  它就在 `sidecar/status` 里。
+- 抽屉三块：sidecar 状态（会话记录 / RingBuffer 用量 / RPC handlers）、
+  per-tier 成本表、日志尾。
+- **刷新节奏归抽屉自己管**（开着 3 秒一次，关掉立刻停）。反过来把定时器放
+  store 里，数据层就得知道"有没有人在看"——那是视图的事。
+
+### 顺手收口的后端隐患（与前端直接相关，所以做了）
+
+- `shell.py` 的 `status / sessions / logs / tools` 也在硬取 `["result"]`——
+  和我先前修的 close/resume/forget 是同一类问题。它们现在都从 HTTP 暴露了，
+  一次 RPC 错误就是"点一下侧栏、handler 崩掉、浏览器看到 Failed to fetch"。
+  全部改走 `_result()`。
+- `new_session` / `clear` 里的 `["result"]["sessionId"]` 撞 error 响应会
+  KeyError。新增 `_create_session_remote()`：抛 RuntimeError（带 sidecar 人话），
+  由 `WebApp.action("create")` 接住变 `{"ok": False, detail}`——
+  **＋ 按钮点了没反应是最糟的失败形态**（分不清是坏了还是没点到）。
+
+### Step 7 · 响应式与可访问性
+
+- 侧栏折叠成 44px 轨。**用 CSS 实现而不是 v-if**：保住列表滚动位置和输入焦点，
+  折叠再展开不该把用户的位置弄丢。
+- `:focus-visible` 焦点轮廓（只给键盘画，鼠标点击不画——否则会被逼着全局关掉，
+  那就等于没有）、`.sr-only`、`role="log"` + `aria-live="polite"` 消息区、
+  `role="alertdialog"` 审批卡、所有图标按钮补 `aria-label`。
+- **审批卡自动聚焦卡片本身，不是"允许"按钮**——审批是安全闸门，误按一下 Enter
+  就放行一个写操作是不能接受的默认动作。聚焦卡片让读屏软件念出规则和理由，
+  人要动手得自己 Tab 过去。
+- **Esc 只隐藏审批卡，绝不等于拒绝**：拒绝必须是一次明确动作（等待超时才是
+  fail-closed 的默认拒绝；误按 Esc 就当成拒绝会让用户莫名其妙丢一次操作）。
+- `app.config.errorHandler` 兜底：组件抛异常时至少给用户一句话，不留白屏。
+- 窄屏：≤900px 抽屉改浮层（盖住聊天区而不是把它挤成一条缝）、≤640px 侧栏收窄、
+  成本行隐藏、气泡放宽。
+
+### 交互完整性（路线图外的补齐）
+
+- 会话列表搜索框（纯函数 `filterRows(rows, keyword)`，空词返回原数组）。
+- 消息区"回到最新"按钮：**上翻历史时不再被强行拽回底部**（新内容到来只在用户
+  本来就贴着底时才自动滚），把决定权交回用户。
+- markdown 代码块复制按钮（按钮不进 `<pre>`——会被一起复制走，而且 pre 里不
+  允许放交互元素）。
+- SSE 断连横幅；`state.streamUp` 改**三态**（null = 还没连过），避免启动瞬间
+  闪一条"已断开"。
+
+### 验证
+
+- Python **309 条**（+4：shell 查询端点错误翻译 2 / web_app logs + create 失败
+  翻译 2），0 failure，15 条 s10 TODO error 未变。
+- 前端冒烟 **42 项**（15 条纯函数 + 27 条浏览器）全过，console 零 error/warn。
+  三张截图：常态 / 跑完一轮 / 抽屉打开。
+
+#### 两个值得复用的探针技法
+
+浏览器冒烟里最有用的一招：**在真页面里隔离挂载组件**。
+
+```js
+const { Markdown } = await import('/src/components.js');
+const { createApp, h } = await import('vue');
+const host = document.createElement('div'); document.body.appendChild(host);
+createApp({ render: () => h(Markdown, { text: src }) }).mount(host);
+// 断言后 app.unmount(); host.remove();
+```
+
+配合**直接改 store 造场景**（`import('/src/store.js')` 后设 `approval.ticket`），
+"需要后端配合才触发"的分支就变成可测分支了——代码块复制、审批卡 a11y 都是
+这么测到的（离线模型永远产不出代码块，也永远不会弹审批）。
+
+#### 测试自身的坑（第三次同类）
+
+- 搜索断言拿 `/api/sessions` 的数字和 DOM 比 → 5 秒轮询在检查途中刷了一次
+  （5→6），测试自己判自己失败。改成 **DOM 前后自比**。
+- "回到最新"测不动：内容没超出容器就滚不动。用探针把 `state.messages` 撑到
+  40 条再测。
+- 截图块里直接写了 `document.getElementById(...)`（那是 **Node 进程**）——
+  页面操作必须走 CDP `Runtime.evaluate`。
+
+### 刻意没做的（都在等对方）
+
+1. **浅色主题**：半套调色板比没有更糟——要做就得把全部硬编码 rgba 提成 CSS
+   变量，再把 markdown / 结局卡 / 抽屉 / 复制按钮四种表面在两种模式下各过
+   一遍。该独立一步做，不适合挂在长会话尾巴上（"不提交半成品"）。
+2. **记忆面板（⑤）**：依赖 s10 未填的 TODO（那 15 条红灯就是它）。
+3. **流式输出**：要动 `RealModel` 的 stream 模式（后端）。
+
+### 后端待补清单（前端已经把位置留好了）
+
+- `GET /api/logs`、`GET /api/status` 已加（各 3~5 行，复用 `shell.*`）。
+- 会话标题编辑：`session/list` 已经回 `title`，但没有任何端点能**改**它。
+- `status` 不落 transcript：结局卡 F5 后就没了，要持久化得让 SessionRecord 带上。
+- s10 工作区记忆：`WorkspaceMemory` 填完后，⑤ 面板只需要加一个
+  `GET /api/memory` + `POST /api/memory/distill` 就能接上。
+
+## 已完成：视觉重做 —— 仿 Codex 单色系（2026-09-15，用户："页面太丑了，做成像 codex 那样"）
+
+先搜了一下 Codex 的实际形态再动手（不凭印象猜），结论很关键：**我们的结构
+本来就和 Codex 同构**——左侧任务列表 / 中间对话（工具执行内嵌）/ 右侧默认
+收起的面板 / 底部 composer / 46px 头部。所以这是一次彻底重做，不是打补丁。
+
+### 设计语言（token 化的单色系）
+
+- **浅色为主**，深色走 `prefers-color-scheme`，两边**共用同一套 token**
+  （约 20 个变量），不是各写一遍结构样式。这正好把上一轮"刻意没做的浅色主题"
+  一并兑现——当时判断"半套调色板比没有更糟"，现在有了完整的两组取值。
+- **单色**：没有彩色主题色，主按钮就是墨黑（`--ink`），深色模式下自动翻转。
+- 尺寸对齐 Codex 桌面版的量级：头部 46px、侧栏 260px、内容列 760px。
+
+### 具体改了什么
+
+| | 改前 | 改后 |
+|---|---|---|
+| 助手消息 | 深色气泡 | **无气泡**，满列宽正文 |
+| 用户消息 | 蓝色气泡 | 右侧灰块，圆角 18px |
+| 布局 | 满屏拉伸 | **760px 居中内容列** |
+| 输入 | 单行 input + 文字按钮 | **textarea 自动长高** + 圆形墨黑 ↑ + Enter 提示 |
+| 系统提示 | 每段对话开头一大段灰字 | **原生 `<details>` 折成一行** |
+| 顶栏 | 一行小字 | 46px：指示灯 + 会话 + 成本 + 抽屉齿轮 |
+| 侧栏底部 | 空 | 工作目录（Codex 把"项目"挂这儿） |
+| 空状态 | 无 | 居中欢迎屏（极简 SVG 标记） |
+
+三个值得记下来的判断：
+
+1. **助手消息去掉气泡**——这是 agent 界面和聊天软件的分野。满列宽正文的
+   可读性远好于把大段代码/列表塞进一个 72% 宽的气泡里。
+2. **系统提示折起来，但不删**。Codex/ChatGPT 都不展示它；可我们的设计前提是
+   "历史=真相"，transcript 第一条就是它——所以用原生 `<details>` 折叠：
+   语义、键盘可达、读屏友好全是白拿的，不写一行 JS。
+3. **折叠的语义按屏宽分叉**：桌面 = 收成 52px 轨；窄屏（≤700px）= 整条滑出
+   屏幕。两套规则**分开写**（`min-width:701px` / `max-width:700px`）——第一版
+   想用一条 `.collapsed` 兼顾两种含义，写出来乱得没法读。
+
+- 清掉与单色风格不搭的彩色 emoji：`✅/🔧/🤖/⚠️` → `✓` / `⚠︎` / 纯文字。
+  **坑**：`⚠`（U+26A0）在 Chrome/Windows 上会渲染成彩色 emoji，要强制文字
+  形态必须跟一个 U+FE0E（variation selector-15）。
+
+- `ui.js`：没存过偏好时按 `window.innerWidth <= 700` 决定侧栏默认收起。
+
+### 冒烟脚本升级
+
+- `--window-size=1280,860`：默认的 750px 窗口会让"内容居中成列"这条断言
+  **退化成恒真**（列宽被拉满、左右间隙都是 0），截图也不像真实场景。
+- 新增 `--dark`：用 CDP `Emulation.setEmulatedMedia` 模拟
+  `prefers-color-scheme: dark`，整套断言 + 截图在深色下再跑一遍。
+  **没跑过就等于没写**——深浅两套都跑，才算这套 token 真的成立。
+- 布局断言改成新设计的形状：列宽 ≤800、左右间隙差 <14px、用户气泡宽 ≤ 列宽。
+
+### 验收
+
+- 前端冒烟 **43 项 × 2 种配色**（浅色 43/43、深色 43/43），console 零
+  error/warn；三张浅色截图 + 三张深色截图都符合预期。
+- Python **309 条**不变（这一轮没碰后端）。
+- 小插曲：写 `index.html` 前发现文件被注入了 7 处 `data-page-node-id`
+  （预览工具的结构标注，只在 html/head/meta/body 上，不是内容改动），
+  直接重写后它们消失。
+
