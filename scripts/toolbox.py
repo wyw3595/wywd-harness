@@ -1,12 +1,27 @@
 """把工具、模型、记忆策略组装成 agent 的运行环境。
 
 新增工具只改这个文件 + 实现模块：
-  - 普通工具：写个函数（放 file_tools / std_tools），加进 ALL_TOOLS。
-  - 延迟工具：Tool(...) 时 defer=True 放进 DEFERRED_TOOLS——schema 不
-    发给模型，等它 ToolSearch 发现后才进会话（s03 省 token）。
+  - 普通工具：写个函数（放 file_tools / std_tools），加进
+    build_instant_tools（与目录有关的）或直接挂 handler（无关的）。
+  - 延迟工具：Tool(...) 时 defer=True 放进 build_deferred_tools——schema
+    不发给模型，等它 ToolSearch 发现后才进会话（s03 省 token）。
   - 桥接工具：ToolSearch / DeferExecuteTool 是 harness 内建协作件，
     handler 用闭包绑 registry，input_schema 必须手写（lambda 反射
     不出 list/dict 类型）。
+
+工作区（2026-09-13）：沙箱根从全局常量升格为会话状态。装配入口是
+build_registry_for(workspace)——按上传目录现做一整套工具（闭包绑定
+root）；build_registry() / build_policy() 只是"默认工作区 = 项目根"的
+兼容包装，老入口（chat / shell / electron）零改动。安全要点：闭包
+签名必须**吃掉** root 参数——tool_to_schema 反射 handler 签名的每个
+参数，root 若出现在签名里，模型就能在 schema 里看见它、传任意路径
+绕沙箱。参数说明书靠继承实现函数的原件（__doc__ 赋值）——原件的
+Args 段里没有 root（file_tools 的规矩），继承也不会泄露。
+
+两个工厂（build_instant_tools / build_deferred_tools）的参数名刻意
+叫 root_（带下划线）：内层闭包 fs_find / tree_dir 自己有个参数 root
+（**搜索起点**，模型可见）。两个"root"是不同概念，名字撞上会互相
+遮蔽——内层看不到外层的 root，沙箱根就丢了。下划线一劳永逸。
 
 超 WorkBuddy 的日常工具箱（实现都在 src/harness/std_tools.py）：
   calc —— 安全数学求值（ast 白名单）；
@@ -14,7 +29,16 @@
   tree_dir —— 目录树（低频、长 schema，正好当延迟加载的演示对象）。
 """
 
-from src.harness.file_tools import ALLOWED_ROOT, FORBIDDEN_PARTS, list_dir, read_file, write_file
+from pathlib import Path
+
+from src.harness.file_tools import (
+    ALLOWED_ROOT,
+    FORBIDDEN_PARTS,
+    edit_file,
+    list_dir,
+    read_file,
+    write_file,
+)
 from src.harness.model_router import ModelRouter, ModelTier
 from src.harness.models import FakeModel
 from src.harness.permissions import (
@@ -23,9 +47,14 @@ from src.harness.permissions import (
     build_default_policy,
 )
 from src.harness.real_model import RealModel
-from src.harness.std_tools import calc, find_text, now, tree_dir
+from src.harness.std_tools import calc, find_text, glob_files, now, tree_dir
 from src.harness.tools import Tool, ToolRegistry
-from src.harness.workspace_memory import FactKind, WorkspaceMemory
+from src.harness.workspace import Workspace
+from src.harness.workspace_memory import (
+    NO_MEMORY_PLACEHOLDER,
+    FactKind,
+    WorkspaceMemory,
+)
 
 import os
 
@@ -49,111 +78,212 @@ def get_weather(city: str) -> str:
     return f"{city}今天下紫色雪花，气温零下 42 度。"
 
 
-# 即时工具：高频、短 schema，直接全量进模型上下文。
-ALL_TOOLS: list[Tool] = [
-    Tool(
-        name="get_weather",
-        description="查询一个城市今天的天气（演示用模拟数据，不代表真实天气）",
-        handler=get_weather,
-    ),
-    Tool(
-        name="now",
-        description="获取当前日期和时间（本地时区），返回格式 YYYY-MM-DD HH:MM",
-        handler=now,
-    ),
-    Tool(
-        name="fs_list",
-        description="列出项目里某个目录的内容（path 是相对项目根的路径，默认 . ）",
-        handler=list_dir,
-    ),
-    Tool(
-        name="fs_read",
-        description="读取项目里某个文本文件（path 相对项目根；超长自动截断）",
-        handler=read_file,
-    ),
-    Tool(
-        name="fs_write",
-        description="写入或覆盖项目里某个文本文件（path 相对项目根，整文件覆盖；"
-        "需用户审批后才会真正执行）",
-        handler=write_file,
-    ),
-    Tool(
-        name="calc",
-        description="安全计算数学表达式，如 (1 + 2) * 3 或 sqrt(16) * 2",
-        handler=calc,
-    ),
-    Tool(
-        name="fs_find",
-        description="在项目里搜索文件内容（正则；返回 文件:行号:行内容 命中）",
-        handler=find_text,
-    ),
-]
+def build_instant_tools(root_: Path) -> list[Tool]:
+    """按工作区根现做一套即时工具（高频、短 schema，直接进模型上下文）。
 
-# 延迟工具：低频、长 schema。不发给模型；模型拿到的是目录里的一行
-# 摘要，据用途调 ToolSearch 发现后，才在本会话加载完整 schema。
-DEFERRED_TOOLS: list[Tool] = [
-    Tool(
-        name="tree_dir",
-        description="渲染一棵目录树，看清项目结构（低频、参数多）",
-        handler=tree_dir,
-        defer=True,
-    ),
-    Tool(
-        name="memory_write",
-        description="往项目工作区记忆追加一条事实（决策/约定/坑/结果）。"
-        "只写原始日志，是否晋升长期记忆由 30 天蒸馏策略决定——"
-        "不要记寒暄、猜测、密钥或原始工具输出。",
-        handler=lambda content, kind="outcome", importance=3:
-            write_memory_fact(content, kind, importance),
-        defer=True,
-        input_schema={
-            "type": "object",
-            "properties": {
-                "content": {"type": "string",
-                            "description": "一句话的项目事实，如'存储层确定用 SQLite WAL 模式'"},
-                "kind": {"type": "string",
-                         "enum": ["decision", "convention", "pitfall", "outcome"],
-                         "description": "事实类型：决策/约定/坑/结果"},
-                "importance": {"type": "integer",
-                               "description": "重要度 1-5，默认 3；>=4 才可能提前晋升"},
-            },
-            "required": ["content"],
-        },
-    ),
-]
+    与目录无关的工具（天气/时间/计算）不闭包，直接挂原函数——没有
+    状态就不该有绑定，读代码的人一眼能看出谁依赖沙箱。
+
+    每个闭包做两件事，缺一不可：
+      1. 签名只保留模型该看见的参数——root_ 被闭包**吃掉**。
+         tool_to_schema 反射签名生成 schema，沙箱根一旦入签名，模型
+         就能传任意路径绕沙箱（这是本函数存在的安全理由）；
+      2. docstring 继承实现函数的原件（__doc__ 赋值）——参数说明书
+         只有一份，不写副本。原件 Args 段里没有沙箱根参数，所以
+         继承也不会泄露。
+    """
+
+    def fs_list(path: str = ".") -> str:
+        return list_dir(path, root=root_)
+    fs_list.__doc__ = list_dir.__doc__
+
+    def fs_read(path: str, offset: int = 1, limit: int = 200) -> str:
+        return read_file(path, offset, limit, root=root_)
+    fs_read.__doc__ = read_file.__doc__
+
+    def fs_write(path: str, text: str) -> str:
+        return write_file(path, text, root=root_)
+    fs_write.__doc__ = write_file.__doc__
+
+    def fs_edit(path: str, old_text: str, new_text: str,
+                replace_all: bool = False) -> str:
+        return edit_file(path, old_text, new_text, replace_all, root=root_)
+    fs_edit.__doc__ = edit_file.__doc__
+
+    def fs_find(pattern: str, root: str = ".", max_results: int = 8,
+                case_sensitive: bool = False) -> str:
+        # 内层的 root 是**搜索起点**（模型可见参数，相对沙箱根）；
+        # 沙箱根本身由外层的 root_ 捕获——两个"root"是不同概念。
+        return find_text(pattern, root, max_results, case_sensitive,
+                         sandbox_root=root_)
+    fs_find.__doc__ = find_text.__doc__
+
+    def fs_glob(pattern: str, root: str = ".", max_results: int = 50) -> str:
+        # root 同 fs_find：搜索起点；沙箱根在 root_。
+        return glob_files(pattern, root, max_results, sandbox_root=root_)
+    fs_glob.__doc__ = glob_files.__doc__
+
+    return [
+        Tool(
+            name="get_weather",
+            description="查询一个城市今天的天气（演示用模拟数据，不代表真实天气）",
+            handler=get_weather,
+        ),
+        Tool(
+            name="now",
+            description="获取当前日期和时间（本地时区），返回格式 YYYY-MM-DD HH:MM",
+            handler=now,
+        ),
+        Tool(
+            name="fs_list",
+            description="列出项目里某个目录的内容（path 是相对项目根的路径，默认 . ）",
+            handler=fs_list,
+        ),
+        Tool(
+            name="fs_read",
+            description="读取项目里某个文本文件（path 相对项目根），返回带行号的正文；"
+            "大文件用 offset/limit 翻页（默认从第 1 行起、最多 200 行）",
+            handler=fs_read,
+        ),
+        Tool(
+            name="fs_write",
+            description="写入或覆盖项目里某个文本文件（path 相对项目根，整文件覆盖；"
+            "需用户审批后才会真正执行）",
+            handler=fs_write,
+        ),
+        Tool(
+            name="fs_edit",
+            description="修改项目里已有的文本文件（只传改动片段，适合改大文件）："
+            "old_text 必须与原文逐字相同且默认要求在文件里唯一；"
+            "多次出现要么补上下文要么 replace_all=true。同样需用户审批",
+            handler=fs_edit,
+        ),
+        Tool(
+            name="calc",
+            description="安全计算数学表达式，如 (1 + 2) * 3 或 sqrt(16) * 2",
+            handler=calc,
+        ),
+        Tool(
+            name="fs_find",
+            description="在项目里按正则搜索文件内容（返回 文件:行号:行内容 命中）。"
+            "自动跳过 .venv/__pycache__/learn-workbuddy 等无关目录；"
+            "要搜这些目录就把它们作为 root 显式传进来",
+            handler=fs_find,
+        ),
+        Tool(
+            name="fs_glob",
+            description="按文件名或路径模式找文件（glob，如 **/*.py、src/**/test_*.py、"
+            "*.md）——知道文件叫什么就用它，不要拿 fs_find 去猜内容。"
+            "同样自动跳过无关目录；要翻这些目录就把它们作为 root 显式传进来",
+            handler=fs_glob,
+        ),
+    ]
 
 
 def write_memory_fact(content: str, kind: str = "outcome",
                       importance: int = 3, root=None) -> str:
     """memory_write 的 handler 本体（root 可注入——测试喂 tmp 目录）。
 
-    TODO 8a（你来填）：
-      memory = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
-      fact = memory.append_daily_log(
-          content, kind=kind, importance=importance, source="agent")
-      return (f"已记录 [{fact.kind}] {fact.content[:60]}"
-              f"（{fact.recorded_at[:10]} 日志，等待蒸馏策略裁决）")
-    写路径的诚实设计：工具只能**追加**原始事实（要不要记住一辈子，
-    蒸馏策略说了算）——"模型说重要就永久保存"是记忆污染的正门。
+    写路径的诚实设计：工具只能**追加**原始事实。要不要记住一辈子由蒸馏
+    策略说了算——"模型说重要就永久保存"是记忆被提示注入污染的正门
+    （教材"常见误区"第二条）。
+
+    所以返回值也刻意说"等待蒸馏策略裁决"，而不是"已记住"：模型读到的
+    应该是"我记下来了，但能不能留下来不归我管"。措辞在这里是安全设计
+    的一部分——说"已永久记住"会让模型以为它可以操纵长期记忆。
     """
-    raise NotImplementedError("TODO 8a: write_memory_fact")
+
+    memory = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
+    fact = memory.append_daily_log(
+        content, kind=kind, importance=importance, source="agent")
+    return (f"已记录 [{fact.kind}] {fact.content[:60]}"
+            f"（{fact.recorded_at[:10]} 日志，等待蒸馏策略裁决）")
+
+
+def build_deferred_tools(root_: Path) -> list[Tool]:
+    """按工作区根现做一套延迟工具（低频、长 schema）。
+
+    schema 不发给模型；模型拿到的是目录里的一行摘要，据用途调
+    ToolSearch 发现后，才在本会话加载完整 schema。延迟的原因与
+    root 无关，绑定的规矩与即时工具相同（root_ 被闭包吃掉）。
+    """
+
+    def tree_dir_tool(root: str = ".", depth: int = 2,
+                      include_hidden: bool = False) -> str:
+        # 内层的 root 是渲染起点（模型可见）；沙箱根在 root_。
+        return tree_dir(root, depth, include_hidden, sandbox_root=root_)
+    tree_dir_tool.__doc__ = tree_dir.__doc__
+
+    def memory_write(content: str, kind: str = "outcome",
+                     importance: int = 3) -> str:
+        # 记忆跟着工作区走：上传目录的会话，日志写进上传目录的
+        # .workbuddy/——会话产物（含记忆）整目录带走，不留在本项目。
+        return write_memory_fact(content, kind, importance, root=root_)
+
+    return [
+        Tool(
+            name="tree_dir",
+            description="渲染一棵目录树，看清项目结构（低频、参数多）",
+            handler=tree_dir_tool,
+            defer=True,
+        ),
+        Tool(
+            name="memory_write",
+            description="往项目工作区记忆追加一条事实（决策/约定/坑/结果）。"
+            "只写原始日志，是否晋升长期记忆由 30 天蒸馏策略决定——"
+            "不要记寒暄、猜测、密钥或原始工具输出。",
+            handler=memory_write,
+            defer=True,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string",
+                                "description": "一句话的项目事实，如'存储层确定用 SQLite WAL 模式'"},
+                    "kind": {"type": "string",
+                             "enum": ["decision", "convention", "pitfall", "outcome"],
+                             "description": "事实类型：决策/约定/坑/结果"},
+                    "importance": {"type": "integer",
+                                   "description": "重要度 1-5，默认 3；>=4 才可能提前晋升"},
+                },
+                "required": ["content"],
+            },
+        ),
+    ]
+
+
+# 默认工作区：项目根。所有老入口（chat / shell / electron）走的都是
+# 它——"没有上传目录"和"上传了目录"只该差在 root 上，别的都不变。
+DEFAULT_WORKSPACE = Workspace(workspace_id="default", root=ALLOWED_ROOT)
+
+# 兼容出口：既有测试与 build_system_prompt 直接 import 这两个名字。它们
+# 是"默认工作区的构建产物"——名字和描述静态，handler 绑定项目根，
+# 与改造前的行为一致（见 tests/test_std_tools.py 对 DEFERRED_TOOLS 的
+# 直接引用，删掉这个名字会炸一片）。
+ALL_TOOLS: list[Tool] = build_instant_tools(ALLOWED_ROOT)
+DEFERRED_TOOLS: list[Tool] = build_deferred_tools(ALLOWED_ROOT)
 
 
 def build_history_seed(root=None) -> list[dict]:
     """sidecar 会话的起步历史：工具目录 system + 工作区记忆有界视图。
 
-    TODO 8b（你来填）：
-      seed = with_system([])
-      memory = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
-      context = memory.get_context_for_agent()
-      if context and context != "(no workspace memory yet)":
-          seed.append({"role": "system", "content": context})
-      return seed
-    记忆放第二条 system（FakeModel 只读第一条的老怪癖不受影响）；
-    每会话开局读一次（不是每 turn——有界视图的教学取舍，边界写进
-    NEXT_SESSION）。空记忆不追加消息：seed 与 s06.5 完全一致。
+    两个刻意的取舍：
+
+    - **记忆放第二条 system**：第一条是工具目录（`with_system` 的产物），
+      保持它在最前面，FakeModel"只读第一条消息"的老怪癖就不受影响；
+    - **每会话开局读一次**，不是每 turn：记忆在会话中途变化不会被察觉，
+      换来的是一个固定的、可预期的起步成本（有界视图的教学取舍）。
+
+    空记忆**不追加消息**：seed 与 s06.5 完全一致——"没记忆"和"有记忆"
+    的区别只该是多出一条 system，不该改变别的。这也是为什么判空要用
+    共享常量而不是就地写字符串字面量。
     """
-    raise NotImplementedError("TODO 8b: build_history_seed")
+
+    seed = with_system([])
+    memory = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
+    context = memory.get_context_for_agent()
+    if context and context != NO_MEMORY_PLACEHOLDER:
+        seed.append({"role": "system", "content": context})
+    return seed
 
 # 免审批白名单（练习 s04）：只读 / 沙箱内的工具显式放行。fs_write
 # 刻意不在名单里——它由 path.write_ask 规则拦成 ASK，执行前必须人点头。
@@ -163,7 +293,7 @@ def build_history_seed(root=None) -> list[dict]:
 # 那一层（已知边界：tree_dir 只读 + 沙箱内，风险可接受）。
 SAFE_TOOLS: frozenset[str] = frozenset({
     "get_weather", "now", "fs_list", "fs_read",
-    "calc", "fs_find", "ToolSearch", "DeferExecuteTool",
+    "calc", "fs_find", "fs_glob", "ToolSearch", "DeferExecuteTool",
     "memory_write",   # 只追加 .memory/ 原始日志，晋升由蒸馏闸门管（s10）
 })
 
@@ -171,24 +301,37 @@ SAFE_TOOLS: frozenset[str] = frozenset({
 # 只提供通用规则框架。新增写工具只改这里一处（加进 WRITE_TOOLS 并确认
 # 不在 SAFE_TOOLS 里），build_policy 会把集合喂给 build_default_policy。
 READ_TOOLS: frozenset[str] = frozenset({"fs_read", "fs_list"})
-WRITE_TOOLS: frozenset[str] = frozenset({"fs_write"})
+# fs_edit 和 fs_write 一样是改状态的工具，必须走 ASK；刻意不进 SAFE_TOOLS
+# （免审批 = 直接放行，这是唯一会被误解成"方便"的坑）。它比 fs_write 更该
+# 有人看一眼——改的是已存在的文件，写坏了丢的是原有内容。
+WRITE_TOOLS: frozenset[str] = frozenset({"fs_write", "fs_edit"})
+
+
+def build_policy_for(workspace: Workspace) -> PermissionPolicy:
+    """按工作区装配权限策略：决策层跟着会话的沙箱根走。
+
+    scope 用的是 workspace.root——决策层（执行前预判）和执行层
+    （file_tools 的 _resolve_safe）认同**同一个**沙箱根，两层不说
+    两家话。上传目录的会话：越界判定、禁区判定都以上传目录为界，
+    .env/.git 的禁区规则对上传目录原样生效（上传包里若藏了 .env，
+    密钥同样读不走）。
+    """
+
+    return build_default_policy(
+        scope=WorkspaceScope(workspace.root, forbidden_parts=FORBIDDEN_PARTS),
+        safe_tools=sorted(SAFE_TOOLS),
+        read_tools=sorted(READ_TOOLS),
+        write_tools=sorted(WRITE_TOOLS),
+    )
 
 
 def build_policy() -> PermissionPolicy:
     """装配本项目工具箱的权限策略：默认规则 + 沙箱作用域 + 白名单。
 
-    scope 用的就是文件工具的 ALLOWED_ROOT——决策层（执行前预判）和
-    执行层（handler 里的 _resolve_safe）认同一个沙箱根，两层不说两家话。
-    forbidden_parts 同样来自 file_tools 的事实源（.env/.git），决策层
-    在 DENY 阶段就拦下禁区，不再等到执行层才炸（s04 补的错位）。
+    默认工作区（项目根）的兼容包装——老入口无参调用，行为不变。
     """
 
-    return build_default_policy(
-        scope=WorkspaceScope(ALLOWED_ROOT, forbidden_parts=FORBIDDEN_PARTS),
-        safe_tools=sorted(SAFE_TOOLS),
-        read_tools=sorted(READ_TOOLS),
-        write_tools=sorted(WRITE_TOOLS),
-    )
+    return build_policy_for(DEFAULT_WORKSPACE)
 
 
 def build_system_prompt() -> str:
@@ -199,6 +342,9 @@ def build_system_prompt() -> str:
     （那要等 ToolSearch 发现后才按需加载）。目录放 system、由应用层
     注入 history 最前——常驻但便宜；而 ToolSearch 的描述保持干净，
     只管"按名/按词召回"。
+
+    目录读模块级 DEFERRED_TOOLS（默认工作区的产物）：工具的名字和
+    描述是静态的，不随工作区变化——变的只有 handler 绑定的沙箱根。
     """
 
     deferred_directory = "\n".join(
@@ -257,11 +403,21 @@ DEFER_EXECUTE_SCHEMA: dict = {
 }
 
 
-def build_registry() -> ToolRegistry:
-    """注册全部工具（即时 + 延迟 + 两个桥接协作件）。"""
+def build_registry_for(workspace: Workspace) -> ToolRegistry:
+    """按工作区现做一整套注册表：即时 + 延迟 + 桥接，全绑定该 root。
+
+    会话隔离的成立条件都收在这一个函数里：工具闭包吃沙箱根（两个
+    build_*_tools 工厂）、桥接闭包捕获**本** registry 和**本**工作区
+    的延迟工具名单——A 会话的注册表解析不到 B 会话的任何路径。
+    """
+
+    # 工厂参数的 root_ 命名规矩见模块 docstring——内层 fs_find /
+    # tree_dir 的 root（搜索起点）不遮蔽它。
+    instant = build_instant_tools(workspace.root)
+    deferred = build_deferred_tools(workspace.root)
 
     registry = ToolRegistry()
-    for tool in ALL_TOOLS + DEFERRED_TOOLS:
+    for tool in instant + deferred:
         registry.register(tool)
 
     # 桥接工具：handler 闭包绑 registry——注册表即边界，循环无需特判。
@@ -270,6 +426,11 @@ def build_registry() -> ToolRegistry:
     # 名字不一致就是 "unexpected keyword argument"，模型猜死循环。
     # 描述刻意保持干净：目录在 build_system_prompt()（system 常驻），
     # ToolSearch 只负责"按名/按词召回"，两者职责分离（对齐 s03）。
+
+    # 延迟工具名单从**本工作区**的构建产物里取（而不是模块级
+    # DEFERRED_TOOLS）：查询词的精确名判断必须与该会话实际注册的
+    # 延迟工具一致，否则 A 会话会"命中"B 会话才有的工具名。
+    deferred_names = {tool.name for tool in deferred}
 
     def search_tools(
             queries: list[str] | None = None, top_k: int | None = None
@@ -286,7 +447,7 @@ def build_registry() -> ToolRegistry:
 
         parts: list[str] = []
         for query in queries or []:
-            if any(tool.name == query for tool in DEFERRED_TOOLS):
+            if query in deferred_names:
                 parts.append(registry.load_by_name([query]))
             else:
                 parts.append(registry.search([query], top_k=top_k or 3))
@@ -312,6 +473,16 @@ def build_registry() -> ToolRegistry:
     return registry
 
 
+def build_registry() -> ToolRegistry:
+    """注册全部工具（即时 + 延迟 + 两个桥接协作件）。
+
+    默认工作区（项目根）的兼容包装：老入口与既有测试都无参调它，
+    行为与改造前一致。
+    """
+
+    return build_registry_for(DEFAULT_WORKSPACE)
+
+
 def build_model() -> RealModel:
     """带工具说明书的真实模型。
 
@@ -330,6 +501,7 @@ def build_model_router() -> ModelRouter:
     真实分级（lite 换便宜厂商 / craft 换旗舰）只改这张映射表，代码
     一行不动。这正是教材"标签路由"的意义：用户改配置换模型。
     """
+
     routes = {tier: (build_model() if os.getenv("DEEPSEEK_API_KEY")
                      else FakeModel()) for tier in ModelTier}
     return ModelRouter(routes=routes)

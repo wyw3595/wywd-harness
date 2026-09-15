@@ -282,6 +282,23 @@ class SidecarServerTests(unittest.TestCase):
         self.assertIn("error", again)         # 不存在：诚实报错
         conn.close()
 
+    def test_forget_live_error_is_actionable_human_text(self) -> None:
+        """删 live 会话的报错要能直接给用户看：带 id + 说出下一步。
+
+        这条错误一路透传到界面弹窗，原文是英文（"close session X before
+        forgetting its record"）——用户看不懂就只会觉得"删不掉"。
+        """
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        sid = self._request(conn, "session/create", {"cwd": "."})["result"]["sessionId"]
+        error = self._request(conn, "session/forget",
+                              {"sessionId": sid})["result"]["error"]
+        self.assertIn(sid, error)        # 说清是哪一个
+        self.assertIn("先关闭", error)   # 说清下一步
+        conn.close()
+
     def test_agent_send_closed_session_returns_error(self) -> None:
         """closed 的会话 send 报错——"记录还在"和"运行时活着"是两回事。"""
 
@@ -444,6 +461,226 @@ class SidecarServerTests(unittest.TestCase):
         conn.close()  # EOF → 循环 break → 线程结束
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
+
+    # ── 工作区（s11）：换沙箱的 RPC 契约 ──────────────────────
+
+    def _workspace_builder(self, seen: list) -> Callable[[dict], tuple]:
+        """假 runtime_builder：记下收到的参数，返回一套**可辨认**的新
+        registry/policy（好断言"真换了"）。"""
+
+        def builder(params: dict):
+            seen.append(params)
+            registry = ToolRegistry()
+            registry.register(Tool(
+                name="probe", description="探针", handler=lambda: "probe-ok"))
+            return (registry, build_default_policy(),
+                    {"kind": params.get("kind"), "id": "ws_9",
+                     "root": params.get("path")})
+
+        return builder
+
+    def _workspace_server(self, seen: list) -> SidecarServer:
+        """带假 runtime_builder 的 server。"""
+
+        return SidecarServer(model=None, registry=ToolRegistry(),
+                             policy=build_default_policy(),
+                             runtime_builder=self._workspace_builder(seen))
+
+    def test_workspace_set_swaps_registry_policy_runner(self) -> None:
+        """三层连带更新：registry 换了、policy 换了、runner 也重建了。
+
+        漏 registry = 模型还在旧沙箱里干活；漏 policy = 决策层与执行层
+        各认一个根；漏 runner = 前两层改了但跑起来还是老边界（最隐蔽）。
+        """
+
+        seen: list = []
+        server = self._workspace_server(seen)
+        conn, _ = self._spawn(server)
+        old_runner = server._runner
+
+        resp = self._request(conn, "workspace/set",
+                             {"kind": "dir", "path": "D:/proj"})
+
+        self.assertEqual(resp["result"]["status"], "ok")
+        self.assertEqual(resp["result"]["workspace"]["id"], "ws_9")
+        self.assertEqual(seen, [{"kind": "dir", "path": "D:/proj"}])
+        self.assertIn("probe", server._registry.names())      # 注册表换新
+        self.assertIsNot(server._runner, old_runner)          # runner 重建
+        self.assertIs(server._runner._registry, server._registry)
+        self.assertIs(server._runner._policy, server._policy)
+        conn.close()
+
+    def test_workspace_get_reports_default_then_switched(self) -> None:
+        seen: list = []
+        server = self._workspace_server(seen)
+        conn, _ = self._spawn(server)
+
+        default = self._request(conn, "workspace/get")["result"]["workspace"]
+        self.assertEqual(default["kind"], "default")
+
+        self._request(conn, "workspace/set", {"kind": "zip", "path": "p.zip"})
+        after = self._request(conn, "workspace/get")["result"]["workspace"]
+        self.assertEqual(after["kind"], "zip")
+        self.assertEqual(after["root"], "p.zip")
+        conn.close()
+
+    def test_workspace_set_translates_builder_error(self) -> None:
+        """装配层的 ValueError 翻成人话进 {"error"}——RPC 唯一错误通道。"""
+
+        def builder(params: dict):
+            raise ValueError("压缩包已损坏或不是 zip：p.zip")
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy(),
+                               runtime_builder=builder)
+        conn, _ = self._spawn(server)
+        result = self._request(conn, "workspace/set",
+                               {"kind": "zip", "path": "p.zip"})["result"]
+        self.assertIn("error", result)
+        self.assertIn("压缩包", result["error"])
+        # 失败不动现状：还是原来那套 registry（fail-closed 的老规矩）
+        self.assertEqual(server._registry.names(), [])
+        conn.close()
+
+    def test_workspace_set_without_builder_says_so(self) -> None:
+        """没注入工厂的 sidecar 如实回绝——不假装成功，也不炸。"""
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        result = self._request(conn, "workspace/set",
+                               {"kind": "dir", "path": "D:/proj"})["result"]
+        self.assertIn("没接工作区能力", result["error"])
+        conn.close()
+
+    def test_status_carries_workspace(self) -> None:
+        seen: list = []
+        server = self._workspace_server(seen)
+        conn, _ = self._spawn(server)
+        self._request(conn, "workspace/set", {"kind": "dir", "path": "D:/p"})
+        status = self._request(conn, "sidecar/status")["result"]
+        self.assertEqual(status["workspace"]["root"], "D:/p")
+        conn.close()
+
+    def test_workspace_set_default_restores_startup_runtime(self) -> None:
+        """复位：回启动态，且**不经过工厂**（工厂只会解析工作区规格）。
+
+        为什么强调不经过工厂：复位不需要坐标。让工厂去解析一个"默认路径"
+        等于把"默认是什么"外包给装配层，而它本来就只是把启动态交出来的人。
+        """
+
+        seen: list = []
+        server = self._workspace_server(seen)
+        initial_registry = server._registry
+        initial_policy = server._policy
+        conn, _ = self._spawn(server)
+        old_runner = server._runner
+
+        self._request(conn, "workspace/set", {"kind": "dir", "path": "D:/p"})
+        self.assertIn("probe", server._registry.names())
+
+        result = self._request(conn, "workspace/set", {"kind": "default"})["result"]
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["workspace"]["kind"], "default")
+        self.assertEqual(len(seen), 1)                       # 工厂没被再叫一次
+        self.assertIs(server._registry, initial_registry)    # registry 回原样
+        self.assertIs(server._policy, initial_policy)
+        self.assertIsNot(server._runner, old_runner)         # runner 重建（换了回来）
+        self.assertIs(server._runner._registry, initial_registry)
+        conn.close()
+
+    def test_workspace_set_default_works_without_builder(self) -> None:
+        """没工厂也能复位——"回启动态"从来不需要工作区能力。"""
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        conn, _ = self._spawn(server)
+        result = self._request(conn, "workspace/set", {"kind": "default"})["result"]
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["workspace"], {"kind": "default"})
+        conn.close()
+
+    def test_initial_workspace_info_is_reported_and_restored(self) -> None:
+        """装配层报的启动态（含 root）如实对外，且复位后回到它。
+
+        root 是给 UI 看的：sidecar 手上只有 registry，认不出路径，
+        不问装配层就没法回答"现在在哪个目录里干活"。
+        """
+
+        seen: list = []
+        server = SidecarServer(
+            model=None, registry=ToolRegistry(), policy=build_default_policy(),
+            runtime_builder=self._workspace_builder(seen),
+            initial_workspace={"kind": "default", "root": "D:/proj-root"})
+        conn, _ = self._spawn(server)
+
+        default = self._request(conn, "workspace/get")["result"]["workspace"]
+        self.assertEqual(default["root"], "D:/proj-root")
+
+        self._request(conn, "workspace/set", {"kind": "dir", "path": "D:/p"})
+        back = self._request(conn, "workspace/set",
+                             {"kind": "default"})["result"]["workspace"]
+        self.assertEqual(back["root"], "D:/proj-root")
+        conn.close()
+
+
+    # ── 空闲回收（s12）：后台线程与状态自述 ──────────────────
+
+    def test_idle_timeout_defaults_to_off(self) -> None:
+        """默认不回收：不该有线程偷偷跑，status 里也要如实说 0。
+
+        "默认关"是刻意的：回收会把"随时发消息都能用"变成"可能要先复活一次"，
+        那是手感变化，得由调用方明确打开。
+        """
+
+        server = SidecarServer(model=None, registry=ToolRegistry(),
+                               policy=build_default_policy())
+        self.assertEqual(server._idle_timeout, 0.0)
+        self.assertIsNone(server._reaper)          # 连线程都不该有
+        conn, _ = self._spawn(server)
+        status = self._request(conn, "sidecar/status")["result"]
+        self.assertEqual(status["idleTimeout"], 0.0)
+        conn.close()
+
+    def test_reaper_releases_idle_runtime_but_keeps_record(self) -> None:
+        """开着回收时：闲置超阈值的运行时被释放，记录还在，resume 能回来。"""
+
+        server = SidecarServer(
+            model=None, registry=ToolRegistry(), policy=build_default_policy(),
+            store=JsonlSessionStore(root=tempfile.mkdtemp()),
+            idle_timeout=0.02, sweep_interval=0.02)
+        self.assertIsNotNone(server._reaper)
+        conn, _ = self._spawn(server)
+        try:
+            sid = self._request(conn, "session/create",
+                                {"cwd": "."})["result"]["sessionId"]
+            # 等回收线程动手：轮询它给出的结果，不睡固定时长猜。
+            # 判据要**等到终态**——close() 是 closing → closed 两步落盘，
+            # 只等 live 变 false 会在中间态上抓个正着（这里踩过一次）。
+            row = {}
+            for _ in range(150):
+                listed = self._request(conn, "session/list")["result"]["sessions"]
+                row = next(s for s in listed if s["id"] == sid)
+                if not row["live"] and row["status"] == "closed":
+                    break
+                time.sleep(0.02)
+
+            self.assertFalse(row["live"])              # 运行时被释放
+            self.assertEqual(row["status"], "closed")  # 记录还在，只是关着
+
+            # 点一下就回来（前端对 closed 会话干的就是这件事）。
+            # 先停掉回收线程再 resume：阈值只有 0.02 秒，不停的话新运行时立刻
+            # 又被收走，断言就变成跟回收赛跑——那不是这条测试要验的东西。
+            server.stop_reaper()
+            resumed = self._request(conn, "session/resume",
+                                    {"sessionId": sid})["result"]
+            self.assertEqual(resumed["generation"], 2)  # 换代重建，不是复活旧进程
+            again = self._request(conn, "session/list")["result"]["sessions"]
+            self.assertTrue(next(s for s in again if s["id"] == sid)["live"])
+        finally:
+            conn.close()
+            server.stop_reaper()           # 幂等；别留线程给下一条测试
+            self.assertFalse(server._reaper.is_alive())
 
 
 class MainProcessClientTests(unittest.TestCase):

@@ -10,7 +10,14 @@
   终端和网页共用同一套）。附带的红利：/clear 免费获得（shell.clear()）。
 """
 
+from pathlib import Path
+
 from scripts.shell import SidecarShell
+
+# 导入顺序有讲究：scripts.shell 在模块顶层把项目根插进了 sys.path，
+# 所以 src.harness.* 必须排在它**后面**才 import 得到（同 shell.py 里那段
+# 引导的注释）。
+from src.harness.workspace_memory import WorkspaceMemory
 
 
 def show_event(data: dict) -> None:
@@ -73,17 +80,25 @@ def main() -> None:
                     print()
                 continue
 
-            if query == "/memory":
-                # s10 TODO 10（你来填）：工作区记忆（本地直读，不走 RPC——
-                # 记忆就是文件，任何进程都能读/蒸馏；教学点写进注释）。
-                #   memory = WorkspaceMemory(Path(__file__).resolve().parents[1])
-                #   query == "/memory distill"：跑 report = memory.distill()，
-                #     打印 f"扫描 {report.scanned} / 晋升 {report.created} /
-                #     合并 {report.updated} / 拦下 {report.skipped}"
-                #   否则：md = memory.read_memory_md()，空则提示
-                #     "（暂无长期记忆；agent 可用 memory_write 记事实，
-                #      /memory distill 跑蒸馏）"，非空则打印。
-                print("  （TODO 10 待填：WorkspaceMemory 本地读 + distill）\n")
+            if query.startswith("/memory"):
+                # s10：工作区记忆**本地直读**，不走 RPC。记忆就是 <项目根>/
+                # .memory/ 下的文件——任何进程都能读它、都能蒸馏它，不必
+                # 求 sidecar 帮忙。这本身就是本课的教学点：**记忆的所有权
+                # 在文件系统，不在某个活着的进程**（所以 sidecar 崩了、
+                # 会话换了一代，记忆都还在）。
+                memory = WorkspaceMemory(Path(__file__).resolve().parents[1])
+                if query == "/memory distill":
+                    report = memory.distill()
+                    print(f"  扫描 {report.scanned} / 晋升 {report.created} / "
+                          f"合并 {report.updated} / 拦下 {report.skipped}\n")
+                else:
+                    rendered = memory.read_memory_md()
+                    if rendered.strip():
+                        print(rendered)
+                    else:
+                        print("  （暂无长期记忆。agent 可以用 memory_write 记事实；"
+                              "攒够年龄线后跑 /memory distill 晋升）")
+                    print()
                 continue
 
             if query == "/sessions":

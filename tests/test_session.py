@@ -6,6 +6,7 @@ threading.Thread + Event 精确编排 close 竞态（不靠 sleep 碰运气）�
 
 import json
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -424,6 +425,99 @@ class SessionManagerTests(unittest.TestCase):
             manager.create_session(str(Path(TESTS_CWD) / "no_such_dir_xyz"))
         with self.assertRaises(ValueError):
             manager.create_session(TESTS_CWD, mode="party")
+
+
+class IdleReapTests(unittest.TestCase):
+    """s12 空闲回收：把闲置的运行时 close 掉（记录保留），只碰 IDLE。
+
+    时间不靠 sleep：直接把 last_used_at 往过去推，或者给 reap_idle 注入 now。
+    """
+
+    def test_only_stale_idle_runtimes_are_reaped(self) -> None:
+        manager, _, _ = make_manager()
+        stale = manager.create_session(TESTS_CWD)
+        fresh = manager.create_session(TESTS_CWD)
+        manager.get_session(stale).last_used_at -= 3600   # 一小时没动
+
+        self.assertEqual(manager.reap_idle(600), [stale])       # 阈值 10 分钟
+        self.assertIsNone(manager.get_session(stale))           # 运行时没了
+        self.assertIsNotNone(manager.get_session(fresh))        # 刚用过的不动
+
+    def test_records_and_history_survive_the_reap(self) -> None:
+        """回收 = 释放运行时，不是删会话：记录、历史全在，还能 resume。"""
+
+        manager, _, _ = make_manager()
+        sid = manager.create_session(TESTS_CWD)
+        manager.get_session(sid).run_turn("你好")
+        manager.get_session(sid).last_used_at -= 3600
+        manager.reap_idle(600)
+
+        record = manager.load_record(sid)
+        self.assertEqual(record.status, SessionState.CLOSED)
+        self.assertGreaterEqual(len(record.messages), 2)     # 历史没丢
+
+        manager.resume_session(sid)                          # 点一下就回来
+        self.assertEqual(manager.load_record(sid).runtime_generation, 2)
+
+    def test_running_is_never_reaped(self) -> None:
+        """正在跑 turn 的绝不回收——回收是省资源，不是打断用户。"""
+
+        gate = threading.Event()
+
+        def blocking(message: str, history: list[dict]):
+            gate.wait(5)          # 把这轮卡住，好让状态停在 RUNNING
+            return "好", history + [{"role": "user", "content": message}]
+
+        manager, _, _ = make_manager(runner=blocking)
+        sid = manager.create_session(TESTS_CWD)
+        runtime = manager.get_session(sid)
+        thread = threading.Thread(target=runtime.run_turn, args=("hi",))
+        thread.start()
+        try:
+            for _ in range(200):        # 等它真进 RUNNING（状态就是判据）
+                if runtime.status == SessionState.RUNNING:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(runtime.status, SessionState.RUNNING)
+            runtime.last_used_at -= 3600                 # 账面再旧
+            self.assertEqual(manager.reap_idle(600), [])  # 也不动它
+            self.assertIsNotNone(manager.get_session(sid))
+        finally:
+            gate.set()
+            thread.join(5)
+
+    def test_error_state_is_left_to_the_user(self) -> None:
+        """ERROR 是有效终态：原因在 last_error 里，等用户决定 resume 还是 forget。"""
+
+        runner = SwitchableRunner()
+        runner.fail = True
+        manager, _, _ = make_manager(runner=runner)
+        sid = manager.create_session(TESTS_CWD)
+        with self.assertRaises(RuntimeError):
+            manager.get_session(sid).run_turn("会炸")
+
+        runtime = manager.get_session(sid)
+        self.assertEqual(runtime.status, SessionState.ERROR)
+        runtime.last_used_at -= 3600
+        self.assertEqual(manager.reap_idle(600), [])
+        self.assertEqual(manager.get_session(sid).status, SessionState.ERROR)
+
+    def test_turn_refreshes_the_idle_clock(self) -> None:
+        """发一轮算"用过"。不刷新的话，刚聊完就可能被下一轮扫描收走。"""
+
+        manager, _, _ = make_manager()
+        sid = manager.create_session(TESTS_CWD)
+        runtime = manager.get_session(sid)
+        runtime.last_used_at -= 3600
+        runtime.run_turn("你好")
+
+        self.assertLess(runtime.idle_seconds, 5)
+        self.assertEqual(manager.reap_idle(600), [])
+
+    def test_nothing_stale_is_a_noop(self) -> None:
+        manager, _, _ = make_manager()
+        manager.create_session(TESTS_CWD)
+        self.assertEqual(manager.reap_idle(3600), [])
 
 
 if __name__ == "__main__":

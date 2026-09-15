@@ -512,9 +512,11 @@ iterdir、stat）。
 .\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v
 $env:DEEPSEEK_API_KEY = "sk-..."   # 冒烟前设置
 .\.venv\Scripts\python.exe -X utf8 -m scripts.smoke_deepseek
+.\.venv\Scripts\python.exe -X utf8 scripts/web_app.py   # 自定义网页 UI → http://127.0.0.1:8765
 ```
 
-当前项目使用 Python 3.13（uv 管理的 .venv，requests + chainlit）。
+当前项目使用 Python 3.13（uv 管理的 .venv，requests；chainlit 已在 s07-c
+退役，网页端换成自研 web\_app）。
 
 ## 已完成：s04\_permission\_hooks 分级信任 + 审批闸门（2026-09-04，由助手写完）
 
@@ -924,9 +926,25 @@ AND 类型 ∈ {decision/convention/pitfall} AND（重要度 ≥4 OR 重复 ≥2
   （大小写+空格）；双文件原子落盘无 .tmp 残骸；有界注入截断；重启
   恢复；write_memory_fact 落日志；seed 双形态；工具延迟+免审批注册。
 
-当前测试状态：275 条中 15 红（全钉 TODO），260 绿。
+当前测试状态：**301 条中 15 红（全钉 TODO），286 绿**。基线会随功能增长，
+别再按 275 对——s07-c 用 test\_web\_app 换掉了旧的侧边栏测试，SSE 又补了
+一批，一律以实测为准（上面这条 301 是 2026-09-10 实测）。
 
-验收标准：275 全绿 + 冒烟——无 key 起终端问"记住我们用 uv 管环境"
+15 条红与 TODO 的对应（按依赖顺序填：1 → 2 → 3 → 4 → 5 → 6 → 7 → 8a/8b）：
+
+| 分组 | 条数 | 对应 TODO |
+| --- | --- | --- |
+| ScopeTests | 2 | TODO 1（\_\_init\_\_ + workspace\_id 路径指纹） |
+| AppendTests | 3 | TODO 2（append\_daily\_log）、TODO 3（\_read\_log / read\_all\_facts） |
+| DistillTests | 6 | TODO 6（distill 三闸门），依赖 TODO 4/5 |
+| ContextTests | 2 | TODO 7（get\_context\_for\_agent 有界注入） |
+| ToolboxIntegrationTests | 2 | TODO 8a（write\_memory\_fact）、8b（build\_history\_seed） |
+
+**注意 TODO 9（shell.py 的 history\_seed 一行改动）和 TODO 10
+（sidecar\_shell.py 的 /memory 命令）没有任何测试钉住**——前 8 个填完 15 红
+会全绿，但 9/10 得靠冒烟验收，别以为红转绿就完事了。
+
+验收标准：**301 全绿** + 冒烟——无 key 起终端问"记住我们用 uv 管环境"
 （真模型走 memory_write 工具）→ /memory 看到原始事实 → 手工跑一次
 带旧时间戳的 distill（或 API 直写旧事实 + /memory distill）→ MEMORY.md
 出现该决策 → 重开会话起步历史里有记忆段。顺序：s10 填完 → s11/s12
@@ -966,6 +984,10 @@ AND 类型 ∈ {decision/convention/pitfall} AND（重要度 ≥4 OR 重复 ≥2
 
 s10 workspace memory（工作区记忆：日志追加、主题蒸馏、30 天保留）。
 s11 user memory / s12 cloud memory 排其后。
+
+> 补充（2026-09-10）：s07-c 自定义前端、前端缺陷修复与界面重做、事件直播
+> 改 SSE 都已完成，专节在**本文档末尾**（不在这个位置）。s10 是当前唯一
+> 的进行中项，骨架已建、15 条红测试钉着，等填。
 
 ## 已完成：网页侧边栏修复（2026-09-08，由助手修）
 
@@ -1053,387 +1075,679 @@ s11 user memory / s12 cloud memory 排其后。
   消息，终端展示不了这个语义）；/status 的 sessions 口径 = 记录总数
   （closed 未 forget 也计入）。
 
-## 已完成：前端换 Vue 3（2026-09-15，由助手写完并真机验证）
+## 已完成：s07-c 自定义前端 + 事件直播改 SSE（2026-09-10）
 
-- 用户定"用 vue3"。路线：**免构建**（ESM 浏览器版 + import map），
-  不引 Vite/npm——`public/vendor/vue.esm-browser.prod.js`（3.5.13，
-  162KB，下载后本地化），保住 web_app 的"离线可用"边界。
+- 提交：cb36c8b（C 方案本体，由我填）、b538b2f（前端修复 + 界面重做 +
+  SSE）、b9e37ba（清 chainlit 遗留 + .gitignore）。
+- 本节记两件事：s07-c 的架构决定，以及之后用户实测反馈"前端有好多 bug +
+  页面不好看"引出的修复与 SSE 改造。**后端 6 个端点没动过架构，改的都是
+  前端和事件传输。**
 
-- `public/src/` 三层：`api.js`（五个端点收成具名函数，无状态、与 Vue
-  无关，换框架可原样搬）→ `store.js`（模块单例 reactive，免 Pinia；
-  状态 + 动作 + 两条轮询编舞）→ `components.js`（SessionList / ChatArea /
-  ApprovalCard / Toast，模板字符串）→ `main.js`（根组件 + 挂载）。
-  旧 `public/app.js`（415 行 vanilla）已删，git 有底（cb36c8b）。
+### C 方案：自定义前端彻底解耦 chainlit（cb36c8b）
 
-- 搬家的三个"顺着改对了"：vanilla 的 `findRow()` 靠 querySelector
-  反查 live（拿视图当数据源）→ 直接读 `state.sessions`；散落各处的
-  `setInputEnabled` → 一个 `canSend` computed；手写 `esc()` → `{{ }}`
-  默认转义（**永远别写 v-html**，练习 13 的铁律换了个执行者）。
+- 为什么换掉：chainlit 的聊天区是它自己的 WS + React 状态，"会话切换 =
+  服务端往聊天区推历史"只能靠 contextvars 快照跨线程搬运，效果不可靠
+  （重放 fire-and-forget、失败全静默）。C 方案换标准做法——**会话是记录，
+  聊天区是视图，切换 = 换 id + 读历史 + 自己渲染**。
+- 新增 `scripts/web_app.py`（纯 stdlib，127.0.0.1:8765），三大机制：
+  1. **历史 = 纯读**：GET /api/sessions/\<sid\>/messages 直接
+     JsonlSessionStore.load(sid).messages（replay fold），不经过 sidecar
+     RPC、不碰运行中的 turn、closed 会话秒开。零静默失败：成功 = 前端
+     自己拿到数组并渲染。
+  2. **直播/审批 = 事件环**（线程安全 deque + seq）+ threading.Event：
+     on_event 与 user_prompt 都往同一条流里塞；审批用线程 Event 而不是
+     asyncio Future——"loop 已死 / 上下文过期"这两个失败模式从根上不存在。
+  3. **发消息带显式 sid**（`shell.send_to(sid, msg)`）：单壳单 sidecar 下
+     多 tab 各看各的，不能依赖壳的"当前会话指针"。
+- 关键架构决定：**单壳单 sidecar**。多 tab 只是同一个 backend 的多个浏览器
+  视图——"每 tab 一个 sidecar 共享 .sessions/"时代的竞态（启动清账误伤、
+  跨进程 resume 双运行时、计数器竞态）被架构性消灭，不是修好。
+- 退役：chainlit_app / sidecar_panel / sessions_panel.js / .chainlit /
+  test_sidecar_panel——桥、contextvars、reap 补丁家族一并清除。
 
-- **顺手修的三个 s07-c 遗留真 bug（与 Vue 无关，浏览器冒烟挖出来的）**：
-  1. `shell.py` 的 close/resume/forget 直接 `["result"]` 硬取 → sidecar
-     回 JSON-RPC error 时 KeyError 穿透到 HTTP handler，连接被空响应关掉
-     （前端只看到 "Failed to fetch"）。send_to/messages 早有这个分支，
-     四个会话操作漏了 → 抽成 `SidecarShell._result()` 一处，+2 测试。
-  2. `web_app.action("close")` 把 `result["closed"]`（**布尔**）当 sid 拼
-     文案 → toast 显示"已关闭 False（记录保留）"。改成用请求的 sid。
-  3. `tests/test_web_app.py` 的 FakeShell 返回 `closed=sid`，与真 sidecar
-     的布尔契约相反（test_sidecar 断言的就是布尔）——**假实现替真实现
-     圆谎，bug 才活到了浏览器上**。假实现已对齐真契约，并补了文案断言。
-     （教训接练习 17：假的不像真的，测试就是自我安慰。）
+### 前端修复 + 界面重做（b538b2f）
 
-- 新增 `scripts/smoke_frontend.cjs`：真 Chromium headless + CDP，**零安装**
-  （系统自带 Chrome/Edge + Node 22 全局 WebSocket，不用下 500MB 的
-  Playwright）。11 条断言：挂载 / 清单行数 == `/api/sessions` 条数 /
-  点会话出历史 / 发送链路（新建→v-model→POST→重拉）/ 关会话锁输入 /
-  布局不横向溢出 / console 干净；`--shot x.png` 可截图。
-  坑：evaluate 必须查 `exceptionDetails`，否则页内 Promise 抛异常时
-  `result.value` 是 `{}`，断言**假通过**。
+用户实测反馈后整体重写 `public/index.html` + `app.js`（仍零依赖 vanilla +
+内联 SVG，不引任何 CDN）。修掉的 7 处缺陷病根相同——**从 DOM 反推状态**
+和 **整体重建 innerHTML**：
 
-- 验收：Python 292 条（+2，0 failure，15 条 s10 TODO error 未变）；
-  前端冒烟 11/11，console 零 error/warn；端口 8765 已释放。
+1. 发送后输入框不清空——`send()` 里根本没有 `input.value = ""`。现在发出
+   即清空，请求失败才把原文回填。
+2. 已关闭会话照样能输入发送——`openSession()` 无条件 `setInputEnabled(true)`。
+   现在按 live 锁定输入区，并给"复活会话"入口。
+3. 状态从 DOM 徽章反推——`findRow()` 靠 `!querySelector('.badge.off')` 猜
+   live，而"当前"徽章又覆盖了 live/closed，于是"当前且已关闭"被判成 live。
+   现在 `state.sessions` 是唯一事实来源，live 只从数据读。
+4. 5s 轮询整体重建列表——冲掉两段式删除的"确认?"、滚动位置与焦点。现在按
+   sid 做 **keyed 增量更新**，只改文本与 class，不重建节点。
+5. Esc 隐藏审批卡——后端干等满 300 秒且卡片永不重显（`shownApprovals` 已
+   标记）。现在 Esc 不再响应，卡片带倒计时，**切换会话时自动拒绝未决审批**。
+6. `esc()` 不转义引号——却被拼进 `data-sid="..."` / `title="..."`，标题含
+   引号就会撑破属性。现在动态值一律走 `textContent`，HTML 只由内联模板产生。
+7. 直播区只认 `tool_start`/`tool_end`，且 turn 结束即清空——现在四类事件都画
+   （含 `round_start` / `model_reply`），并保留到下一轮。
 
-- 遗留（按建议顺序）：① `/api/events` 轮询 → SSE（约 20 行，独立可测，
-  换任何前端都受益）；② 审批卡的浏览器实测（需要真模型走 fs_write）；
-  ③ 真要 Vite 时的三件事（dev server 代理 /api 到 8765、产物挂进
-  PUBLIC_DIR、会话切换改成路由参数）；④ `pyproject.toml` 里的 chainlit
-  依赖已无人用，可清。
+另外两个自己踩出来的坑：
 
-## 已完成：前端路线图 + Step 1/2（2026-09-15，用户授权"前端归你，一步步做完"）
+- `.lock` / `.pill` 这类**显式设了 `display`** 的组件会盖掉浏览器默认的
+  `[hidden]{display:none}`，带 `hidden` 的元素照样显示（输入区上方曾多出
+  一条空白圆角条）。补 `[hidden]{display:none !important}`。
+- 切会话后侧栏高亮要等下一次 5s 轮询才画上（`openSession` 只设了
+  `state.sid` 没刷选中态）。补 `paintSelection()` 立即生效。**这个是从
+  验证探针里抓出来的，不是读代码看出来的。**
 
-- 用户定：前端由助手负责，按"完成"清单一步步推进。七步路线图（顺序即
-  依赖）——地基：①SSE 事件推送 ②turn 结局可见；可观测：③成本/token
-  ④运维抽屉（status+logs）⑤记忆面板（s10）；体验：⑥Markdown 与代码块
-  ⑦响应式与可访问性。本次做完 ①②。
+界面侧：真实空态（不再有游离的 "—"）、长系统提示与工具结果折进
+`<details>`（之前打开会话会被一大段系统提示刷屏）、状态点取代文字徽章、
+气泡/胶囊/审批弹窗/Toast 重画、emoji 图标换内联 SVG。
 
-### Step 1 · SSE 事件推送（替掉 500ms 轮询）
+### 事件直播：轮询 → SSE
 
-- `EventRing` 的 `Lock` → `Condition(同一把锁)`。**这是这一步的核心设计
-  点**：`读游标 + 判空 + wait` 必须是一个原子动作；用独立 Event 做通知会
-  漏唤醒（判完空、还没 wait，事件就到了，然后白睡一整个心跳周期）。
-  新增 `wait_for(after, timeout)` / `latest()` / `wake_all()`。
+- `EventRing` 加订阅扇出：每个连接一个**有界** `queue.Queue`（满了丢这一条，
+  慢客户端不会拖累发布方）。关键语义是**订阅者只收订阅之后的事件**——客户端
+  因此不用再同步 seq 指针，天然不会重放上一轮的旧工具卡。
+- 新端点 `GET /api/events/stream`：首帧 `ready` 给基线，静默期每 15 秒发一行
+  `: ping` 心跳探活；断开/收工都是正常出口，`finally` 里 unsubscribe。
+- **事件名放在 JSON 的 `"event"` 键，没用 SSE 的 `event:` 字段**——沿用
+  sidecar 既有契约，前端一个 `onmessage` 就能分发全部类型；用 `event:` 字段
+  就得在前端维护事件名注册表，后端加新事件会静默失联。
+- `protocol_version` 改 HTTP/1.1（SSE 需要）。代价是**所有响应都必须给准
+  Content-Length**，顺手修掉静态 404 分支缺 Content-Length 会在 HTTP/1.1 下
+  把连接挂住的老问题（新增 `_send_empty`）。
+- `GET /api/events` 快照端点保留供 curl 调试，并加了 `subscribers` 计数。
+- 前端删掉 `pollEvents` / `lastSeq` / `pollTimer`，改常驻 `EventSource`
+  （断线靠浏览器内置重连）；**审批事件不按 `posting` 门控**——安全动作任何
+  tab 收到都该弹。
 
-- 新增纯函数 `sse_frame(item)` + 生成器 `WebApp.event_stream(last_id,
-  heartbeat)`。**写成生成器而不是在 handler 里写循环，是为了可测**：喂一个
-  假 ring + 短心跳，就能在单测里断言"第一帧是什么、什么时候退出"，完全不
-  碰 HTTP（HTTP 层于是只剩搬字节）。
+### 验收与边界
 
-- 路由 `GET /api/events/stream`：不写 Content-Length（响应体长度未知，靠
-  连接关闭收尾——HTTP/1.0 语义），每次 write 后立即 flush，续传靠浏览器
-  自带的 `Last-Event-ID` 头（前端一行游标代码都不用写）。
+- 测试：**301 条**（s07-c 的 test_web_app.py 19 条 + SSE 的 11 条），15 红
+  仍是 s10 骨架 TODO，非回归。SSE 部分新增 `EventRingSubscribeTests`（7）+
+  `SseEndpointTests`（4，真起 ThreadingHTTPServer 走裸 socket 验响应头 /
+  ready 帧 / 实时推送 / 不重放旧事件 / 断开回收）。
+- 浏览器侧实证：`/api/events` 的 `subscribers` 走了 **0 → 1（真实 Chrome 的
+  EventSource 连上并保持）→ 0（退出后自动回收）**；CDP 抓到的实际 DOM 里
+  零 EXCEPTION、零 console error，关闭态会话 `inputDisabled=true` +
+  `lockShown=true` + 胶囊"已关闭"。
+- **已知副作用（下次一定撞上）**：依赖虚拟时间的无头工具
+  （`--screenshot` / `--dump-dom`）在这个页面上会**无输出**——SSE 是"永远
+  挂起"的请求，Chrome 的 `pauseIfNetworkFetchesPending` 策略会把虚拟时钟
+  冻死。绕过办法：Chrome 加 `--remote-debugging-port`，用 Node 22 内置的
+  `WebSocket` + `fetch` 直接讲 CDP（抓异常 / 断言 DOM / 截图 / `Browser.close`
+  优雅关闭），脚本在 `.workbuddy/tools/cdp-probe.mjs`。
+- 遗留：`.workbuddy/tmp/pc` 等 Chrome 配置目录需清理（批量删除守卫要求
+  用户确认）；`smoke_tmp_clean.py` 已备份到 `.workbuddy/scratch/` 后从仓库
+  根移走（它是会删 `.sessions/*.jsonl` 的一次性脚本，未跟踪、删了不可恢复）。
 
-- **关键坑**：事件环是常驻的，首次连接不带游标会把环里最多 500 条旧事件
-  整批重放（F5 后满屏旧卡片）。加了 `?after=latest`：首次连接顶到当下，
-  断线重连时 Last-Event-ID 优先。
+## 已完成：fs_find 扫描范围收窄（2026-09-11，由助手写完）
 
-- `WebApp.stopping` 标志 + `wake_all()`：SSE 是长连、每条约占一个线程，
-  停服务时若不叫醒，handler 线程会各自把 15 秒心跳睡完才走。
+工具设计评审（`.workbuddy/research/fs-tools-review.md`）暴露的第一条硬伤：
+`find_text` 的跳过名单只有 `FORBIDDEN_PARTS = {".env", ".git"}`，`os.walk`
+要遍历全树 **15448 个文件 / 225.7 MB**（`.venv` 7157 + `learn-workbuddy`
+8193 = 99%），而且**耗时取决于命中数量**——命中多就早退，命中少/不命中
+就扫到底，反直觉且不可预期。实测最坏 42~54 秒一次工具调用。
 
-- 前端：`EventSource` 替掉 `pollEvents`/`peekEvents`/`state.lastSeq`；
-  新增 `state.streamUp` + 顶栏指示灯（绿=已连，红闪=重连中）。事件处理
-  加 `if (!state.posting) return` 门：多 tab 不串台，也顺手免疫旧事件重放。
+- `src/harness/std_tools.py`：
 
-### Step 2 · turn 结局可见
+  - 新增 **IGNORED_DIRS / IGNORED_SUFFIXES** 两张 frozenset 常量。语义与
+    `FORBIDDEN_PARTS` 严格分开：后者是**安全**（必须拒，任何参数绕不过），
+    前者是**效率**（看了也没用）。名单与项目根 `.gitignore` 同一份意图，
+    但刻意硬编码兜底——`.gitignore` 被改坏也不会退化成全树扫描。
 
-- **真 gap**：`agent/send` 一直返回 `status`（completed/max_steps/failed），
-  前端却只看了 `error` 字段——于是 `status="failed"` 的 turn 在界面上表现
-  为"用户问了一句、什么都没发生"（失败时 transcript 里只有 user 那条，
-  模型那句人话在 output 里，而 output 不落 transcript，重拉历史拿不到）。
+  - 新增两个纯函数（测试不用碰文件系统，练习 16 的 `_is_permanent_error`
+    同款套路）：`_should_skip_file` 后缀判断（`Path.suffix` + `lower()`，
+    防 `PHOTO.PNG` 漏网）；`_is_probably_binary` 前 4KB 探 NUL 字节。
 
-- 新增 `state.notice` + 结局卡（`.msg.notice.lv-warn/.lv-error`）；`send`
-  里 `res.error` 也走同一张卡（toast 一闪而过，容易错过）。
+  - `find_text` 三处改动：`dirnames[:]` 剪枝时并联 `IGNORED_DIRS`；文件级
+    联查后缀；读文件从 `read_text` 改为 `read_bytes` → NUL 探测 → `decode`，
+    二进制根本不进正则（旧写法会让 `errors="replace"` 把 PNG 静默变成
+    一串 U+FFFD 乱码喂给模型）。
 
-- 直播从"只认 tool_start/tool_end"扩到全 5 种事件：`round_start` 画
-  "第 N 轮"、`model_reply` 画"决定调用 / 给出最终回答"、结尾"✅ 本轮完成"、
-  失败"⚠ …"。
+  - **导入修正**：`ALLOWED_ROOT` 从"按值 import"改为"按模块引用"
+    （`file_tools.ALLOWED_ROOT`）——它是参与路径计算的可变配置，按值导入
+    等于复制出第二份永不更新的副本，mock 换沙箱时只对 file_tools 生效、
+    对 std_tools 失效（这类测试会静默测错东西）。`FORBIDDEN_PARTS` 是
+    常量、不参与路径计算，按值导入没问题。
 
-- **直播不再在 turn 结束时被抹掉**（原 `finishPosting` 会清空）：刚跑完的
-  一轮正是最该回看的东西，清掉之后只剩历史里那几条 role=tool 的结果，
-  "第几轮、模型决定了什么"全没了。清空时机改到"下一次发送 / 切换会话"。
+- `scripts/toolbox.py`：`fs_find` 的 description 补上可行动信息——写明
+  自动跳过哪些目录，以及"要搜这些目录就把它作为 root 显式传入"。模型
+  不知道这条就会以为内容不存在。
 
-- 已知边界：`status` 不落 transcript，结局卡 F5 后就没了。要持久化得让
-  session 记录带上它（归后端那一步）。
+- **设计要点**：忽略名单只作用于"递归途中遇到的目录"，**显式指定的 root
+  永远放行**——`find_text("x", root="learn-workbuddy")` 照样能搜教材。
+  这是 ripgrep 的行为（*Files specified explicitly bypass most filters*），
+  而且是 `os.walk(base)` 从 base **内部**开始剪枝这一结构白送的，不用
+  额外写代码。
 
-### 验证
+- 测试：`tests/test_std_tools.py` +10（SkipPredicateTests 6 条纯函数打表：
+  后缀 / 大小写 / 多段后缀 / 无后缀 / NUL 探测 / 只探前 4KB；SearchScopeTests
+  4 条临时沙箱集成：忽略目录被剪枝 / 后缀命中被跳过 / **显式 root 绕过
+  忽略名单** / NUL 兜底）。**311 条测试，15 红仍是 s10 骨架 TODO，非回归。**
 
-- Python **301 条**（+9：EventRingWait 4 / SseFraming 5），0 failure，
-  15 条 s10 TODO error 未变。
+- 实测（同一批关键词，改前 → 改后）：
 
-- 前端冒烟扩到 **17 条**（`scripts/smoke_frontend.cjs`）：新增 SSE 指示灯、
-  直播保留（断言出现"第 1 轮"和"本轮完成"）、"不再有轮询请求"、报错可见性
-  （对已关闭会话发消息 → 结局卡出现且写着后端的人话）。
+  | 关键词 | 改前 | 改后 |
+  | --- | --- | --- |
+  | `_parse_reply` | 44.84 s | **0.042 s** |
+  | `no_such_symbol_xyzzy` | 42.06 s | **0.043 s** |
+  | `subprocess.run` | 10.06 s | 0.055 s |
+  | `import os` | 0.38 s | 0.051 s |
 
-- curl 直观测到 SSE 原始帧：`id: 1` + `data: {"seq":1,"event":
-  "round_start","step":0}`——`data:` 必须是单行，内层换行由 JSON 转义。
+- **副产物：一次正确性修复。** `subprocess.run` 改前返回 9 条命中、改后
+  未命中——那 9 条**全部来自 `learn-workbuddy/`**（第三方教材），不是本项目
+  代码。旧实现把第三方库的命中当成项目代码返回给模型；现在要搜教材得
+  显式 `root="learn-workbuddy"`（实测 25 ms）。
 
-- 两个测试坑：①`performance.getEntriesByType('resource')` **不报未完成的
-  EventSource 请求**，要查"到底有没有在轮询"必须用 CDP 的 `Network` 域抓
-  真实请求（`Network.requestWillBeSent`）；②断言写成"计时 ≥ 0.15s"会被
-  定时器精度判失败（实际 0.14999830），改成区间断言（>0.05 且 <1.0），
-  钉的是"确实睡了、也没有死等"。
+- 遗留（评审报告 P0 的其余几条，本次未动）：`fs_read` 无行号 / 无
+  offset-limit（只能看到文件的 5%）、缺 `fs_edit`（≥2 万字符的文件完全
+  改不动）、`fs_write` 非原子写、错误文案不可行动、`parse_docstring` 丢
+  续行。`tree_dir` 还没接 `IGNORED_DIRS`（同一份名单可复用）。
 
-### 下一步（路线图剩余）
+- 提交：97feac7
 
-③成本/token ④运维抽屉（status+logs）⑤记忆面板（s10）
-⑥Markdown 与代码块 ⑦响应式与可访问性。
-另有 SSE 的价值兑现点：**流式输出**（模型边生成边推——需要 RealModel 走
-stream 模式，跨前后端，是目前最大的体验缺口）。
+## 已完成：fs_read 重做（行号 + offset/limit 分页）（2026-09-11，由助手写完）
 
-## 已完成：前端 Step 3 · 成本/token + Step 6 · Markdown（2026-09-15）
+评审报告 P0 第 2/3 条（读不完自己的源码），顺手带上第 7 条（二进制当文本）
+与 P1 第 8 条（目录报成 PermissionError）。旧实现 `read_file(path,
+max_chars=2000)` 从文件头截断、无行号、无 offset——NEXT_SESSION.md 40115
+字符只能看到 2021 字符（5.0%），**文件的后 95% 在任何情况下都读不到**：
+不是"要翻页"，是根本没有翻页这个动作。
 
-### Step 3 · 每轮 token + 累计成本
+- `src/harness/file_tools.py`：
 
-- 后端只差"每轮 token 出不来"：`turn_runner` 的协议只回
-  `(output, messages)`，装不下 usage。照 s07-b 给 status 建的**协议接缝记账**
-  套路，在闭包里再记一笔 `_last_turn_usage = dict(result.usage)`，
-  `agent/send` 响应加 `usage` 键。离线模型回 `{}`——诚实，不编造 0。
+  - 签名从 `(path, max_chars=2000)` 换成 **`(path, offset=1, limit=200)`**，
+    对齐 Claude Code 的 `Read(file_path, offset, limit)` 与 Anthropic
+    text_editor 的 `view_range`——按**行**分页，不是按字符。
+  - 返回 **cat -n 格式**：右对齐行号（宽度按本页最大行号自适应）+ 制表符
+    + 正文；末尾一行页码小结，三种形态——`（共 N 行，已全部显示）` /
+    `（共 N 行，已显示 a-b 行；继续读用 offset=b+1）` / 空文件占位。
+    **给模型的可行动信息就落在那句 "继续读用 offset=…" 上。**
+  - 三道限额代替原来的单道：`DEFAULT_READ_LINES=200`（行数）、
+    `MAX_LINE_CHARS=2000`（单行——压缩 JSON / minified JS 一行几十万
+    字符，光限行数拦不住）、`MAX_READ_BYTES=1MB`（文件大小）。
+  - `_truncate_line` 纯函数：超长行截断并**注明原长**，而不是默默丢弃
+    （默默丢弃会让模型以为这一行就这么短）。
+  - **目录显式拦下**：旧写法掉进 `read_text` 的 IsADirectoryError，在
+    Windows 上被翻译成 `PermissionError: [Errno 13] Permission denied`
+    ——模型读到"权限不足"会去猜怎么提权，方向完全错了。现在报
+    `src 是目录不是文件——用 fs_list('src') 看它下面有什么`。
+  - **二进制拒绝**（复用第一步的 NUL 探测）：`sse-ui.png` 以前被
+    `errors="replace"` 静默解成一串 U+FFFD 乱码喂给模型，现在抛
+    `看起来是二进制文件（34127 字节）……请换别的办法处理`。
+  - 参数错误一律 `ValueError`（offset<1 / limit<1 / offset>文件末尾），
+    和 fs_find 的坏正则走同一条回灌通道；offset 越界的消息里带合法区间。
 
-- `web_app` 新增 `GET /api/status`（直通 `shell.status()`）。成本表不另开
-  端点：它本来就是 `sidecar/status` 的 `modelCost` 段（s08 的 duck typing），
-  一个真源，终端 /status 和网页看的是同一份。
+- **结构改动**：`_is_probably_binary` 从 `std_tools.py` **迁到
+  `file_tools.py`**——read 和 search 都要用它，而 std_tools 已经 import
+  了 file_tools，放那边会绕成循环导入。它是"文件内容分类"，本来就属于
+  文件工具这一层。对应的 3 条测试同步从 test_std_tools.py 迁到
+  test_file_tools.py。
 
-- 前端：`cost` reactive（rows / usage）+ `costLine` / `costTitle` computed。
-  顶栏右对齐"本问 输入 X / 输出 Y · 累计 $0.000000"，悬停看 per-tier 明细；
-  每轮 token 同时进直播。
+- `scripts/toolbox.py`：`fs_read` 的 description 换成"返回带行号的正文；
+  大文件用 offset/limit 翻页（默认从第 1 行起、最多 200 行）"。
 
-- **坑（离线测试看不见，真实数据一进门就现形）**：`modelCost[].cost` 是
-  后端**已经格式化好的字符串**（`"0.000000"`，终端直接拼 `$` 打印），前端
-  `reduce(sum + row.cost)` 于是变成了字符串拼接，最后 `toFixed` 抛
-  `total.toFixed is not a function`，顶栏那行整个渲染不出来。求和要先
-  `Number(row.cost)`，再按同精度 `toFixed(6)` 格式化回去。
+- 测试：**320 条，15 红仍是 s10 骨架 TODO，非回归。** 新增 ReadFileTests 5
+  （首行带行号+TAB / 小文件标"已全部显示" / offset+limit 翻页与整篇读
+  逐字一致 / offset 越界报合法区间 / 非正参数拒绝）、ReadFileGuardTests 5
+  （目录报对类型 / 二进制拒绝 / 空文件占位 / 超长行截断不拖累邻行 /
+  超大文件指向 fs_find）、BinaryProbeTests 3（迁入）；test_std_tools 里
+  对应的 3 条迁出。
 
-### Step 6 · Markdown 渲染（零 v-html 路线）
+- 验收实测：NEXT_SESSION.md 1246 行——`offset=1&limit=200` 拿第一页、
+  `offset=1200` 拿到末尾并报"已全部显示"，**覆盖率从 5.0% 变成 100%**。
 
-- 设计：**解析成数据树，渲染层用 Vue 的 h() 建 VNode**。全程没有
-  innerHTML / v-html 可写 → 注入面在结构上不存在。练习 13 的铁律"LLM 输出
-  是不可信输入，进 HTML 前必须转义"在这里升级成**物理隔离**——转义是纪律，
-  没有 innerHTML 可写是物理约束。
+- 遗留：`fs_edit` 还没做（所以 ≥2 万字符的文件仍然改不动——覆盖式
+  `fs_write` 撞 `MAX_WRITE_CHARS`）；`fs_write` 仍是非原子写；错误文案
+  只改了 read 这一路，`list_dir` / `write_file` 的还没跟上；
+  `parse_docstring` 丢续行的 bug 仍在（本次新写的 Args 都刻意压在单行，
+  绕开了它）。
 
-- `public/src/markdown.js`：**纯函数、零 import**（所以能进 Node 单测）。
-  支撑——块级：围栏代码（含未闭合也闭合）/ 标题 / 引用 / 有序无序列表
-  （缩进续行递归成嵌套）/ 分隔线 / 段落；行内：代码 / 链接 / 粗 / 斜 /
-  粗斜 / 删除。链接有 scheme 白名单：`javascript:` / `data:` 降级成纯文字
-  （**零 v-html 挡不住 `href` 执行**，这是另一个入口）。已知取舍：不支持
-  惰性续行。
+- 提交：acae02f
 
-- `components.js`：`Markdown` 组件（`render()` 返回 VNode 数组）+ 一张映射表。
-  只有 assistant 走 markdown——用户输入原样显示（别把用户打的字符当语法），
-  工具结果保持原样（缩进敏感）。
+## 已完成：fs_edit 编辑工具 + 换行符修复（2026-09-11，由助手写完）
 
-- 顺手修：`.t-name` 标签后的空格改用 CSS margin。多行模板里的空白符会被
-  Vue 编译器吃掉（condense），靠"模板里那个空格"迟早断。
+评审报告 P0 第 4/5 条（缺 `fs_edit` → 大文件改不动）。执行过程中又发现并
+修掉一个同级别的**新 bug**：换行符被写坏。
 
-- **重大 bug（Node 直接 OOM 崩了）**：`parseInline` 会递归（粗体套斜体），
-  而我起初把行内正则做成了**模块级共享对象**。`g` 标志的 `lastIndex` 挂在
-  RegExp 对象上——内层递归一执行就把外层的游标踩烂，外层拿着被重置的游标
-  从更早的位置重新匹配，同一个标记反复命中，循环永不退出。死循环在
-  `push` token，不只是空转 → 冒烟跑到"行内：代码/粗/斜/删除"这条时
-  **Node 把 4GB 堆吃满崩掉**。前端里触发就是标签页卡死。
-  修法：每次调用 `new RegExp(INLINE_SRC, "g")` 建自己的实例。备用修法
-  （"递归前存下 lastIndex、回来复位"）要求每个递归点都记得，漏一处就复发。
-  教训：**递归函数里不能碰任何带可变状态的共享对象**。
+### A. fs_edit（本步主题）
 
-### 验证
+- `file_tools.edit_file(path, old_text, new_text, replace_all=False)`：
+  **只传改动片段**，代价与文件大小无关。对齐 Claude Code 的 `Edit`、
+  Anthropic 的 `str_replace`、MCP 的 `edit_file`。
+- 三条规矩（Anthropic 在 SWE-bench 工程博客里写过：试过多种编辑方案，
+  字符串替换可靠性最高）：
+  1. **逐字匹配**——匹配不到就报错，并提示最常见的踩坑：把 fs_read 的
+     行号前缀一起复制进来了；
+  2. **默认要求唯一**——出现 N 次就报出 N，让模型自己补上下文重试，
+     或 `replace_all=true`。错误消息的**信息量**决定模型能不能自愈；
+  3. **先读再改**——本层强制不了（工具是无状态函数，拿不到会话历史），
+     靠约定与审批人把关。已知边界，写进 docstring。
+- 返回值带 **片段对照 diff**（`- 旧` / `+ 新`，超 `DIFF_MAX_LINES=20`
+  行截断并注明剩余）。这不只是好看：审批闸门弹 ASK 时人只看得到这份摘要，
+  **没有 diff 的审批就是盲签**——s04 闸门第一次真正有了审批依据。
+- `new_text` 只受 `MAX_WRITE_CHARS` 约束（"一次调用能改多少状态"），
+  **不受文件大小约束**——这正是它存在的理由。
 
-- Python **305 条**（+4：sidecar usage 2 / web_app status+usage 2），
-  0 failure，15 条 s10 TODO error 未变。
+### B. 权限接线（漏一个方向就是安全洞）
 
-- 前端冒烟 **35 项**（15 条 markdown 纯函数自检 + 20 条浏览器）全过，
-  console 零 error/warn。纯函数自检用 `data:` URL 把零 import 的
-  markdown.js 直接 import 进 Node 跑——快两个数量级，而且能把它单独钉死。
+- `toolbox.WRITE_TOOLS` 加进 `fs_edit`；**刻意不进 SAFE_TOOLS**。
+  测试两头都钉住：漏进 WRITE_TOOLS → `default.deny`（fail-closed，表现为
+  "工具坏了"）；误进 SAFE_TOOLS → 免审批直接放行（真洞）。断言
+  `build_policy().decide(fs_edit)` 的 rule_id == `path.write_ask`。
 
-- 浏览器侧新增：markdown 真渲染（模型回复的缩进列表 → 4 个 `<ul><li>`）、
-  用户输入的 `<b>` 原样躺着没变成标签、聊天区无可执行标签/`on*` 属性、
-  `/api/status` 与顶栏那行账一致（没数据就不编）。
+### C. 换行符修复（执行中新发现的 bug，不修则 A 不可用）
 
-- **测试自身的坑（第二次同类）**：从 `chat-head` 的 textContent 剥 sid，
-  成本数字粘进来把 sid 变成 `sess_00090000000`。加了稳定的 `#chat-sid`。
-  教训同 `#btn-create`：**别靠剥文本取标识，给稳定 id**。
+- **症状一（写坏文件）**：读用 `read_bytes().decode()`（不翻译），写用
+  `write_text()`（文本模式把 `\n` 翻译成 `os.linesep`，而 `\r` 原样保留）
+  ——于是 `b'a\r\nb\r\n'` 写回变成 `b'a\r\r\nb\r\r\n'`，**CR 翻倍**。实测
+  本仓库工作区大量是 CRLF（`file_tools.py` 340 处、`NEXT_SESSION.md` 1305
+  处、`agent.py` 249 处，`git core.autocrlf=true`）——也就是说**旧的
+  `fs_write` 一写 CRLF 文件就把它写坏**。
+- **症状二（匹配不上）**：CRLF 文件的原样正文里是 `\r\n`，而模型的多行
+  `old_text` 是用 `\n` 拼的——不归一化，`fs_edit` 对本仓库文件"永远找不到"。
+- 三个新函数（都在 file_tools，读 / 写 / 编辑共用一套）：
+  `_normalize_newlines(text) -> (统一到 \n 的正文, 原本的换行符)`；
+  `_existing_newline(path)`（只探头 8KB）；`_write_text_bytes(path, text,
+  newline)`（**字节写，绝不走文本模式**）。
+- 规则：**读写对称——进去什么风格，出来什么风格**。覆盖已有文件时沿用它的
+  换行风格，新建文件用 `\n`。这样"没动过的行一个字都没变"，git diff 里
+  只会出现真正改动的那几行。
+- 附注：本仓库工作区本来就是混的——`src` / `tests` / `scripts` 下的 .py
+  文件里 **22 个 LF、24 个 CRLF**（`models.py` / `permissions.py` /
+  `tools.py` / `std_tools.py` 这些一直是 LF，`file_tools.py` / `agent.py`
+  是 CRLF）。`core.autocrlf=true` 下 git 层面对两者一视同仁，所以一直没
+  暴露。新逻辑对两种风格都是"进去什么出来什么"，不会加剧这种混合。
 
-- 残留清理：`.sessions/` 只剩 sess_0001（用户的）+ sess_0006（当前服务的）。
+### 验收（副本操作，不碰真文件）
 
-### 下一步（路线图剩余）
-
-④运维抽屉（status + logs，`/api/status` 已就位，还差 `/api/logs`）
-⑤记忆面板（s10——注意 s10 的 TODO 还没填，15 条红灯就是它）
-⑦响应式与可访问性
-**以及最值钱的：流式输出**（SSE 已铺好路，现在模型一次性回全文；改成边生成
-边推要动 RealModel 的 stream 模式，跨前后端，是目前最大的体验缺口）。
-
-## 已完成：前端 Step 4 + 7 + 交互完整性（2026-09-15，用户定"前端全交给助手"）
-
-用户原话："我后端后面再写，你就把前端全写了，以后我就不用写了。"
-于是把路线图剩余项一次做完，并把前端拆成 7 个模块：
+拿 `NEXT_SESSION.md` 的副本（46051 字符 / 1305 行 / 1305 个 CRLF）：
 
 ```
-public/src/
-  api.js        网络层：五个端点 + /api/status + /api/logs + SSE 工厂
-  store.js      服务端数据：会话 / 历史 / 直播 / 成本账 / 运维快照
-  ui.js         本 tab 的视图偏好：侧栏折叠 / 抽屉开合 / 搜索词
-  markdown.js   纯函数解析器（零 import，能进 Node 单测）
-  components.js SessionList / ChatArea / Markdown / ApprovalCard / Toast
-  drawer.js     运维抽屉（状态 / 成本 / 日志）
-  main.js       根组件 + 挂载 + 全局错误兜底
+fs_write 整文件重写 : ValueError: 写入内容过长（46051 字符，上限 20000），拒绝写入
+fs_edit 改一行      : 21 ms，1 处替换（首处在第 299 行）
+CRLF 1305 -> 1305（没翻倍），裸 CR 1305 -> 1305
+变更行（0 基）：[298]  共 1 行
 ```
 
-- **ui.js 存在的理由**：store 放"服务端有对应物"的数据，ui 放本浏览器的视图
-  状态。混在一起的下场是"改个侧栏宽度要不要通知后端"这种问题开始出现。
-  localStorage 只持久化折叠和抽屉——搜索词不记（记住会让下次开页面看到一份
-  被过滤过的列表，像坏了）。
+- 测试：**339 条，15 红仍是 s10 骨架 TODO，非回归。** 新增 EditFileTests 13
+  条（唯一替换 / diff 供审批 / diff 截断 / 找不到的可行动提示 / 多处报次数 /
+  replace_all / 空 new_text 删除 / 相同片段拒绝 / 空 old_text 拒绝 /
+  new_text 超限 / 禁区 / **改得动 fs_write 拒绝的大文件** / 归一化纯函数
+  打表）+ 4 条换行风格测试（CRLF 保风格不翻倍 / 多行锚点匹配 CRLF 文件 /
+  新建用 LF / 覆盖沿用原风格）+ 2 条接线测试（注册且模型可见 / 走 ASK 不走
+  白名单）。
+- 探针：`.workbuddy/scratch/probe_fs_edit.py`（跑完自动清理副本）。
 
-### Step 4 · 运维抽屉
+- 遗留：**非原子写还没做**（`fs_write` 与 `fs_edit` 都还是整文件覆盖落盘，
+  下一步与错误文案一起统一）；错误文案只改了 read / edit 两路；
+  `parse_docstring` 丢续行仍在；`tree_dir` 未接 `IGNORED_DIRS`。
 
-- `GET /api/logs`（`WebApp.logs()` 直通 `shell.logs()`）。成本表不另开端点，
-  它就在 `sidecar/status` 里。
-- 抽屉三块：sidecar 状态（会话记录 / RingBuffer 用量 / RPC handlers）、
-  per-tier 成本表、日志尾。
-- **刷新节奏归抽屉自己管**（开着 3 秒一次，关掉立刻停）。反过来把定时器放
-  store 里，数据层就得知道"有没有人在看"——那是视图的事。
+- 提交：（待用户）
 
-### 顺手收口的后端隐患（与前端直接相关，所以做了）
+## 已完成：第四步 · 读总量闸 + fs_glob（2026-09-12，由助手写完）
 
-- `shell.py` 的 `status / sessions / logs / tools` 也在硬取 `["result"]`——
-  和我先前修的 close/resume/forget 是同一类问题。它们现在都从 HTTP 暴露了，
-  一次 RPC 错误就是"点一下侧栏、handler 崩掉、浏览器看到 Failed to fetch"。
-  全部改走 `_result()`。
-- `new_session` / `clear` 里的 `["result"]["sessionId"]` 撞 error 响应会
-  KeyError。新增 `_create_session_remote()`：抛 RuntimeError（带 sidecar 人话），
-  由 `WebApp.action("create")` 接住变 `{"ok": False, detail}`——
-  **＋ 按钮点了没反应是最糟的失败形态**（分不清是坏了还是没点到）。
+用户定的切法：第四步 = **限额收口 + 补 glob**，原子写拆成第五步。（原计划
+第四步是"原子写 + 错误文案"，拆开是因为 glob 与限额收口同属"把读这一侧
+补完整"，而原子写是写那一侧的独立机制。）
 
-### Step 7 · 响应式与可访问性
+### A. 第四道闸门：单次返回的字符总量
 
-- 侧栏折叠成 44px 轨。**用 CSS 实现而不是 v-if**：保住列表滚动位置和输入焦点，
-  折叠再展开不该把用户的位置弄丢。
-- `:focus-visible` 焦点轮廓（只给键盘画，鼠标点击不画——否则会被逼着全局关掉，
-  那就等于没有）、`.sr-only`、`role="log"` + `aria-live="polite"` 消息区、
-  `role="alertdialog"` 审批卡、所有图标按钮补 `aria-label`。
-- **审批卡自动聚焦卡片本身，不是"允许"按钮**——审批是安全闸门，误按一下 Enter
-  就放行一个写操作是不能接受的默认动作。聚焦卡片让读屏软件念出规则和理由，
-  人要动手得自己 Tab 过去。
-- **Esc 只隐藏审批卡，绝不等于拒绝**：拒绝必须是一次明确动作（等待超时才是
-  fail-closed 的默认拒绝；误按 Esc 就当成拒绝会让用户莫名其妙丢一次操作）。
-- `app.config.errorHandler` 兜底：组件抛异常时至少给用户一句话，不留白屏。
-- 窄屏：≤900px 抽屉改浮层（盖住聊天区而不是把它挤成一条缝）、≤640px 侧栏收窄、
-  成本行隐藏、气泡放宽。
+- 病灶：前三道限额各自都拦不住"行数 × 单行"的**组合**。实测
+  `read_file("NEXT_SESSION.md", limit=5000)` 直接吐出 **54580 字符**；最坏
+  情况 200 行 × 每行 2000 字符 = **40 万字符**，一次工具调用就把上下文
+  撑爆。Claude Code 有这道闸（输出上限 30000 字符），我们漏了。
+- `MAX_READ_CHARS = 30_000`：逐行累加"行号前缀 + 正文 + 换行"的真实占用，
+  装不下就停在这一行。**第一行无论如何都留下**（`_truncate_line` 已保证
+  单行不超过 `MAX_LINE_CHARS`，一定装得下），所以不会返回空正文。
+- 撞上限时的小结单独一种措辞：`（共 N 行，已显示 a-b 行——本页触到单次
+  30000 字符上限；继续读用 offset=b+1）`。**必须说清是撞了字符上限**，
+  否则模型会以为自己传的 limit 没生效，然后把 limit 调得更大（更糟）。
+- 实测：`limit=5000` → 30018 字符（原来 54580）；小结写"已显示 1-817 行
+  ——本页触到单次 30000 字符上限；继续读用 offset=818"。
 
-### 交互完整性（路线图外的补齐）
+### B. fs_glob：补上"按名字找"那一格
 
-- 会话列表搜索框（纯函数 `filterRows(rows, keyword)`，空词返回原数组）。
-- 消息区"回到最新"按钮：**上翻历史时不再被强行拽回底部**（新内容到来只在用户
-  本来就贴着底时才自动滚），把决定权交回用户。
-- markdown 代码块复制按钮（按钮不进 `<pre>`——会被一起复制走，而且 pre 里不
-  允许放交互元素）。
-- SSE 断连横幅；`state.streamUp` 改**三态**（null = 还没连过），避免启动瞬间
-  闪一条"已断开"。
+- 认知框架（本步最值钱的一点）：**"读什么"是三个互不重叠的问题**——
+  按内容搜（`fs_find`）/ 按名字找（**原来缺**）/ 按位置读（`fs_read`）。
+  缺中间一格，模型只好拿内容去猜文件名、或者把 `tree_dir` 的输出当名单用。
+- `glob_files(pattern, root=".", max_results=50)`：
+  - `_glob_to_regex` 纯函数把 glob 编译成正则：`*` 不跨 `/`、`?` 单字符、
+    **`**/` 匹配"零层或多层目录"**——最后这条是 glob 最反直觉也最要紧的
+    地方，正因为允许零层，`**/*.py` 才能同时命中 `agent.py` 和
+    `src/harness/agent.py`；
+  - **为什么不借现成的**：`fnmatch` 的 `*` 会跨 `/`，于是 `**/*.py` 反过来
+    匹配不到根目录的 .py（语义错，而且错得安静）；`Path.glob` 语义对，但
+    绕不过忽略名单——实测扫全树 **1760 ms**，正是第一步刚修掉的那个毛病。
+    自己翻译十几行，语义和性能就都在手里；
+  - `re.escape` 把模式里的 `.` 当普通字符，否则 `test_*.py` 连 `test_aXpy`
+    都命中；
+  - 复用 `find_text` 的剪枝骨架（`dirnames[:]` + `FORBIDDEN_PARTS` +
+    `IGNORED_DIRS`）；**不按后缀过滤二进制**——只看文件名、从不读内容，
+    没有"读成乱码"的风险，模型要找 `**/*.png` 就该找到（与 fs_find 不同）；
+  - pattern 按**相对 root** 解释（与 `Path.glob` 一致），报出的路径始终相对
+    项目根（方便直接喂给 `fs_read`）：所以 `glob_files("*.md",
+    root="learn-workbuddy")` 命中教材第一层的 .md，报出
+    `learn-workbuddy/README.md`。
+- `toolbox`：注册 `fs_glob`（即时工具），加进 `SAFE_TOOLS`（只读 + 沙箱内，
+  与 `fs_find` 同款）；**刻意不进 `WRITE_TOOLS`**。
 
-### 验证
+- 实测：`fs_glob("**/*.py")` 全量遍历 **5.8 ms**（对照 `fs_find` 未命中
+  46 ms、`Path.glob` 1760 ms）；命中 46 个本项目 .py，`.venv` 与
+  `learn-workbuddy` 一个都不出现；显式 root 时能翻教材。
 
-- Python **309 条**（+4：shell 查询端点错误翻译 2 / web_app logs + create 失败
-  翻译 2），0 failure，15 条 s10 TODO error 未变。
-- 前端冒烟 **42 项**（15 条纯函数 + 27 条浏览器）全过，console 零 error/warn。
-  三张截图：常态 / 跑完一轮 / 抽屉打开。
+- 测试：**355 条，15 红仍是 s10 骨架 TODO，非回归。** 新增 GlobToRegexTests 7
+  （`*` 不跨 `/` / `**/` 零层与多层 / 中间的 `**` / 裸 `**` / `?` 单字符 /
+  `.` 被转义 / 大小写不敏感）、GlobFilesTests 7（找到项目 .py / `**/` 同时
+  够到嵌套与根目录 / 忽略名单生效 / 显式 root 绕过且路径相对项目根 / 未命中
+  回显模式 / 截断提示 / 越界拒绝）、ReadFileGuardTests +2（单页遵守字符预算
+  且说明原因 / 短行文件不受影响）。
 
-#### 两个值得复用的探针技法
+- 遗留：**非原子写仍没做**（`fs_write` / `fs_edit` 都还是整文件覆盖落盘，
+  下一步做）；`list_dir` / `write_file` 的错误文案还没跟上；
+  `parse_docstring` 丢续行仍在；`tree_dir` 未接 `IGNORED_DIRS`。
 
-浏览器冒烟里最有用的一招：**在真页面里隔离挂载组件**。
+- **新发现的缺口（本轮顺手记下，未修）**：策略层的 `path_arg()` 只认
+  `arguments["path"]`，而搜索类工具用的是 `root`——实测 `fs_find` /
+  `fs_glob` 传 `root="../.."` 时，决策层给的是 **allow [tool.allow_safe]**，
+  而 `fs_read` / `fs_write` 同样越界是 **deny [path.outside_workspace]**。
+  **不是安全洞**（执行层 `_resolve_safe` 仍然照拦，实测抛 PermissionError，
+  不会真的越界），但"决策层预判、执行层兜底"两层就不说一家话了。修法是让
+  `path_arg` 也认 `root`，并把两个搜索工具加进 `READ_TOOLS`——属于权限层的
+  改动，值得单独一步。
 
-```js
-const { Markdown } = await import('/src/components.js');
-const { createApp, h } = await import('vue');
-const host = document.createElement('div'); document.body.appendChild(host);
-createApp({ render: () => h(Markdown, { text: src }) }).mount(host);
-// 断言后 app.unmount(); host.remove();
+- 提交：（待用户）
+
+## 已完成：第五步 · 写侧收口（原子写 + 错误文案）（2026-09-12，由助手写完）
+
+两件事：把两个写工具的落盘换成**原子替换**，再把剩下的错误文案统一成
+**可行动的**（评审报告 P0-6 与 P1-9）。走的是 A 方案——在 file_tools 里新写
+一份，不去动 `workspace_memory` 的 TODO 4（那属于 s10 主线，留给自己填）。
+
+### A. 原子写（`_atomic_write_bytes`，机制只有一份）
+
+- 病灶：旧写法是 `path.write_bytes()`——**先截断再写**。写一半崩溃就是半个
+  文件顶着正式名字，原有内容已经被毁了。文件越大这个窗口越宽，而 `fs_edit`
+  正是为改大文件而生的，所以它比 `fs_write` 更经不起这条。
+- 四步（顺序不能换，注释里逐条写了为什么）：
+  1. `tempfile.mkstemp(dir=path.parent)` —— 临时文件必须与目标**同目录**。
+     `os.replace` 只保证"同一文件系统内"原子；跨盘会退化成"复制 + 删除"，
+     那个窗口里文件是半截的。
+  2. 写入 + `flush` + `os.fsync` —— fsync 把数据真正推给磁盘。少了它，
+     `os.replace` 之后断电仍可能丢内容（改名是原子的，但数据可能还在操作
+     系统的页缓存里）。
+  3. `os.replace(tmp, path)` —— 原子改名：观察者要么看到旧的完整文件、要么
+     看到新的完整文件，不存在中间态。
+  4. `finally: tmp.unlink(missing_ok=True)` —— 成功时 tmp 已不存在
+     （`missing_ok=True` 所以不炸），失败时清掉残骸。
+- **落在 `_write_text_bytes` 里，所以 `write_file` 与 `fs_edit` 一起获得原子
+  性**——机制只有一份，不会出现"一个原子、一个不原子"的分裂。
+
+### B. 错误文案（P1-9 收口）
+
+改前都是"陈述事实"，改后每条都带下一步。实测输出：
+
+| 场景 | 现在的文案 |
+| --- | --- |
+| 列不存在的目录 | `没有这个路径：X——用 fs_list('.') 看项目根下有什么，或用 fs_glob('**/*名字片段*') 按名字找` |
+| 把文件当目录列 | `README.md 是文件不是目录——用 fs_read('README.md') 读它的内容` |
+| 路径越出沙箱 | `../../外面.txt 越出沙箱——沙箱根是 D:\React\wywd-harness。请改用相对项目根的路径，例如 'src/harness/agent.py'` |
+| 碰禁区 | `禁区不可访问：.git/config（命中 .git）——.env 里的密钥、.git 里的版本库对工具永久关闭，换个文件吧` |
+| 写一个目录 | `sub 是目录不是文件——要写哪个文件请把文件名补齐` |
+| 父目录不存在 | `X 的父目录不存在——本工具不会自动创建目录，先用 fs_list 确认上一级` |
+| 写超限 | `写入内容过长（20001 字符，上限 20000）——改已有文件请用 fs_edit（只传改动的那一段），或者拆成几次写` |
+
+- 两处顺带修掉的结构问题：
+  - `list_dir` 原来只检查 `is_dir()`，"路径不存在"和"这是个文件"会撞出同一条
+    模糊消息（甚至掉到底层的 `FileNotFoundError` 原文）——现在分开报；
+  - 禁区消息原来只说"拒绝访问"，现在把**命中的是哪个禁区段**报出来
+    （`.git/config` 会显示"命中 .git"），模型才知道是路径中段撞的。
+
+### C. 测试结构
+
+- 抽出 `_SandboxedFileTest` 基类（临时沙箱 + `_seed` / `_read` / `_read_bytes`
+  / `_write` / `_edit` / `_list` / `_temp_leftovers`），`EditFileTests` 与两个
+  新类共用，删掉了重复的 setUp / tearDown。
+- 新增 `AtomicWriteTests` 4 条：写成功不留 `.tmp` / 编辑成功不留 `.tmp` /
+  **mock 掉 `os.replace` 后旧内容原封不动且无残骸**（`write_file` 与
+  `edit_file` 各一条）。后两条是原子写唯一能被观测到的承诺。
+- 新增 `ErrorMessageTests` 7 条：上表每条文案都钉住关键字。
+
+- 验收实测（探针 `.workbuddy/scratch/probe_step5.py`）：
+
+```
+原子写失败（mock os.replace） : 内容 '原始内容\n' 完好，目录里没有 .tmp
+非原子写同样失败（真做一次）   : 内容只剩 'x'，原来的 5 个字符没了
 ```
 
-配合**直接改 store 造场景**（`import('/src/store.js')` 后设 `approval.ticket`），
-"需要后端配合才触发"的分支就变成可测分支了——代码块复制、审批卡 a11y 都是
-这么测到的（离线模型永远产不出代码块，也永远不会弹审批）。
+- 测试：**366 条，15 红仍是 s10 骨架 TODO，非回归。**
 
-#### 测试自身的坑（第三次同类）
+- 遗留：`fs_list` 仍无条数上限（P1-13）；`fs_find` 仍丢缩进 / 无上下文行 /
+  大小写不敏感（P1-10~12）；`parse_docstring` 丢续行（P2-14）；`tree_dir` 未接
+  `IGNORED_DIRS`；策略层 `path_arg()` 不认 `root`（见第四步节的缺口）。
+- `workspace_memory._atomic_write_text` 当时还是 **TODO 4 骨架**——本次没有去
+  实现它（那属于 s10 主线，是留给自己填的练习）。见下一节：它已经在 s10 里
+  填完了。
 
-- 搜索断言拿 `/api/sessions` 的数字和 DOM 比 → 5 秒轮询在检查途中刷了一次
-  （5→6），测试自己判自己失败。改成 **DOM 前后自比**。
-- "回到最新"测不动：内容没超出容器就滚不动。用探针把 `state.messages` 撑到
-  40 条再测。
-- 截图块里直接写了 `document.getElementById(...)`（那是 **Node 进程**）——
-  页面操作必须走 CDP `Runtime.evaluate`。
+- 提交：455acdc
 
-### 刻意没做的（都在等对方）
+## 进行中：s10 · TODO 1~4 已填（2026-09-12，由助手写完）
 
-1. **浅色主题**：半套调色板比没有更糟——要做就得把全部硬编码 rgba 提成 CSS
-   变量，再把 markdown / 结局卡 / 抽屉 / 复制按钮四种表面在两种模式下各过
-   一遍。该独立一步做，不适合挂在长会话尾巴上（"不提交半成品"）。
-2. **记忆面板（⑤）**：依赖 s10 未填的 TODO（那 15 条红灯就是它）。
-3. **流式输出**：要动 `RealModel` 的 stream 模式（后端）。
+用户的切法：**一次填 1~4**（`__init__` / `append_daily_log` / `_read_log` +
+`read_all_facts` / `_atomic_write_text`），红灯 **15 → 10**。
 
-### 后端待补清单（前端已经把位置留好了）
+### 填了什么
 
-- `GET /api/logs`、`GET /api/status` 已加（各 3~5 行，复用 `shell.*`）。
-- 会话标题编辑：`session/list` 已经回 `title`，但没有任何端点能**改**它。
-- `status` 不落 transcript：结局卡 F5 后就没了，要持久化得让 SessionRecord 带上。
-- s10 工作区记忆：`WorkspaceMemory` 填完后，⑤ 面板只需要加一个
-  `GET /api/memory` + `POST /api/memory/distill` 就能接上。
+- **TODO 1 `__init__`**：`resolve()` 先行（防相对路径 / 软链接给同一个项目
+  造出两个 scope）→ `workspace_id = sha256(绝对路径)[:16]` → 布局一次定死
+  + `daily/` 落地。
+- **TODO 2 `append_daily_log`**：四重校验（空 / 超长 / importance 越界 /
+  未知 kind，每条错误消息都带"可选值是什么"）+ 造 `MemoryFact` +
+  **`"ab"` 二进制追加 + flush + fsync**。
+- **TODO 3 `_read_log` + `read_all_facts`**：三种情况区别对待——partial tail
+  放过、完整坏行炸、空行跳过；外加 UTF-8 解码失败也算损坏（**乱码当空行跳过
+  等于悄悄丢事实**）；`workspace_id` 不匹配 → `MemoryScopeError`。
+- **TODO 4 `_atomic_write_text`**：`mkstemp` 同目录 → 写 + `flush` +
+  `fsync` → `os.replace` → `finally unlink(missing_ok=True)`。
 
-## 已完成：视觉重做 —— 仿 Codex 单色系（2026-09-15，用户："页面太丑了，做成像 codex 那样"）
+### 三处对骨架说明的偏离（都写进注释了）
 
-先搜了一下 Codex 的实际形态再动手（不凭印象猜），结论很关键：**我们的结构
-本来就和 Codex 同构**——左侧任务列表 / 中间对话（工具执行内嵌）/ 右侧默认
-收起的面板 / 底部 composer / 46px 头部。所以这是一次彻底重做，不是打补丁。
+1. **`read_all_facts` 的排序只用 `recorded_at`，不拿 `fact_id` 当平局判据。**
+   骨架写的是 `(recorded_at, fact_id)`，但 `fact_id` 是 `uuid4`——实测 2000
+   次：按双键排只有 **49.8%** 保住插入顺序（等于掷硬币），单键排 **100%**。
+   追加顺序是"同一秒里谁先写的"这个有意义的事实，不该被随机数洗掉；而
+   `sorted` 本身是稳定排序，单键天然保住它。**测试 `test_append_read_roundtrip`
+   断言的正是插入顺序**——照骨架写会变成一条 50% 概率挂的 flaky 测试。
+2. **新增 `_collapse_whitespace`（只折叠空白，不 casefold）**，`_normal_form`
+   改为复用它。原来只有一个 `_normal_form`，它带 casefold——拿它处理**存储**
+   会把 `SQLite WAL` 存成 `sqlite wal`，那是对原文的篡改。存储只折叠空白，
+   寻键才需要叠 casefold。**"存储"和"寻键"不该用同一种强度。**
+3. **落盘用 `"ab"` / `"wb"` 而不是 `"a"` / `"w"`。** 文本模式会替我们翻译
+   换行符（Windows 上 `\n` → `\r\n`），写出来的字节就不是要给的那一串——
+   2026-09-12 在 file_tools 上刚栽过这个坑。
 
-### 设计语言（token 化的单色系）
+### 顺带补的一个骨架漏洞
 
-- **浅色为主**，深色走 `prefers-color-scheme`，两边**共用同一套 token**
-  （约 20 个变量），不是各写一遍结构样式。这正好把上一轮"刻意没做的浅色主题"
-  一并兑现——当时判断"半套调色板比没有更糟"，现在有了完整的两组取值。
-- **单色**：没有彩色主题色，主按钮就是墨黑（`--ink`），深色模式下自动翻转。
-- 尺寸对齐 Codex 桌面版的量级：头部 46px、侧栏 260px、内容列 760px。
-
-### 具体改了什么
-
-| | 改前 | 改后 |
-|---|---|---|
-| 助手消息 | 深色气泡 | **无气泡**，满列宽正文 |
-| 用户消息 | 蓝色气泡 | 右侧灰块，圆角 18px |
-| 布局 | 满屏拉伸 | **760px 居中内容列** |
-| 输入 | 单行 input + 文字按钮 | **textarea 自动长高** + 圆形墨黑 ↑ + Enter 提示 |
-| 系统提示 | 每段对话开头一大段灰字 | **原生 `<details>` 折成一行** |
-| 顶栏 | 一行小字 | 46px：指示灯 + 会话 + 成本 + 抽屉齿轮 |
-| 侧栏底部 | 空 | 工作目录（Codex 把"项目"挂这儿） |
-| 空状态 | 无 | 居中欢迎屏（极简 SVG 标记） |
-
-三个值得记下来的判断：
-
-1. **助手消息去掉气泡**——这是 agent 界面和聊天软件的分野。满列宽正文的
-   可读性远好于把大段代码/列表塞进一个 72% 宽的气泡里。
-2. **系统提示折起来，但不删**。Codex/ChatGPT 都不展示它；可我们的设计前提是
-   "历史=真相"，transcript 第一条就是它——所以用原生 `<details>` 折叠：
-   语义、键盘可达、读屏友好全是白拿的，不写一行 JS。
-3. **折叠的语义按屏宽分叉**：桌面 = 收成 52px 轨；窄屏（≤700px）= 整条滑出
-   屏幕。两套规则**分开写**（`min-width:701px` / `max-width:700px`）——第一版
-   想用一条 `.collapsed` 兼顾两种含义，写出来乱得没法读。
-
-- 清掉与单色风格不搭的彩色 emoji：`✅/🔧/🤖/⚠️` → `✓` / `⚠︎` / 纯文字。
-  **坑**：`⚠`（U+26A0）在 Chrome/Windows 上会渲染成彩色 emoji，要强制文字
-  形态必须跟一个 U+FE0E（variation selector-15）。
-
-- `ui.js`：没存过偏好时按 `window.innerWidth <= 700` 决定侧栏默认收起。
-
-### 冒烟脚本升级
-
-- `--window-size=1280,860`：默认的 750px 窗口会让"内容居中成列"这条断言
-  **退化成恒真**（列宽被拉满、左右间隙都是 0），截图也不像真实场景。
-- 新增 `--dark`：用 CDP `Emulation.setEmulatedMedia` 模拟
-  `prefers-color-scheme: dark`，整套断言 + 截图在深色下再跑一遍。
-  **没跑过就等于没写**——深浅两套都跑，才算这套 token 真的成立。
-- 布局断言改成新设计的形状：列宽 ≤800、左右间隙差 <14px、用户气泡宽 ≤ 列宽。
+`_render_memory`（TODO 5）**没有 `raise NotImplementedError`**，函数体只剩
+docstring——调用它会**静默返回 `None`**，然后在很远的地方炸。这正是练习 17
+记下的"没执行到 return 就等于 return None"。已补上 raise：**未实现的 TODO
+必须大声失败**。
 
 ### 验收
 
-- 前端冒烟 **43 项 × 2 种配色**（浅色 43/43、深色 43/43），console 零
-  error/warn；三张浅色截图 + 三张深色截图都符合预期。
-- Python **309 条**不变（这一轮没碰后端）。
-- 小插曲：写 `index.html` 前发现文件被注入了 7 处 `data-page-node-id`
-  （预览工具的结构标注，只在 html/head/meta/body 上，不是内容改动），
-  直接重写后它们消失。
+- 测试：**366 条 / 10 红**（原 15 红）。转绿的正是 `ScopeTests` 2 +
+  `AppendTests` 3；剩下 10 条是 `DistillTests` 6（TODO 6）、`ContextTests` 2
+  （TODO 7）、`ToolboxIntegrationTests` 2（TODO 8a/8b）。
+- 探针 `.workbuddy/scratch/probe_s10_todo1to4.py` 实测：四条校验全拦住、
+  partial tail 放过（读回 2 条）、完整坏行抛 `MemoryCorruptionError`、串线抛
+  `MemoryScopeError`、原子写失败后旧内容原封不动且无 `.tmp` 残骸。
+
+### 已知待办
+
+- `workspace_memory._atomic_write_text` 与 `file_tools._atomic_write_bytes`
+  是**同一套机制的两份实现**（都在 2026-09-12 写）。先各留一份是为了保住
+  s10 的教学点；等这一课过了，把其中一份改成调用另一份，收敛成单实现。
+- TODO 5~8b 未填；TODO 9 / 10 没有任何测试钉住（只能靠冒烟验收）。
+
+- 提交：（待用户）
+
+## 进行中：s10 · TODO 5~6 已填（2026-09-12，由助手写完）
+
+从 TODO 1~4 之后接着填。红灯 **10 → 3**。
+
+### 填了什么
+
+- **TODO 5 `_render_memory`**：三行页眉 + 按 decision / convention / pitfall
+  分节。三个细节：**空节不输出**（只有标题没有内容，会让人以为"这里本该有
+  东西但丢了"）；outcome 干脆不在节列表里——它从不晋升，curated 里根本没有
+  它；条目内按 `(content, key)` 排序，**保证渲染结果逐字节可复现**——派生
+  视图一旦不可复现，每次读都会判定"与 canonical 不一致"，于是每次读都白写
+  一次原子替换。
+- **TODO 6 `distill`**：三段式——筛（年龄线 + 剔除已处理）/ 分组（内容寻键）
+  / 落地（新建或合并）。
+  - **幂等的钥匙**是 `processed` 集合：晋升只建立"证据 -> 条目"的指针，日志
+    一行不动，所以重复跑靠"这条事实已经指向某个条目了"跳过；
+  - **代表事实**取 `(-importance, recorded_at, fact_id)` 最小——最重要优先、
+    同重要度取最早措辞。挑法必须确定，否则每次渲染出来的 MEMORY.md 都可能
+    不一样；
+  - **没有变化就不落盘**（`if created or updated`），省掉两次原子替换。
+
+### ⚠️ 发现的一处账目矛盾（骨架说明 ≠ 字段注释 ≠ 测试）
+
+三处对 `skipped` 的说法互相打架：
+
+| 出处 | 说法 |
+| --- | --- |
+| `DistillReport` 字段注释 | "被门槛拦下的事实数" |
+| 骨架的 TODO 6 说明 | `skipped = len(aged) - len(candidates)` 起步，不合格组再 `+= len(facts)` |
+| 测试 `test_importance_or_repetition_gate` | `created + skipped == scanned` |
+
+**场景 D（同内容重复 2 次、重要度 2）**：两条事实都够格（重复闸门放行），
+所以"被门槛拦下的事实数"= 0；但测试要求 `1 + skipped == 2`，即 skipped = 1。
+**两者不可兼得。**
+
+**根因是单位不一致**：`scanned` / `eligible` 数的是**事实**，`created` /
+`updated` 数的是**条目**。一组 2 条事实只建出 1 条条目——另 1 条被折叠进
+同一条记忆，它没有从账上消失。
+
+**我的取法**：`skipped = scanned - created - updated` 收口（让测试的恒等式
+永远成立），并把 `DistillReport` 的字段注释改成与之一致的说法。代价是它不再
+等于"被拦下的事实数"，诊断价值下降。
+**另一条路**：保留原语义，把测试断言改成 `eligible + skipped == scanned`
+（这个恒等式在 A/B/C/D 四个场景里都成立）。选了前者是因为**不去改测试契约**；
+若更看重诊断价值，随时可以换成后者。
+
+另：`scanned` 的语义也按测试倒推调整成了"**过了年龄线且尚未处理过**的事实数"
+——`test_distill_is_idempotent` 断言第二次跑的 `scanned == 0`；若按字面的
+"过了年龄线的事实数"算，它永远是 1，看不出到底是幂等生效还是坏了。
+
+### 验收
+
+- 测试：**366 条 / 3 红**。转绿的是 `DistillTests` 6 条 + `ContextTests` 的
+  `test_restart_recovers_state`（它只需要 5+6，不需要 TODO 7）。剩 3 条：
+  `ContextTests.test_recent_facts_bounded_and_placeholder`（TODO 7）、
+  `ToolboxIntegrationTests` 2 条（TODO 8a / 8b）。
+- 探针 `.workbuddy/scratch/probe_s10_todo5to6.py`：四个场景分别打中四道闸门
+  （年龄 / 类型 / 重要度 / 重复）；幂等二跑 `scanned=0`；内容寻键把
+  `SQLite 必须 WAL` 与 `sqlite   必须  wal` 合成一条；渲染出的 MEMORY.md 三节
+  齐全且 outcome 不在其中；原子写无残骸；`DistillPolicy(minimum_age_days=0)`
+  能把刚写的事实当场晋升——**证明门槛是 harness 控制的参数，不是模型说了算**。
+
+- 渲染产物（探针实测）：
+
+```
+# Workspace Memory
+
+Derived from append-only project facts. Edit the source log or policy, not this view.
+
+## Decisions
+- 存储层用 SQLite WAL 模式 (seen 1x; evidence: 1)
+
+## Conventions
+- 路径必须相对项目根 (seen 1x; evidence: 1)
+
+## Pitfalls
+- 不要把这个坑忘了 (seen 1x; evidence: 1)
+```
+
+- 剩余：TODO 7（`get_context_for_agent`）、TODO 8a / 8b（`toolbox.py` 的
+  `write_memory_fact` / `build_history_seed`）；TODO 9 / 10 靠冒烟。
+
+- 提交：（待用户）
+
+## 已完成：s10 工作区记忆全部填完（2026-09-12，由助手写完）—— 红灯清零
+
+从 TODO 1~4 → 5~6 → 7 + 8a/8b → 9 + 10，分三轮填完。**366 条测试全绿**，
+并且走完了完整冒烟。
+
+### 最后一轮（TODO 7 / 8a / 8b / 9 / 10）
+
+- **TODO 7 `get_context_for_agent`**：两段拼接——策展视图（`read_memory_md`，
+  顺手修复陈旧的 MEMORY.md）+ 最近 N 条原始事实。`recent_limit <= 0` 时整段
+  不要；**注意不能写成 `facts[-recent_limit:]`**，0 取负还是 0，`facts[-0:]`
+  等于整个列表（练习 19 记过的坑）。空记忆返回哨兵文案。
+- **TODO 8a `write_memory_fact`**：`WorkspaceMemory(root or ALLOWED_ROOT)`
+  → `append_daily_log(source="agent")` → 返回"已记录 … 等待蒸馏策略裁决"。
+  **措辞是安全设计的一部分**：说"已永久记住"会让模型以为它能操纵长期记忆。
+- **TODO 8b `build_history_seed`**：`with_system([])` 打底（工具目录），
+  有记忆时追加第二条 system。空记忆时与 s06.5 完全一致。
+- **TODO 9 `scripts/shell.py`**：`history_seed=lambda: with_system([])` →
+  `history_seed=build_history_seed`；`with_system` 随之在本文件失效，从 import
+  里移除；填完的 TODO 指令块清掉、设计要点收编进 docstring。
+- **TODO 10 `scripts/sidecar_shell.py`**：`/memory` 与 `/memory distill`。
+  **本地直读、不走 RPC**——记忆就是 `<项目根>/.memory/` 下的文件，任何进程都
+  能读、都能蒸馏（教学点：**记忆的所有权在文件系统，不在某个活着的进程**，
+  所以 sidecar 崩了、会话换了一代，记忆都还在）。注意导入顺序：`src.harness.*`
+  必须排在 `from scripts.shell import ...` **之后**——项目根的 sys.path 引导
+  在 shell.py 里。
+
+### 一处顺手的小收拾
+
+`"(no workspace memory yet)"` 这个哨兵要在两个模块里对齐
+（`get_context_for_agent` 返回它、`build_history_seed` 靠它判空），抽成
+`workspace_memory.NO_MEMORY_PLACEHOLDER` 常量。跨模块比字符串字面量是"改一处
+漏一处"的经典来源，而且漏了的症状很隐蔽：**记忆永远注入不进去**。
+
+### 冒烟验收（不用 API key，脚本 `.workbuddy/scratch/smoke_s10.py`）
+
+| 场景 | 实测结果 |
+| --- | --- |
+| 1 空记忆起步历史 | **1 条 system**（工具目录）——与 s06.5 行为零变化 |
+| 2 写链路 | `memory_write` 落进 `.memory/daily/2026-09-12.jsonl` 共 1 行；读回 kind=decision / importance=5 |
+| 3 注入链路 | 有记忆后起步历史变 **2 条 system**，第二条是 `# Recent Workspace Facts` / `- [decision] 这个项目用 uv 管虚拟环境 (2026-09-12)`——**在真 sidecar 子进程里验的**，证明 shell.py 的接线生效 |
+| 4 蒸馏链路 | `DistillPolicy(minimum_age_days=0)` 把年龄线压到 0 → 扫描 1 / 晋升 1；MEMORY.md 出现 `- 这个项目用 uv 管虚拟环境 (seen 1x; evidence: 1)` |
+| 5 幂等 | 第二次：扫描 0 / 晋升 0 / 合并 0 |
+
+- 冒烟脚本自己踩了一个坑（本身有教学价值）：**顶层直接 `shell.start()` 会触发
+  Windows spawn 递归起进程**——`An attempt has been made to start a new
+  process before the current process has finished its bootstrapping phase`。
+  加 `if __name__ == "__main__":` 守卫后正常。本项目所有入口都守这条守则。
+- 冒烟跑完自动清理：`.memory/` 整个删除（跑之前不存在）、本次新建的
+  `.sessions/sess_0154.jsonl` 与 `sess_0155.jsonl` 删除。**仓库里没留下任何
+  验收痕迹。**
+
+### 仍未验证的部分 → 已验证（2026-09-12 真实环境冒烟）
+
+- 真模型路径已用脚本 `.workbuddy/scratch/smoke_s10_real.py` 验过。
+  关键证据：
+  - **场景 A**：让真模型调 `memory_write`——它**真的选了**那个工具
+    （ToolSearch 拿到 schema → DeferExecuteTool 执行）。回复里没废话
+    是好事：模型听话干活不嘴碎。
+  - **场景 B**：`.memory/daily/2026-09-12.jsonl` 落了 1 行，
+    `kind=convention importance=4 source=agent`。
+  - **场景 C**：新会话（`sess_0155`）起步历史 2 条 system，第二条把
+    那条事实注入了进来。
+  - **场景 D**：默认 30 天年龄线拦下（合理），压到 0 后晋升 1 条，
+    MEMORY.md 出现 `- 本项目…约定以 uv 管理 Python 虚拟环境 (seen 1x; evidence: 1)`。
+- 跑完自动清场：`.memory/` 与本次新开的两个 session 文件全删。仓库干净。
+
+至此 s10 整条链路（离线 + 真模型 + 离线回归）全部端到端通过。
+
+### 遗留
+
+- `workspace_memory._atomic_write_text` 与 `file_tools._atomic_write_bytes`
+  仍是同一套机制的**两份实现**，待收敛成一份。
+- 评审报告剩下的 P1/P2 工具小项；权限层 `path_arg()` 不认 `root`。
+- shell 工具那条线（用户说以后再做）——建议先做 `run_tests` 这类零注入面的
+  专用工具。
+
+- 提交：（待用户）
 

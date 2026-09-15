@@ -101,9 +101,11 @@ export const costTitle = computed(() => {
     " / 输出 " + fmtInt(row.completionTokens) + " · $" + row.cost).join("\n");
 });
 
-// 能不能发消息：一个 computed 吃掉 vanilla 版散落各处的 setInputEnabled
+// 能不能发消息：一个 computed 吃掉 vanilla 版散落各处的 setInputEnabled。
+// 注意**不再要求 state.sid**：会话改成懒建之后，"刚打开还没有任何会话就
+// 直接打字"是合法操作，send() 会先替你把会话开出来（见 ensureSession）。
 export const canSend = computed(
-  () => Boolean(state.sid) && !state.posting && !state.chatError && !state.locked
+  () => !state.posting && !state.chatError && !state.locked
 );
 
 // ═══════════════════════════════════════════════════════════
@@ -250,9 +252,52 @@ export async function selectSession(sid) {
 // 动作：发一轮
 // ═══════════════════════════════════════════════════════════
 
+/** 懒建的兜底口：还没有会话就开一个（复用 ＋ 按钮那条路）。
+    成功 = state.sid 变非空 —— createSession 内部已经 openSession 过。 */
+async function ensureSession() {
+  if (state.sid) return true;
+  await createSession();
+  return Boolean(state.sid);
+}
+
+/** 发消息前确认会话有 live 运行时，没有就先 resume。
+
+    为什么需要：空闲回收会在后台把闲置的会话 close 掉（运行时释放，记录还在）。
+    这时用户什么都没做错，却会在界面上吃到一句"会话已关闭"—— 那是回收的
+    后果，不该由用户承担。resume 是幂等且廉价的（造一代新运行时），
+    所以发送路径上顺手做掉，"点一下就能继续"变成"根本不用点"。
+
+    口径与 selectSession 里那条"closed 先 resume 再打开"一致，只是把它
+    挪到了发送路径。注意：别的 tab 主动关掉的会话也会被这里复活——
+    可接受（不破坏任何数据），换来的是回收对用户完全无感。
+    当前会话被**本 tab** 关掉时 canSend 已经是 false，send 根本不会走到这。
+*/
+async function ensureLive(sid) {
+  const row = sessionById(sid);
+  if (row === null || row.live) return true;   // 清单里没有 / 本来就活着
+  try {
+    const res = await api.sessionAction("resume", sid);
+    if (!res || !res.ok) {
+      notify((res && res.detail) || "复活会话失败");
+      return false;
+    }
+    refreshSessions();
+    return true;
+  } catch (err) {
+    notify("后端没响应");
+    return false;
+  }
+}
+
 export async function send(text) {
   const body = String(text || "").trim();
   if (!body || !canSend.value) return;
+
+  // 懒建：启动时不再预建会话，所以"第一句话"要自己把会话开出来。
+  // 放在 posting 之前：建会话失败就直接返回，不留一个卡住的 posting 旗。
+  if (!(await ensureSession())) return;
+  // 后台空闲回收可能已经把它 close 了：先复活，别让用户吃"会话已关闭"。
+  if (!(await ensureLive(state.sid))) return;
 
   state.posting = true;
   state.live = [];
@@ -406,6 +451,98 @@ export function dismissApproval() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 动作：工作区（上传目录）
+// ═══════════════════════════════════════════════════════════
+
+/** 工作区是 sidecar 的**边界**（工具闭包 + 权限作用域都绑它）：换掉之后
+    下一轮就走新沙箱。已建会话的历史不动——旧历史里的路径在新沙箱里可能
+    不存在，所以切换成功后提示"建议新建会话"。 */
+export const workspace = reactive({
+  info: null,        // {kind, id?, root?}；null = 读不到
+  error: "",         // 读不到时的人话（与 info 互斥）
+  busy: "",          // 非空 = 正在做某个动作，内容是给用户看的进度短语
+});
+
+export async function refreshWorkspace() {
+  try {
+    const data = await api.fetchWorkspace();
+    const info = (data && data.workspace) || null;
+    workspace.info = info;
+    workspace.error = info ? "" : "工作区不可读";
+  } catch (err) {
+    workspace.info = null;
+    workspace.error = "后端没响应";
+  }
+}
+
+/** 四个动作的公共收尾。返回原始 res，让组件决定要不要接着弹手输框。
+
+    browse 的三条出路都在这儿收：成功 / 取消 / 弹不出框降级成手输。
+    取消不是错误（不该弹红字），但也**要说一声**——静默的后果是用户分不清
+    "点了没反应"和"我取消了"，他只会觉得按钮坏了（真实反馈里出现过）。
+*/
+function applyWorkspaceResult(res) {
+  if (res && res.cancelled) {
+    notify("已取消选择，工作区没变");
+    refreshWorkspace();          // 进度文案还挂在栏上，刷回后端的事实
+    return res;
+  }
+  if (res && res.fallback === "manual") {
+    notify(res.detail || "改成手输路径");
+    return res;                  // 组件收到这个再弹手输框
+  }
+  if (res && res.ok) {
+    if (res.workspace) workspace.info = res.workspace;
+    notify((res.detail || "工作区已切换") + "，建议新建会话再聊");
+  } else {
+    notify((res && res.detail) || "切换失败");
+    refreshWorkspace();          // 失败就把显示恢复成后端的事实
+  }
+  return res;
+}
+
+/** 跑一个工作区动作。busyText 只是给用户看的进度短语。 */
+export async function runWorkspace(action, opts = {}, busyText = "") {
+  workspace.busy = busyText;
+  try {
+    const res = await api.workspaceAction(action, opts);
+    return applyWorkspaceResult(res);
+  } catch (err) {
+    notify("后端没响应");
+    await refreshWorkspace();
+    return null;
+  } finally {
+    workspace.busy = "";
+  }
+}
+
+/** 上传一个 zip 当工作区。为什么读成 base64：后端要的是 JSON 里的字符串
+    （不走 multipart——那要手写边界解析，不值当；见 web_app._upload_zip）。
+    FileReader 是唯一能把 File 变成 base64 的浏览器 API。 */
+export async function uploadWorkspaceZip(file) {
+  if (!file) return null;
+  const kb = Math.max(1, Math.round((file.size || 0) / 1024));
+  workspace.busy = `上传中… ${kb} KB`;
+  let data = "";
+  try {
+    data = await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result || ""));
+      fr.onerror = () => reject(new Error("读不出这个文件"));
+      fr.readAsDataURL(file);
+    });
+    // readAsDataURL 给的是 "data:<mime>;base64,<载荷>"，砍掉头
+    data = data.slice(data.indexOf(",") + 1);
+  } catch (err) {
+    workspace.busy = "";
+    notify(err.message || "读文件失败");
+    return null;
+  }
+  return runWorkspace("upload", { filename: file.name, data },
+                      `上传中… ${kb} KB`);
+}
+
+// ═══════════════════════════════════════════════════════════
 // 启动
 // ═══════════════════════════════════════════════════════════
 
@@ -414,6 +551,7 @@ let listTimer = null;
 export function start() {
   refreshSessions();
   refreshStatus();
+  refreshWorkspace();
   listTimer = setInterval(refreshSessions, LIST_INTERVAL);
   startEventStream();
 

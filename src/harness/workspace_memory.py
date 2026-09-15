@@ -62,6 +62,12 @@ DEFAULT_RETENTION_DAYS = 30
 MAX_FACT_CHARS = 2_000
 MAX_CONTEXT_FACTS = 6
 
+# "没有记忆"的哨兵文案。抽成常量是因为它要在**两个模块**里对齐：
+# get_context_for_agent 返回它，build_history_seed 靠它判断"要不要往
+# 起步历史里加第二条 system"。跨模块靠字符串字面量比对是
+# "改一处漏一处"的经典来源（漏了的症状还很隐蔽：记忆永远注入不进去）。
+NO_MEMORY_PLACEHOLDER = "(no workspace memory yet)"
+
 
 class MemoryScopeError(RuntimeError):
     """持久化记忆属于另一个 workspace（串线 = 数据事故，当场炸）。"""
@@ -169,13 +175,21 @@ class CuratedEntry:
 
 @dataclass(frozen=True)
 class DistillReport:
-    """蒸馏的可观察结果（给调度方/CLI/审计层）。"""
+    """蒸馏的可观察结果（给调度方 / CLI / 审计层）。
 
-    scanned: int      # 过了年龄线的事实数
-    eligible: int     # 参与了晋升/合并的事实数
+    五个计数的**单位不一样**，读的时候别搞混：`scanned` / `eligible` 数的是
+    **事实**，`created` / `updated` 数的是**条目**。于是一组 3 条事实只建出
+    1 条条目时，`created` 是 1 而不是 3——这也是为什么下面 `skipped` 不能
+    简单定义成"被门槛拦下的事实数"。
+    """
+
+    scanned: int      # 过了年龄线、且尚未进过任何条目的事实数
+    eligible: int     # 过了两道门槛、真的参与晋升/合并的事实数
     created: int      # 新建条目数
-    updated: int      # 合并证据的条目数
-    skipped: int      # 被门槛拦下的事实数
+    updated: int      # 合并了证据的条目数
+    skipped: int      # scanned - created - updated：没换来条目的事实数
+                      # （被门槛拦下的 + 同组里除代表外被折叠进来的）。
+                      # 用它收口是为了保证账永远平
 
 
 # ── 工具函数（给全：都是一行流，课的肉在 WorkspaceMemory）────────
@@ -198,10 +212,23 @@ def _parse_timestamp(value: str) -> datetime:
     return _as_utc(parsed)
 
 
+def _collapse_whitespace(content: str) -> str:
+    """空白折叠（连续空白含换行压成单空格），不动大小写。纯函数。
+
+    为什么先有它、再有 _normal_form：两者用途不同——**存证据时只能折叠空白，
+    不能改大小写**（把 'SQLite WAL' 存成 'sqlite wal' 是篡改原文），而**算
+    key 时必须再叠一层 casefold**（大小写不同的两条才算同一条事实）。
+    合成一个函数会让"存储"和"寻键"被迫用同一种强度。
+    """
+
+    return re.sub(r"\s+", " ", content).strip()
+
+
 def _normal_form(content: str) -> str:
     """归一化：空白折叠 + casefold（比 lower 更激进的大小写归一——
     'SQLite WAL' 和 'sqlite  wal' 是同一条事实）。"""
-    return re.sub(r"\s+", " ", content).strip().casefold()
+
+    return _collapse_whitespace(content).casefold()
 
 
 def _entry_key(kind: str, content: str) -> str:
@@ -219,25 +246,30 @@ def _entry_key(kind: str, content: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 class WorkspaceMemory:
-    """一个项目一份持久记忆：追加证据、策略蒸馏、有界注入。
+    """一个项目一份持久记忆：追加证据、策略蒸馏、有界注入。"""
 
-    TODO 1（你来填）——__init__ + 路径布局：
-      def __init__(self, project_dir: Path) -> None:
-          self.project_dir = Path(project_dir).expanduser().resolve()
-          self.workspace_id = hashlib.sha256(
-              str(self.project_dir).encode("utf-8")).hexdigest()[:16]
-          self.memory_dir = self.project_dir / ".memory"
-          self.daily_dir = self.memory_dir / "daily"
-          self.curated_file = self.memory_dir / "curated.json"
-          self.memory_file = self.memory_dir / "MEMORY.md"
-          self.daily_dir.mkdir(parents=True, exist_ok=True)
-    三个要点：
-      - resolve() 先行：相对路径/软链接归一到同一绝对路径，workspace_id
-        才稳定（教材"只按字符串路径隔离"误区的防御）；
-      - workspace_id 是 scope 的唯一标识，写进每条 fact / curated——
-        读到别家的 id 就是串线，MemoryScopeError；
-      - 布局在 __init__ 定死，方法只管拼（daily_log_path 已给）。
-    """
+    def __init__(self, project_dir: Path) -> None:
+        """定下 scope 与存储布局。
+
+        三个要点：
+          - **`resolve()` 先行**：相对路径 / 软链接归一到同一个绝对路径，
+            `workspace_id` 才稳定。不解析就会出现"同一个项目因写法不同而
+            生出两套记忆"——教材"只按字符串路径隔离"那个误区的落点；
+          - `workspace_id` 是 scope 的唯一标识，会被写进每条 fact 与
+            `curated.json`。读到别家的 id 就是串线，当场 `MemoryScopeError`；
+          - 布局在这里**一次定死**，其余方法只管拼路径（`daily_log_path`
+            已经给好了）——路径散在各处拼，是"改一个地方漏三个地方"的源头。
+        """
+
+        self.project_dir = Path(project_dir).expanduser().resolve()
+        self.workspace_id = hashlib.sha256(
+            str(self.project_dir).encode("utf-8")).hexdigest()[:16]
+        self.memory_dir = self.project_dir / ".memory"
+        self.daily_dir = self.memory_dir / "daily"
+        self.curated_file = self.memory_dir / "curated.json"
+        self.memory_file = self.memory_dir / "MEMORY.md"
+        # 目录先落地：后面所有写路径都假设它存在（makedirs 幂等，重复构造无害）
+        self.daily_dir.mkdir(parents=True, exist_ok=True)
 
     def daily_log_path(self, day: date) -> Path:
         """某 UTC 天的事实日志路径（一天一个文件，文件名即日期）。"""
@@ -258,64 +290,176 @@ class WorkspaceMemory:
     ) -> MemoryFact:
         """追加一条校验过的事实（一行 JSON + fsync，返回构造好的 fact）。
 
-        TODO 2（你来填）：
-          1. 校验（信任边界——进证据前把关）：
-             text = 归一化空白后的 content；空 → ValueError；
-             len(text) > MAX_FACT_CHARS → ValueError；
-             not 1 <= importance <= 5 → ValueError；
-             kind 转 str 后不在 FactKind 值集合 → ValueError
-          2. 造 fact：fact_id=uuid.uuid4().hex、workspace_id=self.workspace_id、
-             recorded_at=_as_utc(recorded_at).isoformat().replace("+00:00","Z")
-          3. 追加一行（s09 同款三连）：
-             encoded = (json.dumps(asdict(fact), ensure_ascii=False,
-                        sort_keys=True) + "\\n").encode("utf-8")
-             path = self.daily_log_path(时间戳的 .date())
-             with open(path, "a", ...)/write/flush/os.fsync
-          4. return fact
-        asdict（新语法）：dataclass → 字典的深度转换（嵌套 dataclass
-        递归拆）——直接 json.dumps(dataclass) 会炸，asdict 是中间站。
+        校验是**信任边界**：事实一进证据日志就不再回头，所以宁可在门口多问
+        几句。四条各有各的坏处——空内容是无意义证据；超长会把日志和注入
+        上下文一起撑爆；越界的 importance 会让蒸馏门槛失灵；未知 kind 则连
+        "该不该晋升"都判不了（`STABLE_KINDS` 查不到它）。
+
+        落盘用 s09 同款三连（write -> flush -> fsync）：证据日志的全部价值
+        就在"断电了它也还在"。开 `"ab"` 而不是 `"a"`——文本模式会替我们
+        翻译换行符，那就不是我们要写的那串字节了（今天在 file_tools 上栽过
+        这个坑，同一个坑不踩第二遍）。
+
+        `asdict` 是 dataclass -> 字典的深度转换（嵌套 dataclass 会递归拆开）；
+        直接 `json.dumps(dataclass)` 会炸，它是中间的必经站。
         """
-        raise NotImplementedError("TODO 2: append_daily_log")
+
+        text = _collapse_whitespace(content)
+        if not text:
+            raise ValueError("事实内容不能是空白——记不住的东西不该进证据日志")
+        if len(text) > MAX_FACT_CHARS:
+            raise ValueError(
+                f"事实内容过长（{len(text)} 字符，上限 {MAX_FACT_CHARS}）"
+                f"——一条事实应该是一句话，不是一篇文档"
+            )
+        if not 1 <= importance <= 5:
+            raise ValueError(f"importance 必须在 1..5 之间，收到 {importance}")
+
+        # kind 允许传 Enum 也允许传字符串（工具箱那边从 JSON 进来的是字符串）
+        kind_value = kind.value if isinstance(kind, FactKind) else str(kind)
+        known_kinds = [item.value for item in FactKind]
+        if kind_value not in known_kinds:
+            raise ValueError(
+                f"未知的事实类型 {kind!r}——可选：{'、'.join(known_kinds)}"
+            )
+
+        when = _as_utc(recorded_at)
+        fact = MemoryFact(
+            fact_id=uuid.uuid4().hex,
+            workspace_id=self.workspace_id,
+            # isoformat() 给出 "+00:00"，换成 "Z"——存储格式统一成一种写法，
+            # 免得以后两个解析路径各认一种。
+            recorded_at=when.isoformat().replace("+00:00", "Z"),
+            kind=kind_value,
+            content=text,
+            source=source,
+            importance=importance,
+            evidence=dict(evidence or {}),
+        )
+
+        encoded = (json.dumps(asdict(fact), ensure_ascii=False,
+                              sort_keys=True) + "\n").encode("utf-8")
+        path = self.daily_log_path(when.date())
+        with open(path, "ab") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return fact
 
     def _read_log(self, path: Path) -> list[MemoryFact]:
-        """读一个日志文件：partial tail 放过，中间坏行/串线炸。
+        """读一个日志文件：partial tail 放过，中间坏行 / 串线当场炸。
 
-        TODO 3（你来填）：
-          if not path.exists(): return []
-          逐行（keepends=True——s09 的判定依据）：
-            空行跳过；json.loads 失败：最后一行无换行 → break（partial
-            tail），否则 MemoryCorruptionError
-            MemoryFact.from_dict 后查两件事：
-              schema_version 合法性、workspace_id == self.workspace_id
-              （不匹配 → MemoryScopeError）
-          返回 facts
-        def read_all_facts(self) -> list[MemoryFact]:
-          所有日志文件（glob "????-??-??.jsonl" 排序）的 facts 拼接，
-          按 (recorded_at, fact_id) 排序返回。
-        （s09 的 read_events 换了个马甲：JSONL 证据校验的第三次上岗。）
+        三种情况区别对待，判断标准只有一条——**这是"没写完"还是"写坏了"**：
+
+          - **partial tail**（最后一行没有换行符）：进程在写那一行的中途死了。
+            它是未完成的写入，不是损坏的证据，放过并忽略——下次追加会自然
+            接在它后面（所以它也不会永远赖在那里）；
+          - **完整的坏行**（有换行符却解析不了）：文件真坏了（被手改过、磁盘
+            出错）。不能装作没看见——继续读下去只会让记忆悄悄失真，而失真
+            的记忆比没有记忆更坏；
+          - **空行**跳过：手动编辑留下的空行不该算证据。
+
+        `keepends=True` 是这套判断的地基：留着换行符，才分得清"最后一行写完
+        了没有"。这就是 s09 `read_events` 的第三次上岗——"日志是证据"这条
+        规矩，每多一个消费方就得再钉一遍。
         """
-        raise NotImplementedError("TODO 3: _read_log / read_all_facts")
+
+        if not path.exists():
+            return []
+
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            # 证据日志连"是不是文本"都不能含糊：乱码当空行跳过 = 悄悄丢事实
+            raise MemoryCorruptionError(
+                f"日志 {path.name} 不是合法的 UTF-8 文本"
+            ) from exc
+
+        facts: list[MemoryFact] = []
+        for raw in raw_text.splitlines(keepends=True):
+            if not raw.strip():
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                if not raw.endswith("\n"):
+                    break  # partial tail：写到一半就崩了，认它没写完
+                raise MemoryCorruptionError(
+                    f"日志 {path.name} 里有完整却无法解析的行：{raw[:80]!r}"
+                ) from exc
+
+            fact = MemoryFact.from_dict(payload)
+            if fact.schema_version != SCHEMA_VERSION:
+                raise MemoryCorruptionError(
+                    f"日志 {path.name} 里的 schema_version="
+                    f"{fact.schema_version} 不受支持（本代码只认 {SCHEMA_VERSION}）"
+                )
+            if fact.workspace_id != self.workspace_id:
+                raise MemoryScopeError(
+                    f"日志 {path.name} 里的记忆属于另一个 workspace"
+                    f"（{fact.workspace_id}）——这是串线，直接拒绝"
+                )
+            facts.append(fact)
+        return facts
+
+    def read_all_facts(self) -> list[MemoryFact]:
+        """所有日志文件按日期拼接后的全部事实（按记录时间排序）。
+
+        排序**只用 recorded_at，不拿 fact_id 当平局判据**。`fact_id` 是
+        `uuid4`，把它当二级键等于"把同一时刻写入的两条事实随机洗牌"；而
+        `sorted` 本身是稳定排序，只按时间排就能保住"文件内按追加顺序"这个
+        有意义的事实（谁先写的谁在前）。
+
+        文件名 glob 用 `????-??-??.jsonl` 而不是 `*.jsonl`：前者顺带要求
+        日期格式合法，顺手把"某某备份.jsonl"这类杂鱼挡在外面（且字典序 = 日期序）。
+        """
+
+        facts: list[MemoryFact] = []
+        for path in sorted(self.daily_dir.glob("????-??-??.jsonl")):
+            facts.extend(self._read_log(path))
+        return sorted(facts, key=lambda item: item.recorded_at)
 
     def _atomic_write_text(self, path: Path, content: str) -> None:
-        """原子替换：要么完整新文件，要么旧文件原封不动（本课新机制）。
+        """原子替换：要么是完整的新文件，要么旧文件原封不动（本课新机制）。
 
-        TODO 4（你来填）：
-          1. descriptor, tmp_name = tempfile.mkstemp(
-                 dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-             ——临时文件必须和目标同目录（os.replace 只保证同文件系统
-             原子；跨盘会退化成复制）
-          2. try:
-                 with os.fdopen(descriptor, "w", encoding="utf-8") as f:
-                     f.write(content); f.flush(); os.fsync(f.fileno())
-                 os.replace(tmp, path)   ← 原子改名：观察者要么看旧要么看新
-             finally:
-                 tmp.unlink(missing_ok=True)   ← 成功后 tmp 已不存在，
-                 失败时清掉残骸（missing_ok=True：不存在也不炸——新语法）
-        为什么不直接 open(path, "w")：写一半崩溃 = 半个文件顶着正式名字，
-        MEMORY.md/curated.json 就坏了；tempfile + replace 保证崩溃点只
-        会留下一个多余的 .tmp（下次覆盖），canonical 永远是完整版本。
+        四步，顺序不能换：
+
+          1. `tempfile.mkstemp(dir=path.parent)` —— 临时文件必须和目标
+             **同目录**。`os.replace` 只保证"同一文件系统内"原子；跨盘会
+             退化成"复制 + 删除"，那个窗口里文件是半截的。
+          2. 写入 + `flush` + `os.fsync` —— fsync 把数据真正推给磁盘。少了
+             它，改名之后断电仍可能丢内容（改名是原子的，但数据可能还躺在
+             操作系统的页缓存里）。
+          3. `os.replace(tmp, path)` —— 原子改名：任何观察者要么看到旧的完整
+             文件、要么看到新的完整文件，不存在中间态。
+          4. `finally: tmp.unlink(missing_ok=True)` —— 成功时 tmp 已经不存在
+             （`missing_ok=True` 所以不炸），失败时清掉残骸。
+
+        为什么不直接 `open(path, "w")`：写一半崩溃 = 半个文件顶着正式名字，
+        `MEMORY.md` / `curated.json` 当场就坏了。tempfile + replace 保证崩溃点
+        只会留下一个多余的 `.tmp`（下次覆盖），canonical 永远是完整版本。
+
+        落盘走 `"wb"`（二进制）而不是 `"w"`：文本模式会把 `\\n` 翻译成
+        `os.linesep`，写出来的字节就不是你给的那一串了——2026-09-12 在
+        file_tools 上刚栽过这个坑（CR 翻倍），同一个坑不踩第二遍。
+
+        与 `file_tools._atomic_write_bytes` 是同一套机制的**两份实现**（工具线
+        那天也补了一份）。这里先各写一份：s10 的教学点就在这四步里，直接调用
+        会把这一课省掉。等这一课过了，再把其中一份改成调用另一份，收敛成单
+        实现（记为已知待办）。
         """
-        raise NotImplementedError("TODO 4: _atomic_write_text")
+
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _load_curated(self) -> list[CuratedEntry]:
         """curated.json → 条目清单（scope/schema 校验 + 结构校验）。"""
@@ -356,6 +500,37 @@ class WorkspaceMemory:
           结尾补一个空行，return "\\n".join(lines)
         """
 
+        lines = [
+            "# Workspace Memory",
+            "",
+            "Derived from append-only project facts. "
+            "Edit the source log or policy, not this view.",
+        ]
+        sections = (
+            (FactKind.DECISION, "Decisions"),
+            (FactKind.CONVENTION, "Conventions"),
+            (FactKind.PITFALL, "Pitfalls"),
+        )
+        for kind, title in sections:
+            group = sorted(
+                (item for item in entries if item.kind == kind.value),
+                key=lambda item: (item.content, item.key),
+            )
+            if not group:
+                # 空节（只有标题没有内容）会让人以为"这里本该有东西但丢了"——
+                # 宁可不写这一节。outcome 一节干脆不在 sections 里：它从不
+                # 晋升，curated 里根本没有它。
+                continue
+            lines.append("")
+            lines.append(f"## {title}")
+            lines.extend(
+                f"- {item.content} (seen {item.occurrences}x; "
+                f"evidence: {len(item.evidence_ids)})"
+                for item in group
+            )
+        lines.append("")
+        return "\n".join(lines)
+
     def _save_curated(self, entries: list[CuratedEntry]) -> None:
         """canonical 先写、派生视图后写——都走原子替换。"""
         ordered = sorted(entries, key=lambda item: (item.kind, item.key))
@@ -375,36 +550,103 @@ class WorkspaceMemory:
         policy: Optional[DistillPolicy] = None,
         as_of: Optional[datetime] = None,
     ) -> DistillReport:
-        """按策略晋升事实，不删证据、幂等（重复跑不重复计）。
+        """按策略晋升事实：不删证据、幂等（重复跑不重复计）。
 
-        TODO 6（你来填）：
-          active = policy or DistillPolicy()
-          cutoff = _as_utc(as_of) - timedelta(days=active.minimum_age_days)
-          （timedelta 新语法：日期算术——"30 天前"就是减一个 timedelta）
-          existing = self._load_curated()
-          by_key = {entry.key: entry for entry in existing}
-          processed_ids = {已进任何条目的 evidence_id}   ← 幂等的钥匙
-          aged = read_all_facts() 里时间 < cutoff 的
-          candidates = aged 里 kind ∈ STABLE_KINDS 且 fact_id ∉ processed_ids
-          skipped = len(aged) - len(candidates) 起步
-          按 _entry_key(fact.kind, fact.content) 分组，每组（sorted 遍历）：
-            qualifies = max(importance) >= minimum_importance
-                        or len(facts) >= repeat_threshold
-            不合格 → skipped += len(facts)，continue
-            eligible += len(facts)
-            by_key 无此 key → 新建 CuratedEntry：
-              代表事实选 (-importance, 时间, fact_id) 最小者（最重要优先，
-              同重要度取最早措辞——确定性展示）
-              first_seen/last_seen = 组内时间戳 min/max
-              evidence_ids = sorted(fact_id 集合)，occurrences = len
-              created += 1
-            已有 → 合并（同内容新证据 = 幂等更新，不是新条目）：
-              evidence_ids = sorted(旧 ∪ 新)，occurrences = len(合并后)
-              first_seen/last_seen 拓宽，updated += 1
-          changed 才 _save_curated(list(by_key.values()))
-          return DistillReport(scanned=len(aged), ...)
+        三段式——**筛、分组、落地**：
+
+        1. **筛**：先按年龄线（`cutoff`）过一遍，再剔掉已经进过条目的证据
+           （`processed`）。后者就是**幂等的钥匙**：晋升只建立"证据 -> 条目"
+           的指针，原始日志一行不动，所以重复跑时靠"这条事实已经指向某个
+           条目了"来跳过，而不是靠删掉它。
+        2. **分组**：`_entry_key(kind, content)` 是内容寻键——同一件事的多次
+           出现（大小写/空格差异被 `_normal_form` 吃掉）会自动落进同一组。
+           本课没有修订链、没有 supersession，"同内容"就是"同一条记忆"。
+        3. **落地**：一组要么**新建**一个条目（证据整体搬进 `evidence_ids`），
+           要么**合并**进已有条目（取并集）。合并是幂等更新，不是新条目。
+
+        代表事实的选法是 `(-importance, recorded_at, fact_id)` 取最小——**最
+        重要优先，同重要度取最早的那条措辞**。为什么要在意这个：同一内容的
+        几种写法里总要挑一个显示，挑法必须确定，否则每次 distill 出来的
+        `MEMORY.md` 都可能不一样，派生视图就失去了"可复现"这个前提。
+
+        账目（`DistillReport`）：`scanned` 是**过了年龄线且没处理过**的事实数
+        ——把"已处理"也算进去的话，第二次跑就永远是"扫了 N 条却什么都没发生"，
+        看不出来是幂等还是坏了。`skipped` 用 `scanned - created - updated`
+        收口，保证恒等式不会因为某个分支漏写而失衡（它的准确含义见
+        `DistillReport` 的字段说明，**不等于**"被门槛拦下的事实数"）。
         """
-        raise NotImplementedError("TODO 6: distill")
+
+        active = policy or DistillPolicy()
+        # timedelta 是日期算术："30 天前"就是现在减去一个 timedelta
+        cutoff = _as_utc(as_of) - timedelta(days=active.minimum_age_days)
+
+        existing = self._load_curated()
+        by_key = {entry.key: entry for entry in existing}
+        processed = {fid for entry in existing for fid in entry.evidence_ids}
+
+        pending = [
+            fact for fact in self.read_all_facts()
+            if _parse_timestamp(fact.recorded_at) < cutoff
+            and fact.fact_id not in processed
+        ]
+        groups: dict[str, list[MemoryFact]] = {}
+        for fact in pending:
+            if fact.kind not in STABLE_KINDS:
+                continue  # outcome 不进分组：一次测试通过不配变成长期规则
+            groups.setdefault(_entry_key(fact.kind, fact.content), []).append(fact)
+
+        eligible = 0
+        created = 0
+        updated = 0
+        for key in sorted(groups):  # 排序遍历：落盘顺序确定，diff 才稳定
+            facts = groups[key]
+            qualifies = (
+                max(item.importance for item in facts) >= active.minimum_importance
+                or len(facts) >= active.repeat_threshold
+            )
+            if not qualifies:
+                continue
+            eligible += len(facts)
+
+            stamps = sorted(item.recorded_at for item in facts)
+            incoming = sorted({item.fact_id for item in facts})
+            entry = by_key.get(key)
+            if entry is None:
+                representative = min(
+                    facts,
+                    key=lambda item: (-item.importance, item.recorded_at,
+                                      item.fact_id),
+                )
+                by_key[key] = CuratedEntry(
+                    key=key,
+                    kind=representative.kind,
+                    content=representative.content,
+                    first_seen=stamps[0],
+                    last_seen=stamps[-1],
+                    evidence_ids=incoming,
+                    occurrences=len(incoming),
+                )
+                created += 1
+            else:
+                merged = sorted(set(entry.evidence_ids) | set(incoming))
+                entry.evidence_ids = merged
+                entry.occurrences = len(merged)
+                entry.first_seen = min(entry.first_seen, stamps[0])
+                entry.last_seen = max(entry.last_seen, stamps[-1])
+                updated += 1
+
+        # 没有变化就不落盘：派生视图每次读都会和 canonical 比对，白写一次
+        # 只会多两次原子替换
+        if created or updated:
+            self._save_curated(list(by_key.values()))
+
+        return DistillReport(
+            scanned=len(pending),
+            eligible=eligible,
+            created=created,
+            updated=updated,
+            skipped=len(pending) - created - updated,
+        )
 
     def get_context_for_agent(self, *, recent_limit: int = MAX_CONTEXT_FACTS) -> str:
         """有界注入：curated 视图 + 最近 N 条事实，超预算的截掉。
@@ -420,7 +662,31 @@ class WorkspaceMemory:
         边界的意义（教材）：memory 的价值不在存得多，在召回时有预算和
         优先级——把全部日志塞回上下文就退化成 s09 了。
         """
-        raise NotImplementedError("TODO 7: get_context_for_agent")
+
+        parts: list[str] = []
+
+        # 第一段：策展视图（蒸馏出来的长期记忆）。read_memory_md 顺手会修复
+        # 陈旧的 MEMORY.md，所以这里拿到的永远是"和 canonical 一致"的版本。
+        curated = self.read_memory_md().strip()
+        if curated:
+            parts.append(curated)
+
+        # 第二段：最近 N 条原始事实——补上"刚发生但还没老到能晋升"的那些。
+        # recent_limit <= 0 时整段不要。注意**不能**直接写 facts[-recent_limit:]：
+        # 0 取负还是 0，而 facts[-0:] 等于整个列表（练习 19 记过这个坑）。
+        recent: list[MemoryFact] = []
+        if recent_limit > 0:
+            recent = self.read_all_facts()[-recent_limit:]
+        if recent:
+            lines = ["# Recent Workspace Facts", ""]
+            lines.extend(
+                f"- [{fact.kind}] {fact.content} ({fact.recorded_at[:10]})"
+                for fact in recent
+            )
+            parts.append("\n".join(lines))
+
+        # 两段都是 markdown，用空行分开才不会粘成一坨。
+        return "\n\n".join(parts) if parts else NO_MEMORY_PLACEHOLDER
 
     def read_memory_md(self) -> str:
         """读 MEMORY.md；与 canonical 不一致时顺手修复（派生视图可重建）。"""

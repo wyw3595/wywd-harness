@@ -32,8 +32,12 @@
 （离线可用：不设 DEEPSEEK_API_KEY 时 choose_model 给 FakeModel）。
 """
 
+import base64
+import binascii
 import json
+import os
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -48,6 +52,7 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from scripts import native_dialog             # noqa: E402
 from scripts.shell import SidecarShell          # noqa: E402
 from src.harness.jsonl_store import JsonlSessionStore  # noqa: E402
 from src.harness.session import (              # noqa: E402
@@ -65,6 +70,18 @@ EVENT_RING_MAX = 500
 # SSE 心跳间隔：静默这么久就写一行注释保活，同时借此发现对面已经走了。
 # 15 秒是常识区间——小于常见中间设备 60 秒空闲断连，又不至于太吵。
 SSE_HEARTBEAT = 15.0
+# 工作区上传（s11）：压缩包原始字节的上限，以及整个请求体（base64 后套
+# JSON 外壳）的上限。后者必须更大：base64 有 33% 膨胀。
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+MAX_BODY_BYTES = 48 * 1024 * 1024
+
+# 这三个会话动作必须带**显式** sid（值是动作的中文名，用来拼错误文案）。
+# 为什么在 web 层硬拦：壳侧的 close/resume/forget 都是 `target = sid or self._sid`
+# ——空 sid 会被静默解释成"当前会话"（终端不带参数是有意的）。可网页是多 tab 的，
+# 这一层根本没有"当前会话"这个概念。空 sid 漏下去 = "删除这一行"变成"删除当前
+# 那个"，删错了还不报错，是最难查的那种坏法。
+_SID_REQUIRED_ACTIONS = {"close": "关闭会话", "resume": "复活会话",
+                         "forget": "遗忘会话"}
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -148,6 +165,19 @@ class EventRing:
 
         with self._changed:
             self._changed.notify_all()
+
+    def close(self) -> None:
+        """收尾的另一个名字：唤醒所有等待者。
+
+        合流（2026-09-15）说明：s11 那条线的 EventRing 用的是"订阅队列 +
+        哨兵"式实现，它有个 close() 负责给每个订阅者发哨兵让他们收摊；
+        本文件采用的是 Condition 式实现（wait_for / wake_all），合流时
+        选了后者（Vue 前端与 master 的 SSE 测试都是按这套写的）。
+        保留 close() 这个名字是为了让 s11 那边在工作区测试的 tearDown 里
+        写的 `ring.close()` 继续可用——语义对齐到 wake_all，没有第二套机制。
+        """
+
+        self.wake_all()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -239,20 +269,52 @@ class WebApp:
     """
 
     def __init__(self, shell: Any = None, store_root: Optional[str] = None,
-                 approval_timeout: float = APPROVAL_TIMEOUT) -> None:
+                 approval_timeout: float = APPROVAL_TIMEOUT,
+                 shell_factory: Any = None) -> None:
         self.ring = EventRing()
         self.board = ApprovalBoard(self.ring, approval_timeout)
         self.store = JsonlSessionStore(store_root or SESSIONS_ROOT)
         # 收尾标志：SSE 是长连，每条约占一个线程。停服务时先竖旗、再
         # wake_all()，它们醒来看到旗就自己收摊。
         self.stopping = False
-        if shell is not None:
-            self.shell = shell
-        else:
-            self.shell = SidecarShell(
-                user_prompt=self.board.request,
-                on_event=self._record_event,
-            )
+        # 造壳的工厂：默认造真 SidecarShell（**不启动**），测试可以注入假壳
+        # ——revive_shell() 靠它就地换一个新壳，不给测试留口子就没法单测。
+        self._shell_factory = shell_factory or (lambda: SidecarShell(
+            user_prompt=self.board.request,
+            on_event=self._record_event,
+        ))
+        self.shell = shell if shell is not None else self._shell_factory()
+
+    def revive_shell(self) -> bool:
+        """sidecar 不在就就地换一个新的。返回是否真的换了。
+
+        为什么需要这一步：sidecar 是**子进程**，会因环境原因退出（本机实测：
+        宿主的"安全删除"拦下会话证据文件的 unlink，子进程当场死掉）。它一死，
+        所有走 RPC 的端点在 handler 里抛 ConnectionClosed —— 这条请求的连接
+        被直接关掉、一个字节的响应都没有，浏览器只看到 "Failed to fetch"，
+        用户以为**整个后端没起**。而 web_app 自己还活着，所以"重启服务"这个
+        动作在用户看来既不明显也不该是必需的。
+
+        代价：每次请求多一次进程存活查询（is_alive 就是 OS 层的一次状态读），
+        可以忽略。假壳（测试）没有 is_alive 时什么都不做，保持既有行为。
+        """
+
+        probe = getattr(self.shell, "is_alive", None)
+        if probe is None:
+            return False                   # 假壳：不动
+        if probe():
+            return False                   # 活着：零成本放行
+
+        try:
+            self.shell.stop()              # 幂等：把半死的壳收干净
+        except Exception:
+            pass                           # 收尾失败也得继续换新的
+        self.shell = self._shell_factory()
+        # 沿用网页入口的口径：启动不建会话（懒建），第一次发消息再建。
+        self.shell.start(create_session=False)
+        print("[web_app] sidecar 已退出 → 自动起了一个新的"
+              "（已建会话的记录仍在 .sessions/，点一下会话即可 resume）")
+        return True
 
     def _record_event(self, data: dict) -> None:
         """SidecarShell.on_event 包装：data["event"] 是事件名，其余是载荷。"""
@@ -262,9 +324,16 @@ class WebApp:
         self.ring.append(name, payload)
 
     def start(self) -> dict:
-        """启动 sidecar 子进程并建首个会话（main() 在 serve_forever 前调用）。"""
+        """启动 sidecar 子进程（main() 在 serve_forever 前调用）。
 
-        return self.shell.start()
+        **懒建会话**：传 create_session=False，启动时不建会话。理由是网页
+        入口每次重启都 spawn 新 sidecar，而前端恢复的是 localStorage 里
+        记着的更早那个 sid——启动会话就永远没人打开，只会变成侧边栏里的
+        「未命名会话」残留。真正的建会话时机交给前端：第一次发消息，或
+        点侧边栏的 ＋（两者都走 POST /api/sessions {action:"create"}）。
+        """
+
+        return self.shell.start(create_session=False)
 
     def stop(self) -> None:
         """干净收尾（幂等）：先竖旗叫醒 SSE，再走 shell.stop() 全套。"""
@@ -294,6 +363,11 @@ class WebApp:
                 return {"ok": False, "detail": f"新建会话失败：{exc}"}
             return {"ok": True, "detail": f"已新建 {new_sid}",
                     "sessionId": new_sid}
+        # 这三个动作必须带显式 sid，理由见 _SID_REQUIRED_ACTIONS 的注释。
+        # 注意 create 不该被一起拦掉（它本来就不需要 sid）。
+        if action in _SID_REQUIRED_ACTIONS and not sid.strip():
+            return {"ok": False,
+                    "detail": f"{_SID_REQUIRED_ACTIONS[action]}必须指定会话 id"}
         if action == "close":
             result = shell.close_session(sid)
             if "error" in result:
@@ -393,6 +467,131 @@ class WebApp:
             return {"ok": True, "detail": "已回执"}
         return {"ok": False, "detail": "无效或已超时的审批单"}
 
+    # ── API：工作区（上传目录）──────────────────────────────
+
+    def workspace(self) -> dict:
+        """读当前工作区。壳不认识 workspace/get 时如实降级为"默认"。"""
+
+        return self.shell.workspace()
+
+    def set_workspace(self, action: str, path: str = "",
+                      filename: str = "", data: str = "") -> dict:
+        """工作区操作：browse（弹系统选框）/ open（用给定路径）/ upload（上传
+        zip）/ reset（回到默认工作区）。
+
+        返回 {"ok": True, "detail", "workspace"} 或 {"ok": False, "detail"}
+        ——与 action() 四操作同一个人话约定（前端只认 ok/detail）。
+        browse 取消时额外带 "cancelled": True（取消不是错误，别弹红字）；
+        机制不可用时额外带 "fallback": "manual"（前端降级为手输路径）。
+        """
+
+        if action == "browse":
+            # 弹系统选框这条路自己拿路径，走完再交给下面同一段收尾
+            picked = self._browse_workspace()
+            if isinstance(picked, dict):      # 取消 / 降级：直接就是答复
+                return picked
+            result = self.shell.set_workspace("dir", picked)
+        elif action == "open":
+            if not path.strip():
+                return {"ok": False, "detail": "没给路径"}
+            result = self.shell.set_workspace("dir", path.strip())
+        elif action == "upload":
+            result = self._upload_zip(filename, data)
+        elif action == "reset":
+            # 空路径：复位不需要坐标，"默认"是 sidecar 的启动态（见 sidecar
+            # 的 _handle_workspace_set）。浏览器拿不到项目根路径，这也正是
+            # 必须由后端说"回哪儿"的原因。
+            result = self.shell.set_workspace("default", "")
+        else:
+            return {"ok": False, "detail": f"未知的工作区操作: {action}"}
+
+        if "error" in result:
+            return {"ok": False, "detail": result["error"]}
+        workspace = result.get("workspace") or {}
+        # detail 是给人看的一句话：root 是常态，但复位回的默认工作区可能
+        # 压根不报 root（装配层没告知时只有 kind），别拼出"已切到 "这种半句。
+        root = workspace.get("root") or ""
+        if root:
+            detail = f"工作区已切到 {root}"
+        elif workspace.get("kind") == "default":
+            detail = "已回到默认工作区"
+        else:
+            detail = "工作区已切换"
+        return {"ok": True, "detail": detail, "workspace": workspace}
+
+    def _browse_workspace(self) -> "str | dict":
+        """弹系统目录选择框，返回路径字符串；返回 dict 表示"这一趟到此为止"
+        （用户取消 / 机制不可用要降级），那个 dict 就是最终答复。
+
+        为什么要降级而不是报错：弹不出框的原因可能是"这台机器根本没有图形
+        环境"（服务跑在服务器上/精简解释器）。那是**环境限制，不是用户做错
+        了什么**——此时退回手输路径，功能还在。把它当错误弹红字，用户只会
+        觉得"按钮坏了还没法绕"。
+
+        全程打日志：服务端看不到屏幕，"点了按钮没反应"这种反馈，除了调用链
+        本身没有别的证据来源。日志分三段（开始/子进程结果/最终去向），
+        哪一段缺了就知道卡在哪。
+        """
+
+        # 起始目录：当前就在某个工作区里，就从那儿开始，省得每次从头翻
+        current = (self.workspace().get("workspace") or {}).get("root") or ""
+        print(f"[web_app] browse 开始（起始目录 {current or '用户主目录'}）")
+        try:
+            picked = native_dialog.pick_directory(
+                initial=current if Path(current).is_dir() else "")
+        except native_dialog.DialogUnavailable as exc:
+            print(f"[web_app] browse 降级为手输：{exc}")
+            return {"ok": False, "fallback": "manual",
+                    "detail": f"这台机器弹不出系统选框（{exc}），改成手输路径吧"}
+        except TimeoutError as exc:
+            print(f"[web_app] browse 超时：{exc}")
+            return {"ok": False, "detail": str(exc)}
+
+        if not picked:
+            # 取消不是错误：前端不该弹红字，也不该改任何状态
+            print("[web_app] browse 用户取消（没选任何目录）")
+            return {"ok": False, "cancelled": True, "detail": "已取消选择"}
+
+        print(f"[web_app] browse 选中 → {picked}")
+        return picked
+
+    def _upload_zip(self, filename: str, data_b64: str) -> dict:
+        """把浏览器上传的 zip 落成临时文件 → 交 sidecar 解压 → 删临时文件。
+
+        为什么走 base64 JSON 而不是 multipart/form-data：multipart 要手写
+        边界解析（一个很容易写出漏洞、且很难读的活）。本项目宁可用 33% 的
+        编码膨胀换一份能一眼读完的解析代码——教学边界在这儿，不在省流量。
+
+        临时文件放**系统 temp**、解开后立刻删：上传的包只是运输工具，
+        留痕的是解压出来的工作区（workspaces/<id>/）。子进程读得它——同一
+        文件系统，与父进程谁写谁读无关。
+
+        三道校验都在"花力气之前"：base64 合法 → 非空 → 大小合适。
+        """
+
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except (binascii.Error, ValueError):
+            return {"error": "上传内容不是合法的 base64"}
+        if not raw:
+            return {"error": "上传的压缩包是空的"}
+        if len(raw) > MAX_UPLOAD_BYTES:
+            return {"error": (f"压缩包过大（{len(raw)} 字节，"
+                              f"上限 {MAX_UPLOAD_BYTES}）——"
+                              f"只打包需要模型处理的部分")}
+
+        suffix = Path(filename or "upload.zip").suffix or ".zip"
+        descriptor, temp_name = tempfile.mkstemp(prefix="wywd-upload-",
+                                                suffix=suffix)
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "wb") as sink:
+                sink.write(raw)
+            return self.shell.set_workspace("zip", str(temp_path))
+        finally:
+            # 解压由 sidecar 在 RPC 内完成：返回即意味着包已经不需要了。
+            temp_path.unlink(missing_ok=True)
+
 
 # ═══════════════════════════════════════════════════════════════
 # HTTP 层 — 路由 /api/* 到 WebApp，其余从 public/ 服务静态文件
@@ -442,6 +641,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", _MIME.get(path.suffix.lower(),
                                                    "application/octet-stream"))
+        # 开发期禁缓存（s11 加）：改了前端文件必须立刻生效，否则会陷入
+        # "后端已经修好了、你还看到旧界面"的白折腾。这是本地开发服务，
+        # 没有带宽顾虑，禁缓存的代价是零。
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -499,6 +702,7 @@ class _Handler(BaseHTTPRequestHandler):
         if app is None:
             self._send_json(500, {"error": "web_app 未初始化"})
             return
+        app.revive_shell()      # sidecar 死了就地换一个（见 WebApp.revive_shell）
         if path == "/api/sessions":
             self._send_json(200, app.sessions())
         elif path.startswith("/api/sessions/") and path.endswith("/messages"):
@@ -516,6 +720,8 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 after = 0
             self._send_json(200, app.events(after))
+        elif path == "/api/workspace":
+            self._send_json(200, app.workspace())
         elif path.startswith("/api/"):
             self._send_json(404, {"error": "not found"})
         else:
@@ -528,8 +734,22 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ── POST ────────────────────────────────────────────────
 
-    def _read_json(self) -> dict:
-        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0)
+    def _read_json(self) -> Optional[dict]:
+        """读请求体（JSON）。超限返回 None——调用方回 413，别把大包读进内存。
+
+        Content-Length 是客户端声称的（可以撒谎），但它足够用来做**早退**：
+        声称超限就直接拒，不读；声称不超限则最多读这么多字节，后面的
+        字节留在连接里由 close_connection 一起丢掉（HTTP/1.1 下必须关连接，
+        否则残留字节会被当成下一个请求的帧头）。
+
+        这道闸是随工作区上传（s11）加的：上传一个 zip 会走 base64 塞进 JSON，
+        不设上限的话一个伪造的大 Content-Length 就能把内存打满。
+        """
+
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > MAX_BODY_BYTES:
+            return None
+        raw = self.rfile.read(length) if length else b""
         if not raw:
             return {}
         try:
@@ -544,7 +764,14 @@ class _Handler(BaseHTTPRequestHandler):
         if app is None:
             self._send_json(500, {"error": "web_app 未初始化"})
             return
+        app.revive_shell()      # sidecar 死了就地换一个（见 WebApp.revive_shell）
         body = self._read_json()
+        if body is None:
+            # 超限：拒绝并关连接（不让残留字节污染下一条请求的解析）
+            self.close_connection = True
+            self._send_json(413, {
+                "error": f"请求体过大（上限 {MAX_BODY_BYTES} 字节）"})
+            return
         if path == "/api/sessions":
             self._send_json(200, app.action(body.get("action", ""),
                                             body.get("sid", "")))
@@ -554,6 +781,19 @@ class _Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/approvals/"):
             ticket = path[len("/api/approvals/"):]
             self._send_json(200, app.approve(ticket, body.get("approved")))
+        elif path == "/api/workspace":
+            action = body.get("action", "")
+            # browse 会在**用户桌面上弹一个系统对话框**——这是本地服务不该让
+            # 任意网页触发的动作。跨站表单发不出自定义头（要发就得先过 CORS
+            # 预检，而本服务不答预检），所以要求一个自定义头就挡住了。
+            # 前端固定带上它（见 public/src/api.js 的 workspaceAction）。
+            if action == "browse" and self.headers.get("X-Wywd-Ui") != "1":
+                self._send_json(403, {"ok": False,
+                                      "detail": "拒绝：缺少界面标识头"})
+                return
+            self._send_json(200, app.set_workspace(
+                action, body.get("path", ""),
+                body.get("filename", ""), body.get("data", "")))
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -570,7 +810,7 @@ def main() -> None:
     try:
         pong = app.start()
         print(f"[web_app] sidecar/ping → {pong.get('status')}")
-        print(f"[web_app] 首个会话 → {app.shell.session_id}")
+        print("[web_app] 会话懒建：启动不建会话，首次发消息 / 点 ＋ 才建")
         print(f"[web_app] 服务已就绪：http://{HOST}:{PORT}（Ctrl+C 退出）")
         server.serve_forever()
     except KeyboardInterrupt:

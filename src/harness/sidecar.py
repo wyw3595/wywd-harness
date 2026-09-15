@@ -38,6 +38,15 @@
   新增 session/resume（旧 id + generation+1 的新运行时，live 拒绝）和
   session/forget（真删除，必须先 close）；agent/send 改走 run_turn——
   并发拒绝、晚到结果拒收从此由状态机接管，不再靠手工回写字典。
+
+📚 s11（工作区/上传目录）：新增 workspace/set + workspace/get 两条领域路由，
+  让"沙箱根"在进程活着的时候也能换——这是"上传一个目录，模型在这个目录里
+  工作"在 sidecar 架构下的落点。机制靠**注入的工厂**：harness 不认识
+  Workspace，装配层把"收 {kind, path} → 返回 (registry, policy, info)"
+  的构建器交进来（依赖方向仍然只有一边：装配层 import harness，反之不成立）。
+  换的为什么是 registry + policy + runner 而不是 model：工具 schema 只由
+  名字/描述/签名决定，与沙箱根无关（说明书可以复用）；而 registry 和
+  policy 本身就是边界——它们才是必须换的东西。
 """
 
 import json
@@ -57,6 +66,13 @@ from src.harness.session import (
     SessionStore,
 )
 from src.harness.tools import ToolRegistry
+
+# 工作区运行件工厂（s11 上传目录）：由装配层注入，harness 不认识 Workspace。
+# 契约：收一个 JSON 化的请求 {"kind": "dir"|"zip", "path": ...}，成功返回
+# (registry, policy, info)——info 是给 UI 看的不透明字典（id/root/kind），
+# harness 只负责原样转交；失败**必须翻成 ValueError / OSError 抛出**
+# （RPC 层只有这一条错误通道，与 session 四操作的约定一致）。
+WorkspaceRuntimeBuilder = Callable[[dict], tuple]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -164,6 +180,18 @@ class SidecarServer:
       max_history —— 会话历史窗口大小（成本刹车，默认 20）
       history_seed —— Callable[[], list[dict]]：新建会话的起步历史
                   （装配层传 lambda: with_system([])，system 常驻）
+      runtime_builder —— 工作区工厂（s11，可选）：换沙箱时现做一套运行件，
+                  None = 不支持换沙箱（老装配零感知）
+      initial_workspace —— 启动态工作区的描述（s11，可选）：装配层把自己的
+                  默认根如实告知（如 {"kind": "default", "root": "..."}）。
+                  给它的唯一理由是**显示**：复位后 UI 要能告诉用户"现在在
+                  哪个目录"，而 sidecar 手上只有 registry，认不出路径。
+                  不给则回落到 {"kind": "default"}（老装配零感知）。
+      idle_timeout —— 空闲回收阈值（秒）：某代运行时闲置超过它就被 close
+                  （**记录保留**，前端点一下即可 resume）。**0 = 不回收**，
+                  这是默认值：回收会让"随时发消息都能用"变成"可能要先复活"，
+                  该由调用方明确选择，而不是悄悄改掉所有人的手感。
+      sweep_interval —— 后台扫描周期（秒），只在 idle_timeout > 0 时有意义。
 
     agent 执行走现有 run_agent（s01~s03 的循环 + s04 的权限闸门），
     session 存 history（练习 10 铁律：Harness 无状态，记忆归应用层）。
@@ -182,10 +210,26 @@ class SidecarServer:
         max_history: int = 20,
         history_seed: Optional[Callable[[], list[dict]]] = None,
         store: Optional[SessionStore] = None,
+        runtime_builder: Optional[WorkspaceRuntimeBuilder] = None,
+        initial_workspace: Optional[dict] = None,
+        idle_timeout: float = 0.0,
+        sweep_interval: float = 60.0,
     ) -> None:
         self._model = model
         self._registry = registry
         self._policy = policy
+        # s11 复位用：留住启动时那套运行件。为什么记在进程里而不是让装配层
+        # 再解析一次"默认路径"——"默认"是**这个进程的启动态**，不是某个目录。
+        # 装配层传的是什么（项目根/别处），reset 就回到什么，无需它再表态。
+        # 描述（root 等）同样留住：registry 认不出路径，UI 却要显示它。
+        self._initial_registry = registry
+        self._initial_policy = policy
+        self._initial_workspace_info: dict = dict(initial_workspace
+                                                 or {"kind": "default"})
+        # s11：工作区工厂（None = 这个 sidecar 不支持换沙箱，老装配零感知）。
+        # 默认 info 说明"我跑在启动时那套边界上"，UI 拿它显示"项目根"。
+        self._runtime_builder = runtime_builder
+        self._workspace_info: dict = dict(self._initial_workspace_info)
         self._max_history = max_history
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
@@ -215,6 +259,56 @@ class SidecarServer:
         self._runner: Optional[GovernedToolRunner] = None
         self._on_event: Optional[Callable[[str, dict], None]] = None
         self._register_channels()
+        # 空闲回收：阈值 0 = 不起线程（默认）。
+        # 用独立的 stop 事件，而不是复用 _shutdown：回收线程该能单独停——
+        # 复用 _shutdown 会连同连接循环一起掀掉（测试里想"停下来单独验
+        # resume"就做不到，只能跟回收赛跑）。
+        self._idle_timeout = idle_timeout
+        self._sweep_interval = sweep_interval
+        self._reaper_stop = threading.Event()
+        self._reaper: Optional[threading.Thread] = None
+        if idle_timeout > 0:
+            self._start_reaper()
+
+    # ── 空闲回收（后台线程）──────────────────────────────────
+
+    def _start_reaper(self) -> None:
+        """起后台回收线程。daemon=True：它是清理工，不该拦住进程退出。"""
+
+        self._reaper = threading.Thread(
+            target=self._reaper_loop, name="wywd-idle-reaper", daemon=True)
+        self._reaper.start()
+
+    def stop_reaper(self) -> None:
+        """停掉回收线程并等它退出（幂等）。关机路径与测试都用它。"""
+
+        self._reaper_stop.set()
+        if self._reaper is not None:
+            self._reaper.join(timeout=2)
+
+    def _reaper_loop(self) -> None:
+        """每 sweep_interval 秒扫一次，把空闲超时的运行时 close 掉。
+
+        为什么用后台线程，而不是"顺手在每次 RPC 里扫一遍"：空闲回收要解决的
+        恰恰是**没有请求时**的内存占用——挂在请求上等于"有人来才打扫"，
+        没人来就永远不打扫，等于没做。
+        """
+
+        while not self._shutdown:
+            # 用 Event.wait 而不是 sleep：停线程时能被立刻叫醒，
+            # 不用让关机卡在等满一个扫描周期上。
+            if self._reaper_stop.wait(self._sweep_interval):
+                break
+            try:
+                reaped = self._manager.reap_idle(self._idle_timeout)
+            except Exception as exc:
+                # 后台清理出错绝不能拖垮整个 sidecar：记一行、下轮再来。
+                self._log(f"idle reap failed: {exc}")
+                continue
+            if reaped:
+                self._log(f"idle reap: released {len(reaped)} runtime(s) "
+                          f"({', '.join(reaped)})"
+                          " —— records kept, resume to continue")
 
     def _register_channels(self) -> None:
         """注册领域化 RPC handler——未来 s07 会话 / s16 skills / s17 MCP
@@ -233,6 +327,9 @@ class SidecarServer:
         self.rpc_handlers["session/messages"] = self._handle_session_messages
         self.rpc_handlers["agent/send"] = self._handle_agent_send
         self.rpc_handlers["tool/list"] = self._handle_tool_list
+        # s11：工作区（上传目录）——换沙箱 + 读当前。
+        self.rpc_handlers["workspace/set"] = self._handle_workspace_set
+        self.rpc_handlers["workspace/get"] = self._handle_workspace_get
 
     def _make_turn_runner(self):
         """造 turn_runner 闭包：session 层的执行入口 → 本文件的 run_agent。
@@ -336,6 +433,11 @@ class SidecarServer:
             "ringBufferTotal": self.ring_buffer.size,
             "ringBufferFull": self.ring_buffer.is_full,
             "handlers": len(self.rpc_handlers),
+            # s11：当前工作区（UI 用它显示"模型现在在哪个目录里干活"）。
+            "workspace": dict(self._workspace_info),
+            # 空闲回收：0 表示没开。运维抽屉靠它显示"回收开着没、阈值多少"——
+            # "运行时为什么被释放了"必须有个能看见的答案。
+            "idleTimeout": self._idle_timeout,
         }
         # s08：模型挂了路由器就捎上成本表。duck typing（getattr 三参：
         # 读属性，没有就给 None）——裸 FakeModel/RealModel 没有
@@ -353,6 +455,7 @@ class SidecarServer:
 
     def _handle_shutdown(self, params: dict) -> dict:
         self._shutdown = True
+        self.stop_reaper()        # 回收线程是独立开关，得单独放它走
         self._log("shutdown requested")
         return {"status": "shutting down"}
 
@@ -424,7 +527,7 @@ class SidecarServer:
         except SessionLifecycleError as exc:
             return {"error": str(exc)}
         if not forgot:
-            return {"error": f"session not found: {sid}"}
+            return {"error": f"没有这个会话：{sid}（可能已被删除）"}
         self._log(f"session forgotten: {sid}")
         return {"status": "ok"}
 
@@ -435,6 +538,62 @@ class SidecarServer:
             {"name": tool.name, "description": tool.description}
             for tool in self._registry._tools.values()
         ]}
+
+    # ── 工作区（s11：上传目录）──────────────────────────────
+
+    def _handle_workspace_set(self, params: dict) -> dict:
+        """换工作区：让装配层现做一套运行件，换掉本进程的 registry/policy。
+
+        三层连带更新，缺一层就是"半换沙箱"（且失败是静默的）：
+          1. registry —— 工具闭包捕获的 root（换成新目录）；
+          2. policy   —— WorkspaceScope 的根（决策层必须和执行层同一个根，
+             否则模型越界时决策层以为在界内、执行层才炸）；
+          3. runner   —— 它**构造时**绑定 registry/policy，不重建就还在用
+             旧沙箱（这一层最容易漏：前两层改了、跑起来还是老边界）。
+
+        model 刻意不换：工具 schema 与沙箱根无关（名字/描述/签名不变），
+        说明书可以复用；换它反而是浪费（RealModel 每次重建都有连接池成本）。
+
+        已建会话的历史**不动**：历史属于会话（应用层状态），工作区属于
+        边界——混在一起会让"换个目录看看"变成"清空对话"。代价是旧历史里
+        的路径在新沙箱可能不存在（模型会收到"没有这个路径"，它会自己适应）。
+
+        kind="default" 是**复位**：回启动态（构造时注入的那套运行件），
+        不走工厂——"默认"不是一个可解析的目录，而是这个进程出生的地方。
+        所以复位永远可用，哪怕没注入工厂（`_runtime_builder is None`）。
+        """
+
+        if params.get("kind") == "default":
+            # 复位：不碰工厂，直接把初始运行件放回去（info 也回启动态）。
+            registry, policy, info = (
+                self._initial_registry, self._initial_policy,
+                dict(self._initial_workspace_info))
+        else:
+            if self._runtime_builder is None:
+                return {"error": "这个 sidecar 没接工作区能力（装配层未注入 runtime_builder）"}
+            try:
+                registry, policy, info = self._runtime_builder(params)
+            except (ValueError, OSError) as exc:
+                # 唯一错误通道：装配层负责把库异常翻译成人话（见契约注释）。
+                return {"error": str(exc)}
+        self._registry = registry
+        self._policy = policy
+        self._workspace_info = dict(info)
+        if self._conn is not None:
+            # runner 是 per-connection 的（approver 绑 socket）：连接还在，
+            # 直接就地重建；没连接说明是直调（测试），留给 handle_connection。
+            self._runner = GovernedToolRunner(
+                policy=self._policy, approver=self._make_approver(self._conn),
+                registry=self._registry, audit=AuditTrail())
+        self._log("workspace switched: "
+                  + str(self._workspace_info.get("root")
+                        or self._workspace_info.get("kind", "?")))
+        return {"status": "ok", "workspace": self._workspace_info}
+
+    def _handle_workspace_get(self, params: dict) -> dict:
+        """读当前工作区（UI 渲染用）。默认态也如实回答（kind=default）。"""
+
+        return {"workspace": dict(self._workspace_info)}
 
     def _handle_session_messages(self, params: dict) -> dict:
         """读一个会话的完整消息历史（历史重放/审计的只读通道）。
@@ -471,7 +630,10 @@ class SidecarServer:
         text = params.get("message","")
         runtime = self._manager.get_session(sid)
         if runtime is None:
-            return {"error": f"session not found or closed: {sid}"}
+            # 这句会直接弹给用户看：说清"为什么发不出去"和"怎么办"。
+            # 记录还在但运行时没了 = 已关闭，复活即可（历史接着用）。
+            return {"error": (f"会话 {sid} 发不了：不存在或已关闭"
+                              "（已关闭的点\"复活\"后可以继续对话）")}
         try:
             output = runtime.run_turn(text)
         except SessionLifecycleError as exc:

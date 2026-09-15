@@ -255,6 +255,25 @@ class SessionProcess:
         self._state_lock = threading.RLock()       # 保护 record 的读改写
         self._turn_lock = threading.Lock()         # 一个会话同时最多一个 turn
         self._abort_requested = threading.Event()  # 协作式中断信号
+        # 空闲回收的账面：最后一次"被用过"的时刻（Manager.reap_idle 读它）。
+        # 为什么记在 Process 上而不是 Record 里：它是**运行时**的属性——
+        # resume 之后是一个全新的运行时，账也该从头记；而 Record 要能进
+        # Store、能序列化，不该装这种临时状态（和 turn 锁同一类东西）。
+        self.last_used_at = time.time()
+
+    # ── 空闲回收的账面 ────────────────────────────────────────
+
+    def touch(self) -> None:
+        """刷新"最后用过"的时刻。turn 开始时调一次。"""
+
+        with self._state_lock:
+            self.last_used_at = time.time()
+
+    @property
+    def idle_seconds(self) -> float:
+        """距今多久没被用过（供状态展示 / 测试断言）。"""
+
+        return time.time() - self.last_used_at
 
     # ── 只读视图（给 UI / Manager / 测试看）────────────────────
 
@@ -336,6 +355,7 @@ class SessionProcess:
                 raise SessionLifecycleError(
                     f"session {self.id} cannot accept input while {self.status}")
             self._abort_requested.clear()  # 上一轮的 abort 不传染
+            self.touch()                   # 空闲回收的账面：这一轮算"用过"
             # 第一句话顶掉默认标题（UI 列表的辨识度来源）：只动还是默认
             # 值的记录——用户/创建方显式起过名的（create 传 title）不碰。
             if self.record.title == DEFAULT_TITLE:
@@ -489,12 +509,43 @@ class SessionManager:
             self.store.save(record)
         return False
 
+    def reap_idle(self, idle_seconds: float,
+                  now: Optional[float] = None) -> list[str]:
+        """回收空闲超过 idle_seconds 的运行时：close（释放运行时），不 forget。
+
+        返回被回收的 sid 列表（测试与日志都用得上）。
+
+        **只碰 IDLE 的**，四种非 IDLE 状态各有各的理由不碰：
+          - RUNNING —— 正在跑 turn。回收是"省资源"，不是"打断用户"；
+          - ERROR   —— 有效终态，原因留在 last_error 里，该由用户决定
+                       resume 还是 forget；
+          - CREATING / CLOSING —— 过渡态，让它自己走完，别插一脚。
+        回收之后会话在前端是 closed。而"点一下就 resume"这条路早就有了
+        （前端对 closed 会话先 resume 再打开），所以用户视角只是"第一次
+        点回去慢一点"——这正是敢做回收的前提。
+
+        now 可注入：测试不想真的 sleep 十几分钟。
+        """
+
+        cutoff = (time.time() if now is None else now) - idle_seconds
+        reaped: list[str] = []
+        # list() 快照：下面 close 会改 _runtimes，边遍历边删会炸
+        for sid, runtime in list(self._runtimes.items()):
+            if runtime.status != SessionState.IDLE:
+                continue
+            if runtime.last_used_at > cutoff:
+                continue
+            self.close_session(sid)
+            reaped.append(sid)
+        return reaped
+
     def forget_session(self, session_id: str) -> bool:
         """真正删除逻辑记录；live 的必须先 close。"""
 
         if session_id in self._runtimes:
             raise SessionLifecycleError(
-                f"close session {session_id} before forgetting its record")
+                f"会话 {session_id} 还在运行，先关闭再删除"
+                "（关闭只是释放运行时，历史仍保留）")
         return self.store.delete(session_id)
 
     def shutdown_all(self) -> None:

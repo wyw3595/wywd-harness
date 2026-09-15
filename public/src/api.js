@@ -16,10 +16,10 @@ async function get(path) {
   return res.json();
 }
 
-async function post(path, body) {
+async function post(path, body, headers = {}) {
   const res = await fetch(path, {
     method: "POST",
-    headers: JSON_HEADERS,
+    headers: { ...JSON_HEADERS, ...headers },
     body: JSON.stringify(body),
   });
   return res.json();
@@ -68,6 +68,24 @@ export function fetchStatus() {
     所以这里拿到的永远是 {"logs": "…"}——不会是个 error 对象。 */
 export function fetchLogs() {
   return get("/api/logs");
+}
+
+// ── 工作区（让 agent 在哪个目录里干活）───────────────────
+
+/** 读当前工作区。壳不认识 workspace/get 时后端会如实降级为"默认"。 */
+export function fetchWorkspace() {
+  return get("/api/workspace");
+}
+
+/** 工作区操作。action ∈ browse | open | upload | reset。
+
+    `X-Wywd-Ui` 不是装饰：browse 会在**用户桌面上弹一个系统对话框**，
+    本地服务不该让任意网页触发它。跨站表单发不出自定义头（要发就得先过
+    CORS 预检，而本服务不答预检），所以这一个头就把它挡在门外了。
+    后端只对 browse 校验这个头（见 web_app 的 do_POST）。
+*/
+export function workspaceAction(action, opts = {}) {
+  return post("/api/workspace", { action, ...opts }, { "X-Wywd-Ui": "1" });
 }
 
 // ── SSE 事件长连（替代原来的 500ms 轮询）─────────────────

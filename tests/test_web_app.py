@@ -6,20 +6,31 @@ scripts/sidecar_panel.py / scripts/shell.py 的测试套路：
   - 历史读用真 JsonlSessionStore（tempfile 目录），不碰真实 .sessions/。
 """
 
+import base64
 import copy
+import io
 import json
 import re
+import socket
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
+import zipfile
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
+from scripts import native_dialog
 from scripts.web_app import (
+    MAX_BODY_BYTES,
     PUBLIC_DIR,
     ApprovalBoard,
     EventRing,
     WebApp,
+    _Handler,
     _static_path,
     sse_frame,
 )
@@ -35,6 +46,7 @@ class FakeShell:
         self._rows = rows
         self.sent: list[tuple[str, str]] = []
         self.ops: list[tuple[str, str]] = []
+        self.zip_existed: bool | None = None   # set_workspace 那刻 zip 在不在盘上
 
     def sessions(self) -> dict:
         return {"sessions": copy.deepcopy(self._rows)}
@@ -69,6 +81,17 @@ class FakeShell:
 
     def logs(self) -> str:
         return "[12:00:00] [sidecar] 罐头日志"
+
+    def workspace(self) -> dict:
+        return {"workspace": {"kind": "default", "id": "default", "root": "."}}
+
+    def set_workspace(self, kind: str, path: str) -> dict:
+        self.ops.append(("set_workspace", kind + ":" + path))
+        self.zip_existed = Path(path).is_file()
+        if kind == "zip" and not self.zip_existed:
+            return {"error": "压缩包不在了"}
+        return {"status": "ok",
+                "workspace": {"kind": kind, "id": "ws1", "root": path}}
 
     def stop(self) -> None:
         pass
@@ -127,6 +150,36 @@ class WebAppActionsTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("live session", result["detail"])
 
+    def test_row_actions_refuse_empty_sid(self) -> None:
+        """空 sid 必须在 web 层被拦住，**不落到壳里**。
+
+        壳的 close/resume/forget 都是 `target = sid or self._sid`：空值会被
+        静默当成"当前会话"。前端一旦漏传（真实发生过：按钮上没有 data-sid），
+        "删除这一行"就变成"删除当前那个"，而且删完还弹成功——最难查的那种
+        坏法。网页是多 tab 的，本层没有"当前会话"这个概念，所以这里硬拒。
+        """
+
+        for action in ("close", "resume", "forget"):
+            with self.subTest(action=action):
+                before = list(self.shell.ops)
+                result = self.app.action(action, "")
+                self.assertFalse(result["ok"])
+                self.assertIn("会话 id", result["detail"])
+                self.assertEqual(self.shell.ops, before)   # 没到壳那一步
+
+    def test_row_actions_refuse_whitespace_sid(self) -> None:
+        """空白 sid 同样拦——"看着有值但其实是空的"更难发现。"""
+
+        result = self.app.action("forget", "   ")
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.shell.ops, [])
+
+    def test_create_needs_no_sid(self) -> None:
+        """但 create 本来就不需要 sid，别把它一起拦掉。"""
+
+        self.assertTrue(self.app.action("create")["ok"])
+        self.assertEqual(self.shell.ops, [("new_session", "")])
+
     def test_unknown_action(self) -> None:
         result = self.app.action("fly")
         self.assertFalse(result["ok"])
@@ -164,6 +217,188 @@ class WebAppActionsTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("新建会话失败", result["detail"])
         self.assertIn("sidecar", result["detail"])
+
+
+def _zip_b64(entries: dict) -> str:
+    """造一个内存里的 zip 并 base64 —— 测上传路径用（不碰磁盘）。"""
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        for name, text in entries.items():
+            zf.writestr(name, text)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+class WorkspaceApiTests(unittest.TestCase):
+    """工作区 API（s11）：open 转发 / upload 落盘即删 / 错误翻译成人话。
+
+    三个边界各有断言：路径空（不发车）、base64 坏（不发车）、壳报错
+    （翻成 ok=False）——错在前端能看见的地方，别让它变成一个静默的
+    "什么都没发生"。
+    """
+
+    def setUp(self) -> None:
+        self.shell = FakeShell([])
+        self.app = WebApp(shell=self.shell)
+
+    def test_get_passthrough(self) -> None:
+        self.assertIn("workspace", self.app.workspace())
+
+    def test_open_forwards_dir_to_shell(self) -> None:
+        """路径两头空白要被 strip 掉——手输路径最容易多带空格。"""
+
+        result = self.app.set_workspace("open", path="  D:/proj  ")
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/proj")])
+        self.assertIn("D:/proj", result["detail"])
+
+    def test_open_without_path_does_not_reach_shell(self) -> None:
+        result = self.app.set_workspace("open", path="   ")
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.shell.ops, [])
+
+    def test_unknown_action(self) -> None:
+        result = self.app.set_workspace("fly")
+        self.assertFalse(result["ok"])
+        self.assertIn("未知的工作区操作", result["detail"])
+
+    def test_shell_error_becomes_ok_false(self) -> None:
+        def bad(kind: str, path: str) -> dict:
+            return {"error": "不是可用的目录：X:/nope"}
+        self.shell.set_workspace = bad
+        result = self.app.set_workspace("open", path="X:/nope")
+        self.assertFalse(result["ok"])
+        self.assertIn("不是可用的目录", result["detail"])
+
+    def test_upload_writes_temp_zip_then_deletes_it(self) -> None:
+        """关键时序：**壳被调用的那一刻**包必须在盘上（子进程要读它），
+        但 RPC 返回后必须已经删掉（上传包不留痕）。"""
+
+        result = self.app.set_workspace(
+            "upload", filename="proj.zip", data=_zip_b64({"a.txt": "hi"}))
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(self.shell.zip_existed)
+        kind, path = self.shell.ops[-1][1].split(":", 1)
+        self.assertEqual(kind, "zip")
+        self.assertFalse(Path(path).exists())
+
+    def test_upload_rejects_bad_base64(self) -> None:
+        result = self.app.set_workspace("upload", filename="p.zip",
+                                        data="这不是 base64!!!")
+        self.assertFalse(result["ok"])
+        self.assertIn("base64", result["detail"])
+        self.assertEqual(self.shell.ops, [])   # 没到壳那一步
+
+    def test_upload_rejects_empty_payload(self) -> None:
+        result = self.app.set_workspace("upload", filename="p.zip", data="")
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.shell.ops, [])
+
+    def test_reset_forwards_default_without_path(self) -> None:
+        """复位发的是 kind=default + 空路径：前端本来就不知道项目根在哪，
+        也不该假装知道——"默认"由后端定义。"""
+
+        result = self.app.set_workspace("reset")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.shell.ops, [("set_workspace", "default:")])
+
+    def test_reset_detail_does_not_dangle(self) -> None:
+        """默认工作区可能不报 root（只有 kind）——别拼出"工作区已切到 "。"""
+
+        def bare(kind: str, path: str) -> dict:
+            return {"status": "ok", "workspace": {"kind": "default"}}
+        self.shell.set_workspace = bare
+
+        result = self.app.set_workspace("reset")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["detail"], "已回到默认工作区")
+
+    def test_switch_without_root_still_has_detail(self) -> None:
+        """非 default 但没 root：给通用那句，不留半句。"""
+
+        def bare(kind: str, path: str) -> dict:
+            return {"status": "ok", "workspace": {"kind": "dir"}}
+        self.shell.set_workspace = bare
+
+        self.assertEqual(self.app.set_workspace("open", path="D:/p")["detail"],
+                         "工作区已切换")
+
+    # ── browse：后端弹系统选框（不用手输路径）─────────────────
+
+    def test_browse_switches_to_picked_dir(self) -> None:
+        """选中了就切过去——路径由后端拿到，前端一个字都不用填。"""
+
+        with mock.patch("scripts.native_dialog.pick_directory",
+                        return_value="D:/picked") as pick:
+            result = self.app.set_workspace("browse")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/picked")])
+        self.assertIn("D:/picked", result["detail"])
+        pick.assert_called_once()
+
+    def test_browse_starts_from_current_workspace(self) -> None:
+        """起点用当前工作区：已经在一个目录里干活，就别每次都从头翻。
+
+        用真目录——实现会先 is_dir() 检查（给一个不存在的路径当起点，
+        系统选框会弹到怪地方），这里要验的就是"真目录会被原样传下去"。
+        """
+
+        with tempfile.TemporaryDirectory() as real:
+            self.shell.workspace = lambda: {
+                "workspace": {"kind": "dir", "root": real}}
+            with mock.patch("scripts.native_dialog.pick_directory",
+                            return_value="D:/picked") as pick:
+                self.app.set_workspace("browse")
+
+        self.assertEqual(pick.call_args.kwargs.get("initial"), real)
+
+    def test_browse_with_vanished_workspace_starts_from_home(self) -> None:
+        """当前工作区已经不在了（比如删掉了）：别把死路径当起点传给系统框。"""
+
+        self.shell.workspace = lambda: {
+            "workspace": {"kind": "dir", "root": "D:/definitely-not-here"}}
+        with mock.patch("scripts.native_dialog.pick_directory",
+                        return_value="D:/picked") as pick:
+            self.app.set_workspace("browse")
+
+        self.assertEqual(pick.call_args.kwargs.get("initial"), "")
+
+    def test_browse_cancelled_is_not_an_error(self) -> None:
+        """取消不是错误：不该弹红字，也不该碰壳（什么都没发生）。"""
+
+        with mock.patch("scripts.native_dialog.pick_directory", return_value=None):
+            result = self.app.set_workspace("browse")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["cancelled"])       # 前端靠它决定"别弹红字"
+        self.assertEqual(self.shell.ops, [])
+
+    def test_browse_unavailable_asks_frontend_to_fall_back(self) -> None:
+        """弹不出框是**环境限制**，不是用户的错——要能降级成手输，不能变死路。"""
+
+        with mock.patch("scripts.native_dialog.pick_directory",
+                        side_effect=native_dialog.DialogUnavailable("没有图形环境")):
+            result = self.app.set_workspace("browse")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["fallback"], "manual")
+        self.assertIn("没有图形环境", result["detail"])
+        self.assertEqual(self.shell.ops, [])
+
+    def test_browse_timeout_is_a_plain_error(self) -> None:
+        """超时和"弹不出"要分开：超时不该被降级成手输（用户会莫名其妙）。"""
+
+        with mock.patch("scripts.native_dialog.pick_directory",
+                        side_effect=TimeoutError("等太久了")):
+            result = self.app.set_workspace("browse")
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("fallback", result)
+        self.assertIn("等太久了", result["detail"])
 
 
 class MessagesReadTests(unittest.TestCase):
@@ -404,6 +639,20 @@ class ApprovalBoardTests(unittest.TestCase):
         self.assertFalse(board.respond("no-such-ticket", True))
 
 
+# ── 以下两类测试未被合流保留（2026-09-15）─────────────────────
+# 原 s11 那条线里放的是 EventRingSubscribeTests / _SseStream /
+# SseEndpointTests，测的是它的 EventRing 用「订阅队列 + 哨兵」式的
+# 实时推流实现（subscribe / unsubscribe / subscriber_count）。
+#
+# 合流时选了 master 那套 Condition 式实现（wait_for / wake_all），
+# 因为 Vue 3 前端与 master 自己的 EventRingTests / EventRingWaitTests /
+# SseFramingTests 都是按它写的。两套机制只留一套，所以对应的单测
+# 也就只留一份——留着另一份会指向已不存在的 API，永远是红的。
+#
+# 若将来要换回订阅式实现，找抢救包：
+#   D:////React////wywd-harness-salvage-20260915////tests////test_web_app.py/n
+
+
 class StaticServingTests(unittest.TestCase):
     def test_index_html_exists_and_servable(self) -> None:
         target = _static_path("/")
@@ -434,6 +683,192 @@ class StaticServingTests(unittest.TestCase):
             target = _static_path(ref)
             self.assertIsNotNone(target, f"{ref} 解析不到 public/ 下的文件")
             self.assertTrue(target.exists(), f"{ref} 指向的文件不存在")
+
+
+class WorkspaceHttpTests(unittest.TestCase):
+    """HTTP 层：/api/workspace 的路由 + 请求体上限是真拦在前面的。
+
+    请求体上限是安全边界（**先读再判 = 把内存交给客户端控制**），
+    它的价值就在"读到 body 之前早退"——不真发一次请求测不到这一点。
+    """
+
+    def setUp(self) -> None:
+        self.shell = FakeShell([])
+        self.app = WebApp(shell=self.shell)
+        handler = type("_TestHandler", (_Handler,), {"app": self.app})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.app.ring.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+
+    def _post(self, path: str, payload: dict,
+              ui_header: bool = False) -> tuple[int, dict]:
+        headers = {"Content-Type": "application/json"}
+        if ui_header:
+            headers["X-Wywd-Ui"] = "1"
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:      # 4xx 走这条路
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def test_post_open_reaches_shell(self) -> None:
+        status, payload = self._post(
+            "/api/workspace", {"action": "open", "path": "D:/proj"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/proj")])
+
+    def test_get_workspace(self) -> None:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/api/workspace", timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        self.assertIn("workspace", payload)
+
+    def test_browse_without_ui_header_is_rejected(self) -> None:
+        """browse 会在用户桌面上弹系统对话框——不能让任意网页触发它。
+
+        跨站表单发不出自定义头（要发就得先过 CORS 预检，本服务不答预检），
+        所以"必须有 X-Wywd-Ui"就足够挡住。缺头时必须在**到达业务逻辑前**被拒，
+        否则恶意页面照样能把框弹出来（哪怕读不到响应）。
+        """
+
+        with mock.patch("scripts.native_dialog.pick_directory") as pick:
+            status, payload = self._post("/api/workspace", {"action": "browse"})
+
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+        pick.assert_not_called()                   # 关键：根本没去弹框
+        self.assertEqual(self.shell.ops, [])
+
+    def test_browse_with_ui_header_reaches_app(self) -> None:
+        with mock.patch("scripts.native_dialog.pick_directory",
+                        return_value="D:/picked"):
+            status, payload = self._post(
+                "/api/workspace", {"action": "browse"}, ui_header=True)
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/picked")])
+
+    def test_other_actions_do_not_need_ui_header(self) -> None:
+        """只有 browse 需要那个头——别的动作别顺手一起拦掉（会白挂）。"""
+
+        status, payload = self._post(
+            "/api/workspace", {"action": "reset"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+
+    def test_static_files_are_not_cached(self) -> None:
+        """开发期禁缓存：改了前端文件必须立刻生效，否则"后端修好了、
+        你还看到旧界面"，白折腾一轮。
+
+        合流（2026-09-15）修：原来取的是 /app.js——那是 s11 那条线的
+        vanilla 前端。master 换成 Vue 3 之后 app.js 已被删除，改成
+        public/src/ 下的模块文件。断言的行为本身没变（Cache-Control
+        = no-store），只是取样文件跟着前端换了。
+        """
+
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/src/main.js", timeout=5) as resp:
+            self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
+
+    def test_oversize_body_is_rejected_without_reading_it(self) -> None:
+        """只发头部（声称超限）、不发 body——服务端必须当场 413。
+
+        这条测的正是"早退"：若实现是"先读后判"，它会卡在这里等 body，
+        客户端等不到响应（超时），测试就会红。
+        """
+
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            sock.sendall((
+                "POST /api/workspace HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {MAX_BODY_BYTES + 1}\r\n\r\n"
+            ).encode("ascii"))
+            head = sock.recv(65536).decode("utf-8", errors="replace")
+        finally:
+            sock.close()
+
+        self.assertIn("413", head.split("\r\n")[0])
+        self.assertEqual(self.shell.ops, [])       # 没碰到壳
+
+
+class FakeRevivableShell(FakeShell):
+    """能假装死活、并记录 start/stop 的假壳——revive_shell 的靶子。"""
+
+    def __init__(self, alive: bool) -> None:
+        super().__init__([])
+        self._alive = alive
+        self.started: list[bool] = []
+        self.stopped = 0
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def start(self, create_session: bool = True) -> dict:
+        self.started.append(create_session)
+        self._alive = True
+        return {"status": "ok"}
+
+    def stop(self) -> None:
+        self.stopped += 1
+        self._alive = False
+
+
+class ShellReviveTests(unittest.TestCase):
+    """sidecar 退出后的自愈。
+
+    背景（2026-09-15 现场）：sidecar 一死，所有走 RPC 的端点在 handler 里抛
+    ConnectionClosed → 这条请求的连接被直接关掉、一个字节响应都没有 → 浏览器
+    看到的是 "Failed to fetch"，用户以为**整个后端没起**。而 web_app 自己还活着，
+    所以"重启服务"不该是用户必须做的动作。
+    """
+
+    def _app(self, shell, factory) -> WebApp:
+        return WebApp(shell=shell, store_root=tempfile.mkdtemp(),
+                      shell_factory=factory)
+
+    def test_live_shell_is_left_alone(self) -> None:
+        shell = FakeRevivableShell(alive=True)
+        made: list = []
+        app = self._app(shell, lambda: made.append(1) or shell)
+
+        self.assertFalse(app.revive_shell())
+        self.assertIs(app.shell, shell)
+        self.assertEqual(made, [])          # 活着就不该造新壳
+        self.assertEqual(shell.stopped, 0)
+
+    def test_dead_shell_is_replaced(self) -> None:
+        old = FakeRevivableShell(alive=False)
+        fresh = FakeRevivableShell(alive=True)
+        app = self._app(old, lambda: fresh)
+
+        self.assertTrue(app.revive_shell())
+        self.assertIs(app.shell, fresh)
+        self.assertEqual(old.stopped, 1)           # 半死的壳被收干净
+        self.assertEqual(fresh.started, [False])   # 沿用懒建口径：启动不建会话
+
+    def test_shell_without_probe_is_untouched(self) -> None:
+        """没 is_alive 的壳（测试里的 FakeShell 就是）原样放行，行为不变。"""
+
+        shell = FakeShell([])
+        app = self._app(shell, lambda: self.fail("不该造新壳"))
+        self.assertFalse(app.revive_shell())
+        self.assertIs(app.shell, shell)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@
 
 import { computed, h, nextTick, ref, watch } from "vue";
 import { parseMarkdown } from "./markdown.js";
+import { WorkspacePanel } from "./workspace.js";
 import {
   approval,
   answerApproval,
@@ -108,6 +109,10 @@ export const Markdown = {
 export const SessionList = {
   name: "SessionList",
 
+  // 工作区面板挂在侧栏里：它是"模型在哪个目录里干活"的显示与切换处，
+  // 和会话清单一上一下、共用同一条侧栏（Codex 也是把空间信息放侧栏）。
+  components: { WorkspacePanel },
+
   setup() {
     // armed 是纯 UI 状态（"这一行正在等待二次确认"），归组件自己管，
     // 不进 store——数据层只放服务端有对应物的东西。
@@ -182,6 +187,7 @@ export const SessionList = {
           </div>
         </template>
       </div>
+      <WorkspacePanel />
       <div class="sb-foot" v-if="!ui.sidebarCollapsed" :title="cwd">{{ cwd || "—" }}</div>
     </aside>
   `,

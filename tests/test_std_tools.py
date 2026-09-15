@@ -1,9 +1,21 @@
 """标准工具集 + 工具箱装配的回归测试（std_tools 全离线，不碰模型）。"""
 
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
+from unittest import mock
 
-from src.harness.std_tools import calc, find_text, now, tree_dir
+from src.harness import file_tools
+from src.harness.std_tools import (
+    _glob_to_regex,
+    _should_skip_file,
+    calc,
+    find_text,
+    glob_files,
+    now,
+    tree_dir,
+)
 
 
 class NowTests(unittest.TestCase):
@@ -74,6 +86,179 @@ class FindTextTests(unittest.TestCase):
     def test_rejects_outside_sandbox(self) -> None:
         with self.assertRaises(PermissionError):
             find_text("whatever", root="../secret-outside")
+
+
+class GlobToRegexTests(unittest.TestCase):
+    """glob → 正则的纯函数：语义对不对全在这里打住，不用碰文件系统。"""
+
+    def test_star_does_not_cross_slash(self) -> None:
+        pattern = _glob_to_regex("src/*.py")
+        self.assertTrue(pattern.match("src/agent.py"))
+        self.assertFalse(pattern.match("src/harness/agent.py"))
+
+    def test_double_star_slash_matches_zero_or_more_dirs(self) -> None:
+        """**/ 允许零层——这正是 "**/*.py" 能命中根目录 .py 文件的原因，
+        也正是 fnmatch 做不到、必须自己翻译一回的地方。"""
+
+        pattern = _glob_to_regex("**/*.py")
+        self.assertTrue(pattern.match("agent.py"))               # 零层
+        self.assertTrue(pattern.match("src/harness/agent.py"))   # 多层
+
+    def test_double_star_in_the_middle(self) -> None:
+        pattern = _glob_to_regex("src/**/*.py")
+        self.assertTrue(pattern.match("src/agent.py"))
+        self.assertTrue(pattern.match("src/harness/agent.py"))
+
+    def test_bare_double_star_matches_anything(self) -> None:
+        pattern = _glob_to_regex("docs/**")
+        self.assertTrue(pattern.match("docs/a/b/c.txt"))
+        self.assertFalse(pattern.match("other/a.txt"))
+
+    def test_question_mark_is_exactly_one_char(self) -> None:
+        pattern = _glob_to_regex("a?.py")
+        self.assertTrue(pattern.match("ab.py"))
+        self.assertFalse(pattern.match("abc.py"))
+
+    def test_dot_is_escaped_not_a_wildcard(self) -> None:
+        """re.escape 的分内事：模式里的 "." 只能当点，不能当通配符，
+        否则 "test_*.py" 连 "test_aXpy" 都会命中。"""
+
+        pattern = _glob_to_regex("test_*.py")
+        self.assertTrue(pattern.match("test_a.py"))
+        self.assertFalse(pattern.match("test_aXpy"))
+
+    def test_case_insensitive(self) -> None:
+        self.assertTrue(_glob_to_regex("**/*.py").match("README.PY"))
+
+
+class GlobFilesTests(unittest.TestCase):
+    """按名字找：补上"读什么"的三格里缺的那一格。"""
+
+    def test_finds_project_python_files(self) -> None:
+        result = glob_files("src/**/*.py", max_results=100)
+        self.assertIn("src/harness/agent.py", result)
+        self.assertIn("src/harness/tools.py", result)
+
+    def test_double_star_reaches_nested_and_root(self) -> None:
+        result = glob_files("**/*.md", max_results=50)
+        self.assertIn("README.md", result)          # 根目录（零层）
+        self.assertIn("NEXT_SESSION.md", result)
+
+    def test_skips_ignored_dirs(self) -> None:
+        """忽略名单同样生效——第三方依赖和教材里的文件不该出现。"""
+
+        result = glob_files("**/*.py", max_results=1000)
+        self.assertIn("src/harness/tools.py", result)   # 本项目自己的要找到
+        self.assertNotIn(".venv", result)
+        self.assertNotIn("learn-workbuddy", result)
+
+    def test_explicit_root_bypasses_ignore_list(self) -> None:
+        """pattern 相对 root 解释（与 Path.glob 一致），报出的路径相对项目根。"""
+
+        result = glob_files("*.md", root="learn-workbuddy", max_results=10)
+        self.assertIn("learn-workbuddy/README.md", result)
+
+    def test_no_match_message_carries_the_pattern(self) -> None:
+        # 没找到时要把模式原样回显出来——模型据此才知道自己写的是什么。
+        result = glob_files("**/*.zzz", max_results=10)
+        self.assertIn("没有", result)
+        self.assertIn("**/*.zzz", result)
+
+    def test_truncation_hints_how_to_narrow(self) -> None:
+        result = glob_files("**/*.py", max_results=3)
+        self.assertIn("已截断", result)
+        listed = [line for line in result.splitlines() if not line.startswith("…")]
+        self.assertEqual(len(listed), 3)
+
+    def test_rejects_outside_sandbox(self) -> None:
+        with self.assertRaises(PermissionError):
+            glob_files("*.py", root="../secret-outside")
+
+
+class SkipPredicateTests(unittest.TestCase):
+    """忽略名单的纯函数：打表即可，不用碰文件系统。
+
+    _is_probably_binary 的测试在 test_file_tools.py——它已迁到 file_tools
+    （read_file 也要用，住 std_tools 会绕成循环导入）。
+    """
+
+    def test_should_skip_file_by_suffix(self) -> None:
+        for name in ("a.pyc", "logo.png", "book.pdf", "archive.ZIP", "PHOTO.JPG"):
+            with self.subTest(name=name):
+                self.assertTrue(_should_skip_file(name))
+
+    def test_should_skip_file_keeps_source_files(self) -> None:
+        for name in ("main.py", "README.md", "Makefile", ".gitignore", "config.toml"):
+            with self.subTest(name=name):
+                self.assertFalse(_should_skip_file(name))
+
+    def test_should_skip_file_only_takes_last_suffix(self) -> None:
+        # Path.suffix 只认最后一段：a.tar.gz -> ".gz"（不是 ".tar.gz"）。
+        self.assertTrue(_should_skip_file("a.tar.gz"))
+        # 没有后缀的名字返回空串，不能炸也不能误判。
+        self.assertFalse(_should_skip_file("Makefile"))
+        self.assertFalse(_should_skip_file(".env"))
+
+
+class SearchScopeTests(unittest.TestCase):
+    """搜索范围：忽略目录真的被剪枝，但"显式起点"永远放行。
+
+    用临时目录当沙箱（mock 把 ALLOWED_ROOT 换掉），不碰真实项目树。
+    patch 的前提是 find_text 在**调用时**读 file_tools.ALLOWED_ROOT
+    （它确实如此，见 std_tools 的导入注释），而不是定义时把值焊死。
+    """
+
+    def _build_tree(self, tmp: str) -> Path:
+        """造一棵含"该搜到的"和"不该搜到的"的目录树。"""
+
+        root = Path(tmp)
+        (root / "src").mkdir()
+        (root / "src" / "keep.py").write_text("NEEDLE_IN_SRC\n", encoding="utf-8")
+        (root / "__pycache__").mkdir()
+        (root / "__pycache__" / "cached.py").write_text(
+            "NEEDLE_IN_PYCACHE\n", encoding="utf-8")
+        (root / ".venv" / "Lib").mkdir(parents=True)
+        (root / ".venv" / "Lib" / "vendor.py").write_text(
+            "NEEDLE_IN_VENV\n", encoding="utf-8")
+        # 后缀挡住的那一类：名字是 .pyc，内容其实是纯文本——
+        # 内容探测救不了它，只有后缀名单能挡住。
+        (root / "copy.pyc").write_text("NEEDLE_IN_PYC_COPY\n", encoding="utf-8")
+        return root
+
+    def test_ignored_dirs_are_pruned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._build_tree(tmp)
+            with mock.patch.object(file_tools, "ALLOWED_ROOT", Path(tmp).resolve()):
+                result = find_text("NEEDLE_", root=".")
+        self.assertIn("NEEDLE_IN_SRC", result)
+        self.assertNotIn("NEEDLE_IN_PYCACHE", result)
+        self.assertNotIn("NEEDLE_IN_VENV", result)
+
+    def test_ignored_suffix_skipped_during_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._build_tree(tmp)
+            with mock.patch.object(file_tools, "ALLOWED_ROOT", Path(tmp).resolve()):
+                result = find_text("NEEDLE_IN_PYC_COPY", root=".")
+        self.assertIn("未找到匹配", result)
+
+    def test_explicit_root_bypasses_ignore_list(self) -> None:
+        """效率语义可以被参数绕过——想搜被忽略的目录就直接指过去
+        （ripgrep 同款：显式指定的路径不受忽略规则约束）。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._build_tree(tmp)
+            with mock.patch.object(file_tools, "ALLOWED_ROOT", Path(tmp).resolve()):
+                result = find_text("NEEDLE_IN_PYCACHE", root="__pycache__")
+        self.assertIn("NEEDLE_IN_PYCACHE", result)
+
+    def test_binary_content_never_matches(self) -> None:
+        """后缀挡不住的二进制（名字是 .dat）由 NUL 探测兜底。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "blob.dat").write_bytes(b"BEFORE\x00AFTER_NEEDLE")
+            with mock.patch.object(file_tools, "ALLOWED_ROOT", Path(tmp).resolve()):
+                result = find_text("AFTER_NEEDLE", root=".")
+        self.assertIn("未找到匹配", result)
 
 
 class TreeDirTests(unittest.TestCase):
@@ -179,6 +364,38 @@ class ToolboxAssemblyTests(unittest.TestCase):
         report = build_registry().token_report()
         self.assertGreater(report["full"], report["current"])
         self.assertGreater(report["saved"], 0)
+
+    def test_edit_tool_is_registered_and_visible_to_model(self) -> None:
+        from scripts.toolbox import build_registry
+
+        registry = build_registry()
+        self.assertIsNotNone(registry.get("fs_edit"))
+        names = [schema["function"]["name"] for schema in registry.model_schemas()]
+        self.assertIn("fs_edit", names)
+
+    def test_edit_tool_is_gated_by_ask_not_whitelisted(self) -> None:
+        """新增写工具的接线两头都要钉住。
+
+        漏进 WRITE_TOOLS -> 掉进 default.deny（fail-closed，表现为"工具
+        坏了"）；误进 SAFE_TOOLS -> 免审批直接放行，改状态不问人，那是真
+        的安全漏洞。两个方向各一条断言，少一条就漏一个方向。
+        """
+
+        from scripts.toolbox import SAFE_TOOLS, WRITE_TOOLS, build_policy
+        from src.harness.permissions import PermissionAction, ToolRequest
+
+        self.assertIn("fs_edit", WRITE_TOOLS)
+        self.assertNotIn("fs_edit", SAFE_TOOLS)
+
+        decision = build_policy().decide(
+            ToolRequest(
+                tool_use_id="t1",
+                name="fs_edit",
+                arguments={"path": "README.md"},
+            )
+        )
+        self.assertIs(decision.action, PermissionAction.ASK)
+        self.assertEqual(decision.rule_id, "path.write_ask")
 
 
 if __name__ == "__main__":
