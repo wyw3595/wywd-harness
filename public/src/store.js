@@ -543,6 +543,82 @@ export async function uploadWorkspaceZip(file) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 动作：目录选择器（选工作区用）
+// ═══════════════════════════════════════════════════════════
+
+/** 目录清单是服务端数据（跟 approval 同一类），所以进 store 而不是组件。
+    它是瞬态的——弹层关掉就丢，丢的成本只是重新点一下。 */
+export const fsPicker = reactive({
+  open: false,
+  path: null,        // 当前浏览到的目录；null = 起点态（还没挑盘）
+  parent: null,      // 上一级目录；null = 到底了（盘符根）
+  roots: [],         // 起点态的入口：盘符（Windows）或 /
+  entries: [],       // 当前目录下的子目录
+  error: "",
+  loading: false,
+});
+
+export async function openFsPicker() {
+  fsPicker.open = true;
+  await loadFsList("");        // 起点态：先挑盘
+}
+
+export function closeFsPicker() {
+  fsPicker.open = false;
+}
+
+/** Windows 的盘符根以 \ 结尾，别再补一个分隔符；其余目录补 / 即可。
+    混用分隔符 Windows 也认，交给后端的 resolve 一步归一。 */
+function joinPath(dir, name) {
+  const sep = /[\\/]$/.test(dir) ? "" : "/";
+  return dir + sep + name;
+}
+
+async function loadFsList(path) {
+  fsPicker.loading = true;
+  fsPicker.error = "";
+  try {
+    const data = await api.fetchFsList(path);
+    if (data && data.error) {
+      fsPicker.error = data.error;
+      return;
+    }
+    fsPicker.path = data.path || null;
+    fsPicker.parent = data.parent || null;
+    fsPicker.roots = data.roots || [];
+    fsPicker.entries = data.entries || [];
+  } catch (err) {
+    fsPicker.error = "后端没响应";
+  } finally {
+    fsPicker.loading = false;
+  }
+}
+
+export function fsEnterDir(name) {
+  if (fsPicker.loading || !fsPicker.path) return;
+  loadFsList(joinPath(fsPicker.path, name));
+}
+
+export function fsGoUp() {
+  if (fsPicker.loading || !fsPicker.parent) return;
+  loadFsList(fsPicker.parent);
+}
+
+export function fsEnterRoot(root) {
+  if (fsPicker.loading) return;
+  loadFsList(root);
+}
+
+/** 把当前浏览到的目录设为工作区。关弹层在先：切换失败的话，
+    工作区面板会自己刷回后端的事实，别让两层 UI 同时挂着。 */
+export async function pickFsDir() {
+  if (fsPicker.loading || !fsPicker.path) return;
+  const path = fsPicker.path;
+  closeFsPicker();
+  await runWorkspace("open", { path }, "切换中…");
+}
+
+// ═══════════════════════════════════════════════════════════
 // 启动
 // ═══════════════════════════════════════════════════════════
 

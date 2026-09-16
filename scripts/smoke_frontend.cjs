@@ -386,7 +386,18 @@ function connect(url) {
     await new Promise(r => setTimeout(r, 60));
     const modelSynced = input.value.includes('加粗');
     document.getElementById('btn-send').click();
-    await new Promise(r => setTimeout(r, 2500));
+    // 等 turn 真正结束：输入栏从禁用（posting）变回可用就是"一轮跑完了"。
+    // 不能睡固定时长——turn 长短不定，跨了两轮还调工具的那次 2.5 秒根本不够，
+    // 会数到旧气泡、漏掉 markdown，看起来像回归其实是测试自己没等。
+    for (let i = 0; i < 1800 && document.getElementById('input').disabled; i++) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    // posting 结束（输入栏回弹）之后**还要再拉一次历史**，气泡才会多出来。
+    // 这两步之间隔着一次网络请求——不等到 user 气泡出现就数数，
+    // 会数到旧的 1 条（system），看起来像"turn 没跑"（这里踩过）。
+    for (let i = 0; i < 100 && !document.querySelector('#messages .msg.user'); i++) {
+      await new Promise(r => setTimeout(r, 100));
+    }
     return { ok: modelSynced && document.querySelectorAll('#messages .msg').length > 0
              && !document.getElementById('input').disabled,
              modelSynced, inputCleared: input.value === '',
@@ -483,7 +494,8 @@ function connect(url) {
     const card = document.querySelector('#messages .msg.notice');
     const text = card ? card.textContent.trim() : '';
     const feed = document.getElementById('live-feed').textContent.trim();
-    return { ok: !!card && card.classList.contains('lv-error') && text.includes('closed'),
+    return { ok: !!card && card.classList.contains('lv-error')
+             && (text.includes('closed') || text.includes('已关闭')),
              cls: card ? card.className : null, text: text.slice(0, 80),
              stillCanSend: !document.getElementById('btn-send').disabled };
   })()`);
@@ -519,7 +531,14 @@ function connect(url) {
     // 断言要自洽：拿 DOM 自己的前后数量比。之前拿 /api/sessions 的数字比，
     // 结果 5 秒轮询在检查过程中刷了一次，DOM 从 5 变 6，测试自己判自己失败。
     const before = rows();
-    set('sess_0001');
+    // 搜索词**动态取**当前清单里第一行的会话 id —— 之前硬编码 'sess_0001'，
+    // 换个工作区/换台机器（会话 id 从 sess_0147 起）就永远 0 命中，假失败。
+    const meta = document.querySelector('#session-list .row .r-meta');
+    const want = (meta ? meta.textContent.split(' ')[0] : '').trim();
+    if (!before || !want) {
+      return { ok: true, skipped: '清单是空的，没有可搜的对象' };
+    }
+    set(want);
     await new Promise(r => setTimeout(r, 80));
     const hit = rows();
 

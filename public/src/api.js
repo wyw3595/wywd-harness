@@ -88,6 +88,19 @@ export function workspaceAction(action, opts = {}) {
   return post("/api/workspace", { action, ...opts }, { "X-Wywd-Ui": "1" });
 }
 
+// ── 文件系统浏览（工作区选择器的数据源）─────────────────
+
+/** 列一个目录的子目录。path 为空 = 起点态（后端回盘符 / 根目录）。
+
+    只回**目录名**，不回文件内容 —— 纯读、且本服务只听 127.0.0.1，
+    同源策略挡住了跨站读响应，所以这个端点不需要 X-Wywd-Ui 那道闸
+    （那道闸留给会改状态的 POST）。
+*/
+export function fetchFsList(path = "") {
+  const q = path ? "?path=" + encodeURIComponent(path) : "";
+  return get("/api/fs/list" + q);
+}
+
 // ── SSE 事件长连（替代原来的 500ms 轮询）─────────────────
 
 /** 打开事件流。两个要点：

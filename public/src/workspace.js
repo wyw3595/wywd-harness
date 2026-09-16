@@ -20,6 +20,7 @@
 
 import { computed, ref } from "vue";
 import {
+  openFsPicker,
   refreshWorkspace,
   runWorkspace,
   uploadWorkspaceZip,
@@ -62,14 +63,9 @@ export const WorkspacePanel = {
       return ws.root || (ws.kind === "default" ? "项目根" : "");
     });
 
-    /** 忙的时候这一行显示进度短语（"等你在系统窗口里选目录…"），
-        而不是把上半句留着让人以为卡住了。 */
+    /** 忙的时候这一行显示进度短语（"切换中…"），而不是把上半句留着
+        让人以为卡住了。 */
     const lineText = computed(() => workspace.busy || nameText.value);
-
-    async function browse() {
-      const res = await runWorkspace("browse", {}, "等你在系统窗口里选目录…");
-      if (res && res.fallback === "manual") await byPath();
-    }
 
     /** 降级路径：后端弹不出框（服务跑在没图形环境的机器上）时才手输。
         把它当死路是错的——那是环境限制，不是用户做错了什么。 */
@@ -98,7 +94,7 @@ export const WorkspacePanel = {
 
     return {
       workspace, isDefault, lineText, pathText, fileEl,
-      browse, byPath, pickZip, onZip, reset, refreshWorkspace,
+      openFsPicker, byPath, pickZip, onZip, reset, refreshWorkspace,
     };
   },
 
@@ -108,8 +104,8 @@ export const WorkspacePanel = {
         <span class="ws-title">工作区</span>
         <span class="flex"></span>
         <button type="button" class="icon-btn" :disabled="!!workspace.busy"
-                title="选择目录（弹系统窗口）" aria-label="选择目录"
-                @click="browse">&#30446;</button>
+                title="选择目录（在页面里点选）" aria-label="选择目录"
+                @click="openFsPicker">&#30446;</button>
         <button type="button" class="icon-btn" :disabled="!!workspace.busy"
                 title="上传 zip 当工作区" aria-label="上传 zip 当工作区"
                 @click="pickZip">&#20256;</button>

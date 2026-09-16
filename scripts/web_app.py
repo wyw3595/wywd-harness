@@ -36,6 +36,7 @@ import base64
 import binascii
 import json
 import os
+import string
 import sys
 import tempfile
 import threading
@@ -467,6 +468,53 @@ class WebApp:
             return {"ok": True, "detail": "已回执"}
         return {"ok": False, "detail": "无效或已超时的审批单"}
 
+    # ── API：文件系统浏览（选工作区的数据源）────────────────
+
+    def list_fs(self, path: str = "") -> dict:
+        """列一个目录的子目录，给前端的目录选择器当数据源。
+
+        **为什么由后端来列**：浏览器拿不到本地路径（File 只有 name/size/type），
+        所以"让用户点着选一个真实目录"这条路，只能由后端提供清单、前端照着
+        画。这正是 Jupyter / code-server / Filebrowser 的做法——它们都不弹
+        系统原生框，因为原生框要求服务进程能把窗口画到用户桌面上，而那条路
+        在远程 / 容器 / 沙箱里必死（native_dialog 的注释记过实测）。
+
+        **为什么只回子目录不回文件**：这个端点服务的是「选一个目录当沙箱」，
+        文件在这一步是噪声，也省得把大目录整棵树搬给前端。
+
+        不带 path = 起点态：返回盘符（Windows）或根目录，让用户先挑个盘。
+
+        **安全口径**：响应只回目录名、不回文件内容；本服务只听 127.0.0.1，
+        且同源策略挡住了跨站读响应（X-Wywd-Ui 头那套留给**会改状态**的 POST）。
+        """
+
+        target = (path or "").strip()
+        if not target:
+            return {"roots": _fs_roots()}
+
+        try:
+            resolved = Path(target).expanduser().resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            return {"error": f"打不开这个目录：{exc}"}
+        if not resolved.is_dir():
+            return {"error": f"不是一个目录：{resolved}"}
+
+        entries: list[dict] = []
+        try:
+            children = sorted(resolved.iterdir(), key=lambda p: p.name.lower())
+        except (PermissionError, OSError) as exc:
+            return {"error": f"列不出这个目录的内容：{exc}"}
+        for child in children:
+            if not child.is_dir():
+                continue                      # 只挑目录（选的是沙箱根）
+            entries.append({"name": child.name})
+
+        parent = resolved.parent
+        # 盘符根（如 D:\）的 parent 是它自己——那就没有"上一级"可去，
+        # 前端这时该给出"换一个盘"的入口。
+        parent_out = None if parent == resolved else str(parent)
+        return {"path": str(resolved), "parent": parent_out, "entries": entries}
+
     # ── API：工作区（上传目录）──────────────────────────────
 
     def workspace(self) -> dict:
@@ -597,6 +645,24 @@ class WebApp:
 # HTTP 层 — 路由 /api/* 到 WebApp，其余从 public/ 服务静态文件
 # ═══════════════════════════════════════════════════════════════
 
+def _fs_roots() -> list[str]:
+    """起点态给用户挑的"顶层入口"：Windows 是各盘符，其他平台是 /。
+
+    为什么需要这一步：Windows 上 D:\ 的 parent 还是 D:\，没有"再往上"。
+    不给盘符入口，用户就永远到不了另一块盘上他的项目目录。
+    只列**存在**的盘：光驱/不存在的盘符列出来点了也没内容。
+    """
+
+    if os.name != "nt":
+        return ["/"]
+    roots: list[str] = []
+    for letter in string.ascii_uppercase:
+        drive = f"{letter}:\\"
+        if os.path.exists(drive):
+            roots.append(drive)
+    return roots
+
+
 def _static_path(rel: str) -> Optional[Path]:
     """把 URL 相对路径解析到 public/ 下的真实文件；目录穿越 / 不存在回 None。
 
@@ -722,6 +788,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, app.events(after))
         elif path == "/api/workspace":
             self._send_json(200, app.workspace())
+        elif path == "/api/fs/list":
+            # 工作区选择器的数据源：列一个目录的子目录（纯读，无副作用）
+            self._send_json(200, app.list_fs((query.get("path") or [""])[0]))
         elif path.startswith("/api/"):
             self._send_json(404, {"error": "not found"})
         else:

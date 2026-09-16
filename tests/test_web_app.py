@@ -401,6 +401,47 @@ class WorkspaceApiTests(unittest.TestCase):
         self.assertIn("等太久了", result["detail"])
 
 
+class FsListTests(unittest.TestCase):
+    """/api/fs/list 的数据源：只回子目录、错误回人话、无 path 回起点入口。
+
+    这是工作区选择器的数据源（后端列目录、前端自己画树）——不弹系统原生框，
+    所以远程 / 容器 / 沙箱里照样能用。
+    """
+
+    def setUp(self) -> None:
+        self.app = WebApp(shell=FakeShell([]))
+        self.tmp = tempfile.mkdtemp()
+        # 一棵小树：a/b（两层）、c（空目录）、plain.txt（文件，不该出现在清单）
+        (Path(self.tmp) / "a" / "b").mkdir(parents=True)
+        (Path(self.tmp) / "c").mkdir()
+        (Path(self.tmp) / "plain.txt").write_text("x", encoding="utf-8")
+
+    def test_lists_only_directories(self) -> None:
+        """文件不该出现——选的是沙箱根，不是文件。"""
+
+        res = self.app.list_fs(self.tmp)
+        self.assertEqual([e["name"] for e in res["entries"]], ["a", "c"])
+        self.assertEqual(res["path"], str(Path(self.tmp).resolve()))
+
+    def test_parent_points_up(self) -> None:
+        res = self.app.list_fs(str(Path(self.tmp) / "a"))
+        self.assertEqual(Path(res["parent"]), Path(self.tmp).resolve())
+
+    def test_unknown_dir_is_a_readable_error(self) -> None:
+        res = self.app.list_fs(str(Path(self.tmp) / "no_such_dir"))
+        self.assertIn("error", res)
+
+    def test_file_path_is_rejected(self) -> None:
+        res = self.app.list_fs(str(Path(self.tmp) / "plain.txt"))
+        self.assertIn("error", res)
+
+    def test_no_path_gives_roots_entrypoint(self) -> None:
+        """无 path = 起点态：Windows 给盘符（至少一块盘），别让用户没地方开始。"""
+
+        res = self.app.list_fs("")
+        self.assertTrue(res.get("roots"))
+
+
 class MessagesReadTests(unittest.TestCase):
     """C 的灵魂：历史直读证据文件，不碰壳、不碰 RPC。"""
 

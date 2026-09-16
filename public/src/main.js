@@ -11,13 +11,14 @@
 import { createApp, onMounted, onUnmounted } from "vue";
 import { ApprovalCard, ChatArea, SessionList, Toast } from "./components.js";
 import { OpsDrawer } from "./drawer.js";
+import { FsPicker } from "./fs-picker.js";
 import { approval, dismissApproval, notify, start } from "./store.js";
 import { closeDrawer } from "./ui.js";
 
 const App = {
   name: "App",
 
-  components: { SessionList, ChatArea, OpsDrawer, ApprovalCard, Toast },
+  components: { SessionList, ChatArea, OpsDrawer, ApprovalCard, Toast, FsPicker },
 
   setup() {
     function onKey(e) {
@@ -44,6 +45,7 @@ const App = {
     <ChatArea />
     <OpsDrawer />
     <ApprovalCard />
+    <FsPicker />
     <Toast />
   `,
 };

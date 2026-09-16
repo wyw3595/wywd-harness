@@ -1,0 +1,10 @@
+=== HEAD ===
+445f5d7 s11 合流：Vue 3 前端 + 工作区/上传目录（473 绿，2 skip）
+8923d63 前端换 Vue 3 + 仿 Codex 视觉重做；SSE/成本/Markdown/运维面板；修 s07-c 遗留三 bug（309 绿 15 红）
+=== status ===
+?? day-check.txt
+?? day-git.txt
+(空=干净)
+=== 接口 ===
+  /api/status -> 200 {"sessions": 8, "ringBufferUsed": 18566, "ringBufferTotal": 1048576, "ringBufferFull": false, "handlers": 14, 
+  /api/workspace -> 200 {"workspace": {"kind": "default", "root": "D:\\React\\wywd-harness-v2"}}

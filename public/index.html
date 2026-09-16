@@ -334,6 +334,43 @@
   #a-reject:hover:not(:disabled){color:var(--danger);border-color:var(--danger)}
   #approval-card button:disabled{opacity:.45;cursor:not-allowed}
 
+  /* ══ 目录选择弹层（后端列目录、前端自己画；不依赖桌面）══ */
+  #fs-overlay{position:fixed;left:0;right:0;bottom:0;top:0;
+    display:none;z-index:110;pointer-events:none}
+  #fs-picker{
+    pointer-events:auto;position:absolute;left:50%;transform:translateX(-50%);
+    top:64px;width:min(520px,calc(100% - 48px));background:var(--surface);
+    border:1px solid var(--line);border-radius:14px;padding:14px 16px;
+    box-shadow:var(--shadow);display:flex;flex-direction:column;gap:10px;
+    max-height:min(560px,calc(100vh - 140px));
+  }
+  .fp-head{display:flex;align-items:center;gap:8px}
+  .fp-title{font-size:13px;font-weight:600;color:var(--tx)}
+  .fp-head .flex{flex:1}
+  .fp-path{font-size:11px;color:var(--tx3);font-family:var(--mono);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    border:1px solid var(--line);border-radius:8px;padding:6px 8px}
+  .fp-list{border:1px solid var(--line);border-radius:10px;overflow:auto;
+    min-height:180px;max-height:300px;background:var(--bg)}
+  .fp-row{display:flex;align-items:center;gap:8px;padding:8px 12px;
+    cursor:pointer;font-size:13px;color:var(--tx);
+    border-bottom:1px solid var(--line)}
+  .fp-row:last-child{border-bottom:none}
+  .fp-row:hover{background:var(--panel-hover)}
+  .fp-ico{width:13px;height:13px;flex:0 0 13px;border:1.5px solid var(--tx3);
+    border-radius:3px}
+  .fp-hint{color:var(--tx3);font-size:12px;padding:10px 12px}
+  .fp-empty{color:var(--tx3);padding:18px 12px;text-align:center;font-size:12px}
+  .fp-ops{display:flex;gap:8px;align-items:center}
+  .fp-ops .flex{flex:1}
+  .fp-ops button{border-radius:9px;padding:7px 14px;cursor:pointer;font-size:13px;
+    font-weight:500;border:1px solid var(--line);background:var(--surface);
+    color:var(--tx)}
+  .fp-ops button:hover:not(:disabled){background:var(--panel-hover)}
+  .fp-ops button:disabled{opacity:.45;cursor:not-allowed}
+  .fp-primary{background:var(--ink)!important;color:var(--ink-fg)!important;
+    border-color:var(--ink)!important}
+
   /* ══ 运维抽屉（Codex 的右侧面板：默认收起）═════════════ */
   #drawer{display:flex;flex-direction:column;width:0;flex:0 0 0;
     overflow:hidden;border-left:1px solid var(--line);background:var(--panel);
