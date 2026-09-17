@@ -1,5 +1,8 @@
 """标准工具集 + 工具箱装配的回归测试（std_tools 全离线，不碰模型）。"""
 
+import json
+import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -8,12 +11,15 @@ from unittest import mock
 
 from src.harness import file_tools
 from src.harness.std_tools import (
+    BASH_OUTPUT_LIMIT,
+    _clean_env,
     _glob_to_regex,
     _should_skip_file,
     calc,
     find_text,
     glob_files,
     now,
+    run_bash,
     tree_dir,
 )
 
@@ -396,6 +402,207 @@ class ToolboxAssemblyTests(unittest.TestCase):
         )
         self.assertIs(decision.action, PermissionAction.ASK)
         self.assertEqual(decision.rule_id, "path.write_ask")
+
+
+class BashToolTests(unittest.TestCase):
+    """bash 工具（2026-09-17）：能跑、不卡死、不喷爆上下文、不漏密钥。
+
+    这些用例会真的起子进程，但都用 `sys.executable -c ...`——跨平台，
+    不依赖系统里装了哪些命令（`echo` 是唯一的例外，两个平台都有）。
+
+    权限层那两道专属闸门（hard_deny / requires_approval）也在本类里测：
+    它们按**工具名**匹配，和工具本体是同一个功能的两个面，分开测容易漏。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        # 宿主的"安全删除"会拦 unlink（见项目记忆），清理失败不该算测试失败。
+        try:
+            self.tmp.cleanup()
+        except OSError:
+            pass
+
+    def _py(self, code: str) -> str:
+        """拼一条"用当前解释器跑一段代码"的命令：跨平台、可控、无外部依赖。"""
+
+        return f'"{sys.executable}" -c "{code}"'
+
+    def test_runs_command_and_reports_exit_code(self) -> None:
+        result = run_bash("echo hi", sandbox_root=self.root)
+
+        self.assertIn("exit 0", result)
+        self.assertIn("hi", result)
+
+    def test_nonzero_exit_is_data_not_exception(self) -> None:
+        """失败要变成**数据**回灌给模型，不能抛异常打断循环（同 s02 的
+        "未知工具/参数错"一律转成错误结果）。"""
+
+        result = run_bash(self._py("import sys; sys.exit(3)"),
+                          sandbox_root=self.root)
+
+        self.assertIn("exit 3", result)
+
+    def test_working_directory_is_the_sandbox_root(self) -> None:
+        """命令里的相对路径能落在项目里，靠的就是 cwd=沙箱根。"""
+
+        result = run_bash(self._py("import os; print(os.getcwd())"),
+                          sandbox_root=self.root)
+
+        self.assertIn(self.root.resolve().name, result)
+
+    def test_timeout_kills_a_stuck_command(self) -> None:
+        """一条 sleep 不能把整个 turn 拖死——这是"必须有超时"的全部理由。"""
+
+        result = run_bash(self._py("import time; time.sleep(10)"),
+                          timeout=1, sandbox_root=self.root)
+
+        self.assertIn("超时", result)
+        # 且不把等 10 秒才攒到的输出也端着：超时返回的是"已产生的部分"。
+        self.assertLess(len(result), 500)
+
+    def test_timeout_lower_bound_is_clamped(self) -> None:
+        """模型传 timeout=0 时钳到 1 秒，而不是"一启动就掐断"。
+
+        上界（300）没法在不真等的情况下观察，所以只测下界；上界的正确性
+        由常量与 max(1, min(...)) 这一行保证。
+        """
+
+        result = run_bash("echo ok", timeout=0, sandbox_root=self.root)
+
+        self.assertIn("ok", result)
+
+    def test_long_output_is_clipped_with_a_visible_notice(self) -> None:
+        """截断必须**说出来**——模型只知道"输出被截断了"才会换更精确的命令，
+        默默丢一半它会以为那就是全部（这是 s13 输出外化的引子）。"""
+
+        result = run_bash(self._py("print('x' * 20000)"),
+                          sandbox_root=self.root)
+
+        self.assertIn("被截断", result)
+        self.assertLess(len(result), BASH_OUTPUT_LIMIT + 300)
+
+    def test_empty_command_is_refused(self) -> None:
+        self.assertIn("为空", run_bash("   ", sandbox_root=self.root))
+
+    def test_empty_output_is_labelled(self) -> None:
+        """没有输出 ≠ 出错：说一句"（无输出）"，别让模型对着空白猜。"""
+
+        result = run_bash(self._py("pass"), sandbox_root=self.root)
+
+        self.assertIn("exit 0", result)
+        self.assertIn("（无输出）", result)
+
+    def test_secret_env_vars_are_stripped(self) -> None:
+        """`env` 本来能把密钥原样打出来——而工具输出要回灌给模型、
+        还随 transcript 落盘，等于把密钥送给模型。"""
+
+        with mock.patch.dict(os.environ, {"WYWD_FAKE_SECRET": "leak-me"}):
+            result = run_bash(
+                self._py("import os; "
+                         "print(os.environ.get('WYWD_FAKE_SECRET', 'ABSENT'))"),
+                sandbox_root=self.root,
+            )
+
+        self.assertIn("ABSENT", result)
+        self.assertNotIn("leak-me", result)
+        # 顺带直接测那个纯函数：名字里带 SECRET/KEY/TOKEN 的一律不传下去。
+        self.assertNotIn("WYWD_FAKE_SECRET", _clean_env())
+
+    def test_policy_sends_bash_to_approval(self) -> None:
+        """普通命令必须走 ASK——"每次都要人点头"是它敢默认上架的唯一理由。"""
+
+        from src.harness.permissions import PermissionAction, ToolRequest
+        from scripts.toolbox import build_policy
+
+        decision = build_policy().decide(ToolRequest(
+            tool_use_id="t1", name="bash",
+            arguments={"command": "git status --short"},
+        ))
+
+        self.assertIs(decision.action, PermissionAction.ASK)
+        self.assertEqual(decision.rule_id, "bash.requires_approval")
+
+    def test_policy_hard_denies_dangerous_commands(self) -> None:
+        """危险命令是 DENY 而不是 ASK：审批**翻不了案**——弹窗会让用户以为
+        自己有权放行，那就不算边界（permissions 模块的设计铁律）。"""
+
+        from src.harness.permissions import PermissionAction, ToolRequest
+        from scripts.toolbox import build_policy
+
+        for command in ("sudo apt install x", "rm -rf build",
+                        "shutdown /s", "dd if=/dev/zero of=x"):
+            decision = build_policy().decide(ToolRequest(
+                tool_use_id="t1", name="bash", arguments={"command": command},
+            ))
+            self.assertIs(decision.action, PermissionAction.DENY, command)
+            self.assertEqual(decision.rule_id, "bash.hard_deny", command)
+
+    def test_empty_command_falls_through_to_default_deny(self) -> None:
+        """空命令既不弹审批（白打扰用户）也不许 IndexError。
+
+        这是 bash 上架当天发现的潜藏 bug：`is_hard_deny` 里
+        `command.strip().split()[0]` 在空串上会抛 IndexError——那条规则在
+        bash 工具存在之前永远不会被调用，所以一直没暴露。这个用例把角落钉住。
+        """
+
+        from src.harness.permissions import PermissionAction, ToolRequest
+        from scripts.toolbox import build_policy
+
+        for command in ("", "   "):
+            decision = build_policy().decide(ToolRequest(
+                tool_use_id="t1", name="bash", arguments={"command": command},
+            ))
+            self.assertIs(decision.action, PermissionAction.DENY, repr(command))
+            self.assertEqual(decision.rule_id, "default.deny", repr(command))
+
+    def test_schema_does_not_leak_the_sandbox_root(self) -> None:
+        """bash 的 schema 里不能出现 sandbox_root——闭包把它吃掉了。
+
+        泄露的后果在 bash 上比在 fs_* 上更重：fs_* 就算传了 root 也只是
+        "搜索起点"（仍受 _resolve_safe 管），而 bash 的工作目录一旦可传，
+        模型就能把它设成任意位置，连沙箱的**起点**都不在项目里了。
+        """
+
+        from scripts.toolbox import DEFAULT_WORKSPACE, build_registry_for
+        from src.harness.tools import tool_to_schema
+
+        params = tool_to_schema(
+            build_registry_for(DEFAULT_WORKSPACE).get("bash")
+        )["function"]["parameters"]
+
+        self.assertEqual(set(params["properties"]), {"command", "timeout"})
+        self.assertNotIn("sandbox_root", json.dumps(params))
+        self.assertEqual(params["required"], ["command"])
+
+    def test_registry_runs_bash_through_the_gate(self) -> None:
+        """端到端：过 runner（approver 模拟用户点"允许"）→ 真跑 → 结果文本。
+
+        单测 run_bash 只证明"函数本身能用"；这条证明它**接线正确**——
+        工具名能命中规则、handler 能拿到闭包里的沙箱根、结果能被编码回灌。
+        """
+
+        from scripts.toolbox import (
+            DEFAULT_WORKSPACE,
+            build_policy_for,
+            build_registry_for,
+        )
+        from src.harness.permissions import GovernedToolRunner, ToolRequest
+
+        runner = GovernedToolRunner(
+            policy=build_policy_for(DEFAULT_WORKSPACE),
+            approver=lambda decision: True,      # 模拟用户点"允许"
+            registry=build_registry_for(DEFAULT_WORKSPACE),
+        )
+
+        result = runner.run(ToolRequest(
+            tool_use_id="t1", name="bash", arguments={"command": "echo e2e-ok"},
+        ))
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertIn("e2e-ok", result.output)
 
 
 if __name__ == "__main__":

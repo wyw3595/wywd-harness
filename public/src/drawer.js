@@ -69,6 +69,7 @@ export const OpsDrawer = {
             <div><span>会话记录</span><b>{{ ops.status.sessions }}</b></div>
             <div><span>RingBuffer</span><b>{{ ring || "—" }}</b></div>
             <div><span>RPC handlers</span><b>{{ ops.status.handlers }}</b></div>
+            <div><span>单轮步数上限</span><b>{{ ops.status.maxSteps || "—" }}</b></div>
           </div>
           <div v-else class="dw-dim">读取中…</div>
         </section>

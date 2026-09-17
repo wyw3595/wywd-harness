@@ -67,7 +67,8 @@ def run_agent(
     日志、计费统计都吃同一份事件流）。不传则完全安静。
 
     保险丝：连续 max_steps 轮没等到最终回答 -> 返回 status="max_steps"
-    的 RunResult，output 说明最后一轮请求了哪些工具。
+    的 RunResult，output 说明用了几轮、最后请求了哪些工具、以及可以
+    续跑（messages 照常返回，调用方把它当 history 再发一句「继续」即可）。
     """
 
     if model is None:
@@ -78,7 +79,7 @@ def run_agent(
         registry = ToolRegistry()
 
     step = 0
-    last_reply = ""
+    last_requested = "（无）"
     # 跨轮记账（练习 18）：每轮 reply.usage 是"单次 API 调用"的账单，
     # run_agent 是唯一看全所有轮的地方——在这里按键求和，三个出口
     # （completed / max_steps / failed）都把 totals 填进 RunResult.usage。
@@ -210,15 +211,22 @@ def run_agent(
                 }
             )
 
-        last_reply = "请求调用工具：" + "、".join(
-            call.name for call in reply.tool_calls
-        )
+        last_requested = "、".join(call.name for call in reply.tool_calls)
         step += 1
 
+    # 步数用尽的出口（2026-09-16 改文案）。
+    # 旧文案是 "请求调用工具：now"：对模型没意义（它自己刚请求的），对用户
+    # 更没意义（不知道发生了什么、也不知道能不能接着做）。现在一次说清三件事：
+    # 用了几轮、任务确实没完成、以及**能续跑**——因为 messages 照常返回，
+    # 调用方把它当 history 再发一句「继续」就能从断点接着做。
     return RunResult(
         run_id=str(uuid4()),
         task=task,
-        output=last_reply,
+        output=(
+            f"步数用尽（{max_steps} 轮），任务未完成。"
+            f"最后一轮请求的工具：{last_requested}。"
+            "这是暂停而不是失败——直接说「继续」，我会接着上次的地方做。"
+        ),
         status="max_steps",
         messages=messages,
         usage=totals,

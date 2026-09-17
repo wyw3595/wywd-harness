@@ -53,6 +53,7 @@ from scripts.toolbox import (
     build_policy_for,
     build_registry,
     build_registry_for,
+    resolve_max_agent_steps,
 )
 from src.harness.jsonl_store import JsonlSessionStore
 from src.harness.sidecar import MainProcessClient, RPCConnection, SidecarServer
@@ -147,16 +148,24 @@ def _sidecar_process(sock: socket.socket) -> None:
 
     s12：idle_timeout 交给 SidecarServer 起后台回收线程（默认关，
     见 _idle_reap_seconds）。
+
+    2026-09-16：max_steps 显式传进去（环境变量 WYWD_MAX_STEPS，默认 30）。
+    以前不传，于是 run_agent 的签名默认值 5 就成了线上真实上限——一个需要
+    6 轮的任务必然以 max_steps 收场。同时 history_seed 带上步数预算，
+    让上限成为"看得见的预算"（模型据此规划、接近时收尾），而不是撞墙才知道。
     """
+    max_steps = resolve_max_agent_steps()
     server = SidecarServer(
         model=build_model_router(),
         registry=build_registry(),
         policy=build_policy(),
-        history_seed=build_history_seed,   # s10：工具目录 + 工作区记忆（空记忆时与旧行为一致）
+        # s10：工具目录 + 工作区记忆（空记忆时与旧行为一致）。
+        history_seed=lambda: build_history_seed(max_steps=max_steps),
         store=JsonlSessionStore(root=Path(_PROJECT_ROOT) / ".sessions"),
         runtime_builder=_workspace_runtime,   # s11：上传目录 / 换沙箱
         initial_workspace={"kind": "default", "root": str(DEFAULT_WORKSPACE.root)},
         idle_timeout=_idle_reap_seconds(),    # s12：空闲回收（默认关）
+        max_steps=max_steps,                  # 单轮步数上限（默认 30）
     )
     server.handle_connection(RPCConnection(sock))
 

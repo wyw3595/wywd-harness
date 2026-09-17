@@ -32,6 +32,7 @@ import math
 import operator
 import os
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -417,3 +418,130 @@ def tree_dir(
 
     walk(base, "", 1)
     return "\n".join(lines)
+
+
+# -- 执行 shell 命令（bash 工具）：本项目唯一"跑得出沙箱"的能力 --------------
+#
+# 为什么它和别的工具不是一个风险等级：fs_* 的路径会被 _resolve_safe 拦在
+# 沙箱内，而一条 shell 命令**拦不住**——`cd /` 之后想去哪去哪。所以这里不
+# 假装它是沙箱，而是把边界写在明面上：
+#
+#   闸门①（真正的闸门，在权限层，不在本文件）
+#     - `bash.hard_deny`：sudo / rm / reboot / shutdown / dd 开头 → DENY，审批也翻不了案
+#     - `bash.requires_approval`：其余命令 → ASK，**每次执行都要用户点头**
+#     这两条规则在 permissions.build_default_policy 里早就写好了，一直空着——
+#     本段就是把那个预留位置填上，所以工具名必须**逐字叫 bash**，否则规则不命中，
+#     而规则不命中就落到 default.deny（fail-closed，安全但用不了）。
+#   闸门② WYWD_DISABLE_BASH=1 → 装配层根本不注册这个工具。
+#
+# 本函数自己只管三件事：能跑、不卡死、不喷爆上下文。
+# 另注意"黑名单"的性质：它是**心理安全**，不是沙箱（`find . -delete` 就绕过
+# rm 那条）。真正的保险是"每次都要人点头"。
+
+BASH_TIMEOUT_DEFAULT = 60
+BASH_TIMEOUT_MAX = 300
+BASH_OUTPUT_LIMIT = 8000
+
+# 按名字特征剥环境变量：`env` 这条命令本来能把 DEEPSEEK_API_KEY 原样打出来，
+# 而工具输出是要回灌给模型的（还随 transcript 落盘）——等于把密钥送给模型。
+_SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def _clean_env() -> dict[str, str]:
+    """继承当前环境，但剥掉看起来是密钥的变量。
+
+    按名字特征过滤，不追求完备——能想到的都挡住，想不到的靠"每次都审批"
+    兜底。宁可偶尔少给一个无关变量，也不能把密钥漏进上下文。
+    """
+
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS)
+    }
+
+
+def _decode_output(data: bytes) -> str:
+    """按 utf-8 → gbk 的顺序尝试解码，最后兜底 replace。
+
+    Windows 的 cmd 输出中文是 cp936（GBK），直接按 utf-8 解会抛异常；POSIX
+    上反过来基本只会是 utf-8。所以顺序尝试。兜底用 errors="replace"：宁可
+    显示成乱码，也不能因为编码问题让整个工具崩掉。
+    """
+
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _clip_output(text: str) -> str:
+    """裁掉尾部空白；超长时留头部并注明被截断。
+
+    为什么不外部化到磁盘（教材 s13 那套）：那是下一步的事。这里先做一个
+    诚实的止损——**明确告诉模型"被截断了，用更精确的命令重来"**，比默默
+    丢一半输出好，也比把几十 MB 灌进上下文好。
+    """
+
+    text = text.rstrip()
+    if not text:
+        return "（无输出）"
+    if len(text) <= BASH_OUTPUT_LIMIT:
+        return text
+    return (
+        text[:BASH_OUTPUT_LIMIT]
+        + f"\n…（输出被截断，原始共 {len(text)} 字符；"
+          "请用更精确的命令缩小范围）"
+    )
+
+
+def run_bash(command: str, timeout: int = BASH_TIMEOUT_DEFAULT,
+             sandbox_root: Path | None = None) -> str:
+    """在项目目录里执行一条 shell 命令，返回退出码与输出。
+
+    Args:
+        command: 要执行的命令，如 "git status --short" 或
+            "python -m unittest discover -s tests"。
+        timeout: 超时秒数，默认 60、上限 300；超时会终止命令并返回已产生的输出。
+
+    （sandbox_root 是内部沙箱根参数，由装配层注入，不暴露给模型。）
+
+    工作目录固定为沙箱根，所以命令里的相对路径都落在项目里；但**命令本身
+    不受沙箱约束**（`cd /` 之后能走到任何地方）——这个工具的边界是"每次执行
+    都要用户审批"，不是"跑不出去"。stdout 与 stderr 合并返回，超过 8000
+    字符截断。Windows 下走 cmd、POSIX 下走 /bin/sh（shell=True 的平台默认）。
+    """
+
+    if not command or not command.strip():
+        return "（命令为空，没有执行任何东西）"
+
+    # 超时钳到 [1, MAX]：模型可能传 0（一启动就掐断）或 99999（一个 turn 卡死）。
+    limit = max(1, min(int(timeout), BASH_TIMEOUT_MAX))
+    sandbox = sandbox_root if sandbox_root is not None else file_tools.ALLOWED_ROOT
+    # 复用沙箱解析拿工作目录（"." 一定在界内），顺带确认它确实存在。
+    cwd = _resolve_safe(".", sandbox)
+
+    try:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(cwd),
+            capture_output=True,     # stdout / stderr 都由我们接管，不直接喷终端
+            timeout=limit,
+            env=_clean_env(),
+        )
+    except subprocess.TimeoutExpired as expired:
+        # 超时也要把"已经产生的输出"还给模型——它可能就是问题本身
+        # （比如卡在一个交互式提示上，输出里留着半句提示语）。
+        partial = _decode_output((expired.stdout or b"") + (expired.stderr or b""))
+        return (
+            f"(超时：{limit} 秒内没有结束，命令已被终止)\n"
+            f"{_clip_output(partial)}"
+        )
+    except OSError as error:
+        return f"(无法执行：{error})"
+
+    merged = _decode_output(completed.stdout + completed.stderr)
+    return f"(exit {completed.returncode})\n{_clip_output(merged)}"

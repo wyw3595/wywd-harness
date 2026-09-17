@@ -34,6 +34,7 @@ from scripts.toolbox import (
     build_model,
     build_policy_for,
     build_registry_for,
+    resolve_max_agent_steps,
     with_system,
 )
 from src.harness.agent import run_agent
@@ -257,6 +258,10 @@ def main() -> None:
     # 都一样），换目录不需要重建说明书。审批员是终端 y/n（web_app
     # 的审批卡是另一个入口另一套 UI，不共用显示代码）。
     model = build_model()
+    # 单轮步数上限（2026-09-16）：显式读配置，别再吃 run_agent 的签名默认 5。
+    # 同一份预算既进 system（让模型自己规划）又进循环（真正的保险丝），
+    # 两者必须同源，否则"告诉它的"和"实际给的"会对不上。
+    max_steps = resolve_max_agent_steps()
 
     def on_event(event: str, data: dict) -> None:
         """实时播报循环事件——过程不再黑盒。"""
@@ -346,7 +351,7 @@ def main() -> None:
         if history:
             history = trim_history(history, MAX_HISTORY_MESSAGES)
         # 目录常驻：system 提示（含延迟工具目录）每次调到最前，幂等。
-        history = with_system(history)
+        history = with_system(history, max_steps)
         # 透明化：发出前展示这次"发给模型的所有东西"——请求体由两部分
         # 组成：tools（模型能调用的说明书）+ messages（对话内容）。
         # 与 /msgs 的 messages 渲染共用 _format_messages。
@@ -362,6 +367,7 @@ def main() -> None:
             task,
             model=model,
             registry=registry,
+            max_steps=max_steps,
             history=history,
             on_event=on_event,
             runner=runner,
@@ -373,6 +379,11 @@ def main() -> None:
         # 和失败同理，不能让用户以为这是完整回答。
         if result.status == "failed":
             print(f"⚠️ {result.output}")
+        elif result.status == "max_steps":
+            # 暂停 ≠ 失败（2026-09-16）：步数用尽意味着"还能接着做"，
+            # 不是"做不了"。这个区别必须在终端上说清楚——历史完整保留，
+            # 再打一句「继续」就从断点接着走，用户不必重述任务。
+            print(f"⏸ {result.output}\n")
         elif result.status == "truncated":
             print(f"⚠️ 助手> {result.output}（回答被截断，内容不完整）\n")
         else:

@@ -25,8 +25,11 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.output, "任务已完成")
 
     def test_stops_at_max_steps_when_model_never_finishes(self) -> None:
-        # 剧本永远只请求工具 -> 只能靠保险丝熔断；
-        # output 应说明最后一轮请求了哪些工具。
+        # 剧本永远只请求工具 -> 只能靠保险丝熔断。
+        # 2026-09-16 改文案：旧 output 是 "请求调用工具：add"（对模型是它自己
+        # 刚说的、对用户是天书）。新契约是**说清三件事**：用了几轮、任务没完成、
+        # 能续跑。断言改成"包含关键要素"而不是逐字相等——文案会继续演进，
+        # 但"必须给出轮数、工具名、续跑暗示"是接口契约。
         model = ScriptedModel(
             [
                 ModelReply(
@@ -39,7 +42,9 @@ class AgentLoopTests(unittest.TestCase):
         result = run_agent("不会完成的任务", model=model, max_steps=3)
 
         self.assertEqual(result.status, "max_steps")
-        self.assertEqual(result.output, "请求调用工具：add")
+        self.assertIn("3 轮", result.output)
+        self.assertIn("add", result.output)
+        self.assertIn("继续", result.output)
         self.assertTrue(result.run_id)
 
     def test_truncated_final_answer_reports_truncated_status(self) -> None:

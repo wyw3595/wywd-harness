@@ -1751,3 +1751,149 @@ Derived from append-only project facts. Edit the source log or policy, not this 
 
 - 提交：（待用户）
 
+## 2026-09-16 ~ 09-17：长任务三连修 + bash 工具上架
+
+> ⚠️ **先说一件影响记录方式的事**：`.workbuddy/memory/` 下的文件（含 MEMORY.md）
+> 在**会话之间会被宿主记忆服务的缓存覆盖** —— 09-16 那天写进去的 push 记录、
+> 探针、长任务修复全没了，而同时期写进 `scratch/` 的脚本都在。
+> 所以：**要跨会话留下的事，写在这个文件里**（git 跟踪，不会被覆盖），
+> 别只写进 `.workbuddy/memory/`。
+
+### 一、修「完成不了长任务」（09-16）
+
+**根因**：`run_agent` 的签名默认 `max_steps=5`，而**所有入口都不传它**
+（`sidecar.py` 的 turn_runner、`chat.py` 都没给）→ 5 成了线上真实上限。
+
+**证据**（`.workbuddy/scratch/probe_step_limit.py`，ScriptedModel 离线可复现）：
+同一个「7 轮工具 + 第 8 轮给答案」的剧本，只改 max_steps：
+
+```
+max_steps= 5  status=max_steps  实际执行工具轮数=5
+max_steps= 8  status=completed  实际执行工具轮数=7
+max_steps=10  status=completed  实际执行工具轮数=7
+```
+
+**改动**
+- `scripts/toolbox.py`：`MAX_AGENT_STEPS_DEFAULT = 30` + `resolve_max_agent_steps()`
+  （读 `WYWD_MAX_STEPS`，非法值喊一声退回默认）；**把步数预算写进 system prompt**
+  （业界做法：光有 enforced ceiling 不够，还要有 advertised budget，模型才会
+  自我规划、接近上限时收尾）；`build_system_prompt` / `with_system` /
+  `build_history_seed` 都多了一个 `max_steps` 参数（默认 None，无参调用照旧）。
+  30 的依据：OpenAI Agents SDK 10 / LangGraph 25 / CrewAI 25 / smolagents 20 /
+  Vercel 20，**注意单位不可直接搬**（LangGraph 数 super-step，我们数 model.generate）。
+- `src/harness/sidecar.py`：构造器加 `max_steps: int = 30`，turn_runner 显式传，
+  `sidecar/status` 加 `maxSteps`（行为参数要能在运维面板看见）。
+- `scripts/shell.py` / `scripts/chat.py`：装配处显式传；chat 撞上限时走新的 `⏸` 分支。
+- `src/harness/agent.py`：熔断出口的 output 从 `"请求调用工具：now"`（对模型是它
+  刚说的话、对用户是天书）改成说清三件事——用了几轮 / 未完成 / **可续跑**。
+- 前端 `store.js`（优先显示后端那句人话）、`drawer.js`（显示单轮步数上限）。
+
+**关键语义**：撞上限是**暂停**不是失败。`messages` 照常返回，调用方把它当 history
+再发一句「继续」就能从断点接着做（`verify_long_task.py` 验证：中断时 5 条消息，
+续跑时模型收到 6 条，role 序列完整，能走到 completed）。
+
+### 二、bash 工具上架（09-17）
+
+**背景**：`permissions.build_default_policy` 里早就有两条专属于 bash 的规则
+（`bash.hard_deny` / `bash.requires_approval`），一直没有对应工具，规则在空转。
+所以工具名必须**逐字叫 `bash`**：规则按名字匹配，换名字就落进 `default.deny`。
+
+- `src/harness/std_tools.py`：新增 `run_bash()` + `_clean_env()`（按名字剥
+  KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 环境变量——`env` 本来能把 API key 打出来，
+  而工具输出要回灌给模型**并随 transcript 落盘**）+ `_decode_output()`（utf-8 →
+  gbk → replace）+ `_clip_output()`（超长截断并**注明**）。cwd=沙箱根；
+  stdout+stderr 合并；`shell=True` 平台默认；超时钳到 [1,300]。
+- `scripts/toolbox.py`：`bash_enabled()`（`WYWD_DISABLE_BASH=1` 关闭，**默认启用**
+  ——它的安全靠"每次都要审批"，开了闸门却不上架等于白做）；`SAFE_TOOLS` 注释里
+  写死「绝不能加 bash」。
+- **顺手修掉一个潜藏 bug**：`permissions.is_hard_deny` 里
+  `command.strip().split()[0]` 在空命令上会 `IndexError`——那条规则在 bash 存在
+  之前**永远不会被调用**，所以从没暴露，bash 一上架就会被 `{"command": ""}` 踩到。
+- 新增 14 条测试（`tests/test_std_tools.py` 的 `BashToolTests`）+ 更新
+  `tests/test_workspace.py` 的注册名单期望值。
+
+**边界（必须明说）**：bash 是本项目**唯一跑得出沙箱**的能力——fs_* 的路径被
+`_resolve_safe` 拦住，命令拦不住（`cd /` 之后想去哪去哪）。它的边界是**审批**，
+不是沙箱。DANGEROUS 那份是**首词黑名单**，属心理安全（`find . -delete` 绕过 `rm`）。
+
+### 三、能力探针 `scripts/smoke_capability.py`（10 层）
+
+测「agent 能做什么、卡在哪一层」。`--max-steps N` 做对照实验是核心用法：
+
+```bash
+python -X utf8 scripts/smoke_capability.py                 # 现状
+python -X utf8 scripts/smoke_capability.py --max-steps 20  # 对照
+python -X utf8 scripts/smoke_capability.py --only L4 L7
+python -X utf8 scripts/smoke_capability.py --offline       # 只验管线，不烧额度
+```
+
+L1 单工具 / L2 多轮串联 / L3 多工具协作（含能否识别输出被截断）/ L4 延迟工具发现 /
+L5 失败后诚实 / L6 写审批 / L7 长任务（对照主角）/ L8 跨轮记忆 / L9 没有的能力会不会编 /
+L10 用 bash 干正事（含审批闸门）。
+
+### 验收
+
+- **492 条测试全绿（2 skip）**
+- `.workbuddy/scratch/demo_bash.py`：四场景端到端（批准 / 拒绝 / 危险命令 / 空命令），
+  其中危险命令那条**审批环节根本没触发**（approver 一次都没被调用）——「DENY 不可
+  审批覆盖」的实证。
+- `.workbuddy/scratch/verify_long_task.py`：长任务改动 5 个检查点全 OK。
+- `.workbuddy/scratch/probe_find_time.py`：只读工具耗时实测（fs_read 0.96ms /
+  fs_find 早停 17ms / 全量 40ms）→ 结论「工具之间并行不值得做」。
+
+### 仍未做
+
+- `README.md` 还停在 chainlit 时代（46 条测试 / `chainlit_app.py` 都过时了）。
+- 长任务只解决了一半：历史窗口仍是 20 条 ≈ 6 轮，跑长了会被 `trim_history` 截掉。
+  真正的长任务要教材 s13（输出外化）+ s14（四层压缩）。
+- bash 的输出上限 8000 字符只是止损（截断+说明），s13 才是解法。
+
+### 四、修「工具像在返回假数据」的真因：换代时工作区静默复位（09-17）
+
+**现场**（用户提供的对话记录）：同一会话里，`fs_list` 列出了某个 Java/Vue 项目
+（`backend/ frontend/ docs/ sql/ .m2/ .maven-settings.xml` …）的完整结构，
+`fs_read README.md` 也读到了它的 README（DocNest 企业知识库）；但紧接着
+`fs_read docs/RAG评估与消融实验报告.md` 报
+`[WinError 3] 系统找不到指定的路径: 'D:\React\wywd-harness-v2\docs\...'`，
+`fs_glob **/*.java` 也返回空。**当时的 agent 判定「工具在返回虚假数据」——这个结论错了。**
+
+**先排除"假数据"**：`list_dir` 的输出格式是 `名字  (文件, N 字节)` / `名字/  (目录)`，
+与现场逐字一致；`fs_find` 读到的 `.gitignore` 前 15 行与我们 v2 的真实 `.gitignore`
+一字不差。**输出是真的，只是两次调用用了不同的根。**
+
+**真因**：**工作区是 sidecar 的进程级状态，而 `revive_shell()` 换代时没有把它带过去。**
+1. 用户把工作区打开成磁盘上那个项目目录（browse/open）→ 那一刻 root 就是它，
+   所以 `fs_list` / `fs_read README` 都对；
+2. sidecar 因环境原因死掉（本机高频：宿主"安全删除"拦 unlink，见 09-15 事故）；
+3. 下一次请求触发 `revive_shell()` → 新壳的 `initial_workspace` 是**启动态 =
+   项目根 v2**（`scripts/shell.py` 装配时写死的那份）；
+4. 于是后续所有工具都按 v2 解析路径 → `docs/` 不存在、没有 `.java`；
+5. 前端只在**用户主动操作工作区**时才刷 `refreshWorkspace()`（`start()` 里刷一次），
+   所以界面上可能还显示着旧路径 —— 现象看上去就像"数据是假的"。
+
+`workspaces/` 目录是空的 → 那个项目**不是 zip 上传的**，是「打开目录」指过去的
+真实磁盘目录。
+
+**修复**（`scripts/web_app.py`）
+- 新增 `self._workspace_root`：凡成功切换工作区就记一笔（`_remember_workspace`，
+  挂在 `set_workspace` 的**统一出口**上，zip 上传也一并覆盖）；
+- `revive_shell()` 起完新壳后调 `_restore_workspace()` 把原目录设回去；
+- **只在明确知道结果时更新记忆**：`kind=default` → 清空（用户主动复位，别把
+  复位也"恢复"掉）、有 `root` → 更新、结构缺失 → 保持原样（"猜"会擦掉一份
+  好记忆，而擦掉就再也恢复不了了）；
+- 恢复失败不拖垮自愈，但**喊一声**（不静默）；
+- **为什么记忆必须在 WebApp 这一侧**：revive 的触发条件就是旧壳已经死了——
+  问不到"你刚才在哪个目录"。
+
+**验收**
+- **495 条测试全绿**（492 + 3 条新测试：恢复成功 / 复位后不恢复 / 恢复失败清记忆）
+- `.workbuddy/scratch/verify_workspace_revive.py`：**真 sidecar** 端到端——
+  spawn 真子进程 → 切工作区到临时目录 → 杀掉 → 自愈 → 读回的工作区**确实**是那个
+  目录（`恢复成功 : True`）。
+
+**顺带踩的坑**：写这个验证脚本时忘了 Windows spawn 守则（顶层直接 `shell.start()`），
+子进程一 spawn 就崩 `An attempt has been made to start a new process before…`。
+**所有副作用必须进 `main()`，顶层只留 `if __name__ == "__main__"`** ——
+s10 的冒烟脚本踩过同一个坑，这次是我自己踩。
+
+

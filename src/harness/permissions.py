@@ -299,7 +299,12 @@ def build_default_policy(
         command = request.arguments.get("command")
         if not isinstance(command, str):
             return False
-        return command.strip().split()[0] in DANGEROUS
+        # 空命令没有"首词"。旧写法 `command.strip().split()[0]` 在这里会
+        # IndexError——这条规则在 bash 工具存在之前永远不会被调用，所以
+        # 一直没暴露（2026-09-17 上架 bash 时才发现）。空命令不是"危险"，
+        # 交给后面的规则（is_bash 也不认它，最终落到 default.deny）。
+        head = command.strip().split()
+        return bool(head) and head[0] in DANGEROUS
 
     def is_outside(request: ToolRequest) -> bool:
         """越界:路径工具 + 参数里的 path 解析后跑出工作区。"""
@@ -357,7 +362,12 @@ def build_default_policy(
 
     def is_bash(request: ToolRequest) -> bool:
         if not isinstance(request.arguments, dict):
-            return False  # 参数都不是对象,谈不上"平凡 bash",交给 default.deny
+            return False  # 参数都不是对象，谈不上"平凡 bash"，交给 default.deny
+        command = request.arguments.get("command")
+        # 空命令不认：它不是"要执行的命令"，走 ASK 只会白打扰用户一次
+        # （审批弹出来才发现没内容）。不命中任何规则 → default.deny。
+        if not isinstance(command, str) or not command.strip():
+            return False
         return request.name == "bash" and not is_hard_deny(request)
 
     rules = [

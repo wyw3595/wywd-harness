@@ -285,6 +285,11 @@ class WebApp:
             on_event=self._record_event,
         ))
         self.shell = shell if shell is not None else self._shell_factory()
+        # 换代恢复用：最近一次确认过的工作区根（默认工作区时空）。
+        # **为什么必须在这一侧留一份**：revive_shell 的触发条件就是旧壳已经
+        # 死了——它答不了话，问不到"你刚才在哪个目录"。所以凡是成功切过
+        # 工作区，就在这边记一笔（见 _remember_workspace / _restore_workspace）。
+        self._workspace_root: str = ""
 
     def revive_shell(self) -> bool:
         """sidecar 不在就就地换一个新的。返回是否真的换了。
@@ -313,9 +318,58 @@ class WebApp:
         self.shell = self._shell_factory()
         # 沿用网页入口的口径：启动不建会话（懒建），第一次发消息再建。
         self.shell.start(create_session=False)
+        # 工作区必须设回去（见 _restore_workspace 的注释：这是 2026-09-17
+        # 那次"工具像在返回假数据"的真正原因）。
+        restored = self._restore_workspace()
         print("[web_app] sidecar 已退出 → 自动起了一个新的"
-              "（已建会话的记录仍在 .sessions/，点一下会话即可 resume）")
+              "（已建会话的记录仍在 .sessions/，点一下会话即可 resume）"
+              + (f"；工作区已恢复为 {restored}" if restored else ""))
         return True
+
+    def _remember_workspace(self, workspace: dict | None) -> None:
+        """记下当前工作区根，供换代恢复。
+
+        只在**明确知道**结果时更新：default 说明用户主动复位（清空记忆）、
+        有 root 说明切到了某个目录（更新记忆）。结构缺失时保持原样——
+        "猜"会把一份好记忆擦掉，而擦掉之后就再也恢复不了了。
+        """
+
+        info = workspace or {}
+        if info.get("kind") == "default":
+            self._workspace_root = ""              # 明确复位 → 不需要恢复
+        elif info.get("root"):
+            self._workspace_root = info["root"]    # 明确切到某目录
+
+    def _restore_workspace(self) -> str:
+        """把换代前的工作区设回去，返回恢复到的根（没恢复则空串）。
+
+        **为什么要有这一步**（2026-09-17 排查的那次事故）：
+        工作区是 sidecar 的**进程级状态**。用户打开了一个上传目录（比如
+        某个 Java 项目），sidecar 因环境原因死掉 → revive_shell 换了新壳 →
+        新壳的 initial_workspace 是**启动态 = 项目根**。于是工具静默换了根：
+        上一句还能 `fs_list` 出 docs/、backend/，下一句 `fs_read` 就说
+        "系统找不到指定的路径"。而前端只在用户主动操作时才刷新工作区，
+        界面上可能还显示着旧路径——现象看上去就是"工具在返回假数据"。
+
+        工作区是**边界**，边界不能悄悄变。所以换代时把它一起带过去。
+        """
+
+        if not self._workspace_root:
+            return ""
+        try:
+            result = self.shell.set_workspace("dir", self._workspace_root)
+        except Exception as exc:
+            # 恢复失败不能拖垮自愈本身，但也不能静默：喊出来，用户至少知道
+            # 现在的边界是哪个，而不是以为还在原来那个目录里。
+            print(f"[web_app] 换代后恢复工作区失败"
+                  f"（{self._workspace_root}）：{exc}")
+            self._workspace_root = ""
+            return ""
+        if isinstance(result, dict) and result.get("error"):
+            print(f"[web_app] 换代后恢复工作区被拒"
+                  f"（{self._workspace_root}）：{result['error']}")
+            return ""
+        return self._workspace_root
 
     def _record_event(self, data: dict) -> None:
         """SidecarShell.on_event 包装：data["event"] 是事件名，其余是载荷。"""
@@ -556,6 +610,7 @@ class WebApp:
         if "error" in result:
             return {"ok": False, "detail": result["error"]}
         workspace = result.get("workspace") or {}
+        self._remember_workspace(workspace)
         # detail 是给人看的一句话：root 是常态，但复位回的默认工作区可能
         # 压根不报 root（装配层没告知时只有 kind），别拼出"已切到 "这种半句。
         root = workspace.get("root") or ""

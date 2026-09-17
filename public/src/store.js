@@ -354,9 +354,14 @@ function noteOutcome(res) {
     pushLive("end", "✓ 本轮完成");           // 单色 glyph，不用彩色 emoji
     return;
   }
-  const text = status === "failed"
-    ? (res && res.output) || "本轮失败"
-    : "达到步数上限：模型没在限定轮数内给出最终回答，本轮被截断";
+  // max_steps 是**暂停**而不是失败：后端给的 output 已经把该说的说清了
+  // （用了几轮 / 任务没做完 / 直接说「继续」就能接着做——历史完整保留，
+  // 续跑真的有效）。所以优先显示 output；兜底文案也保留「继续」这个暗示，
+  // 因为对用户来说那是唯一能据此行动的信息，"本轮被截断"只能让他干瞪眼。
+  const fallback = status === "failed"
+    ? "本轮失败"
+    : "达到步数上限，本轮暂停（任务还没做完）；说「继续」可以接着做。";
+  const text = (res && res.output) || fallback;
   state.notice = { level: "warn", text };
   pushLive("warn", "⚠︎ " + text);            // U+26A0 + U+FE0E：强制文字形态
 }

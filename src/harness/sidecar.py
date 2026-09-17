@@ -208,6 +208,7 @@ class SidecarServer:
         registry: ToolRegistry,
         policy: Any,
         max_history: int = 20,
+        max_steps: int = 30,
         history_seed: Optional[Callable[[], list[dict]]] = None,
         store: Optional[SessionStore] = None,
         runtime_builder: Optional[WorkspaceRuntimeBuilder] = None,
@@ -231,6 +232,13 @@ class SidecarServer:
         self._runtime_builder = runtime_builder
         self._workspace_info: dict = dict(self._initial_workspace_info)
         self._max_history = max_history
+        # 单轮步数上限（2026-09-16）：run_agent 的签名默认是 5，那只是"循环
+        # 保险丝"；但用户接触的是这一层，默认值就是用户实际拿到的上限，
+        # 所以要给一个能干活的值。装配层会显式传 toolbox.resolve_max_agent_steps()
+        # （环境变量 WYWD_MAX_STEPS，默认 30）——harness 不能反向 import
+        # 装配层（依赖方向铁律），所以这里是同一数值的第二处声明，
+        # 改默认值时两处一起改。
+        self._max_steps = max_steps
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
         # s09：持久化注入 + 启动清账。
@@ -349,6 +357,7 @@ class SidecarServer:
             result = run_agent(
                 message, model=self._model, registry=self._registry,
                 history=trim_history(history, self._max_history),
+                max_steps=self._max_steps,
                 on_event=self._on_event, runner=self._runner)
             self._last_turn_status = result.status
             # usage 是这一轮的账（run_agent 在轮内跨 step 累加出来的 totals）。
@@ -438,6 +447,9 @@ class SidecarServer:
             # 空闲回收：0 表示没开。运维抽屉靠它显示"回收开着没、阈值多少"——
             # "运行时为什么被释放了"必须有个能看见的答案。
             "idleTimeout": self._idle_timeout,
+            # 单轮步数上限：运维面板要能看见"一个任务最多能走几步"——
+            # 它和 idleTimeout 一样属于"行为参数"，不该只活在代码里。
+            "maxSteps": self._max_steps,
         }
         # s08：模型挂了路由器就捎上成本表。duck typing（getattr 三参：
         # 读属性，没有就给 None）——裸 FakeModel/RealModel 没有

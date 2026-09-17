@@ -47,7 +47,14 @@ from src.harness.permissions import (
     build_default_policy,
 )
 from src.harness.real_model import RealModel
-from src.harness.std_tools import calc, find_text, glob_files, now, tree_dir
+from src.harness.std_tools import (
+    calc,
+    find_text,
+    glob_files,
+    now,
+    run_bash,
+    tree_dir,
+)
 from src.harness.tools import Tool, ToolRegistry
 from src.harness.workspace import Workspace
 from src.harness.workspace_memory import (
@@ -62,6 +69,69 @@ import os
 # 约占 3 条）。数字越小越省钱、记忆越短——这是取舍题，不是优化题。
 # 记忆策略归应用层（练习 10 铁律），harness 保持中立；两个入口共用。
 MAX_HISTORY_MESSAGES = 20
+
+# 单轮对话的步数上限：一次 model.generate 算一步，所以它直接决定
+# "一个任务最多能做几次工具往返"。
+#
+# 为什么从 5 提到 30（2026-09-16）：5 是 run_agent 的**签名默认值**，本意
+# 只是"循环要有个保险丝"；但装配层一直没显式传它，于是这个安全兜底悄悄
+# 变成了真实的业务上限——一个需要 6 轮的任务必然以 status="max_steps"
+# 收场（对照实验：.workbuddy/scratch/probe_step_limit.py）。
+#
+# 30 这个数怎么来的：同类框架的默认量级（2026-09 查证）——
+#   OpenAI Agents SDK  max_turns = 10（超限抛 MaxTurnsExceeded）
+#   LangGraph          recursion_limit = 25
+#   CrewAI             max_iter = 25
+#   smolagents         max_steps = 20（到顶时**强制给最终答案**）
+#   Vercel AI SDK      stepCountIs(20)
+# 注意单位不可直接搬：LangGraph 数的是 super-step（一个 super-step 里可以
+# 有多个并行节点），我们数的是"一次模型调用"。取 30 略高于它们，因为我们
+# 的工具粒度更细（一次调用只做一件事，读一个文件也算一步）。
+#
+# 调参方法（业界共识，别凭感觉）：跑一批真实任务，统计完成所需轮数的分布，
+# 取 P95 + 20% 余量。截断率 > 5% 说明上限偏低，或者模型该停的时候不停。
+MAX_AGENT_STEPS_DEFAULT = 30
+
+
+def resolve_max_agent_steps() -> int:
+    """读环境变量 WYWD_MAX_STEPS；没设 / 非法 / 非正数 → 默认 30。
+
+    与 WYWD_IDLE_REAP_SECONDS 同一套约定（见 shell._idle_reap_seconds）：
+    配置读不对就**喊一声再退回默认**——静默吞掉错配置比直接报错更难查，
+    而且这里退回默认比退回 0 安全（0 会让每一轮都立刻熔断）。
+    """
+
+    raw = (os.environ.get("WYWD_MAX_STEPS") or "").strip()
+    if not raw:
+        return MAX_AGENT_STEPS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[toolbox] WYWD_MAX_STEPS 不是整数（{raw!r}），"
+              f"用默认 {MAX_AGENT_STEPS_DEFAULT}")
+        return MAX_AGENT_STEPS_DEFAULT
+    if value <= 0:
+        print(f"[toolbox] WYWD_MAX_STEPS 必须为正数（{value}），"
+              f"用默认 {MAX_AGENT_STEPS_DEFAULT}")
+        return MAX_AGENT_STEPS_DEFAULT
+    return value
+
+
+def bash_enabled() -> bool:
+    """是否注册 bash 工具。`WYWD_DISABLE_BASH=1/true/yes/on` → 不注册。
+
+    **默认启用**，理由：它的安全不靠"关掉"，靠"每次执行都要审批"
+    （权限层的 `bash.requires_approval` → ASK）；一个开了审批闸门却默认不
+    上架的工具，等于白做。这个开关是给"我压根不想让模型碰 shell"的场景
+    准备的逃生阀，不是默认状态。
+
+    取舍的另一面：bash 是本项目唯一**跑得出沙箱**的能力（fs_* 的路径会被
+    `_resolve_safe` 拦住，命令拦不住）。所以关掉它是合理的保守选择，
+    只是不该替所有用户做这个决定。
+    """
+
+    raw = (os.environ.get("WYWD_DISABLE_BASH") or "").strip().lower()
+    return raw not in {"1", "true", "yes", "on"}
 
 
 def get_weather(city: str) -> str:
@@ -123,7 +193,7 @@ def build_instant_tools(root_: Path) -> list[Tool]:
         return glob_files(pattern, root, max_results, sandbox_root=root_)
     fs_glob.__doc__ = glob_files.__doc__
 
-    return [
+    tools = [
         Tool(
             name="get_weather",
             description="查询一个城市今天的天气（演示用模拟数据，不代表真实天气）",
@@ -178,6 +248,29 @@ def build_instant_tools(root_: Path) -> list[Tool]:
             handler=fs_glob,
         ),
     ]
+
+    # bash（2026-09-17）：唯一"跑得出沙箱"的能力，所以单独条件注册。
+    # 工具名必须**逐字叫 bash**：权限层那两条规则（bash.hard_deny /
+    # bash.requires_approval）是按名字匹配的，换个名字就落进 default.deny
+    # （fail-closed，安全但用不了）。
+    if bash_enabled():
+        def bash(command: str, timeout: int = 60) -> str:
+            # 与 fs_* 同一套规矩：root_ 被闭包吃掉，不进签名=不进 schema。
+            # 沙箱根在这里只是"工作目录"，挡不住命令自己 cd 出去——真正的
+            # 闸门是权限层那条 ASK（每次执行都要人点头）。
+            return run_bash(command, timeout, sandbox_root=root_)
+        bash.__doc__ = run_bash.__doc__
+
+        tools.append(Tool(
+            name="bash",
+            description="在项目目录里执行一条 shell 命令（工作目录固定为项目根，"
+            "默认超时 60 秒，输出上限 8000 字符）。"
+            "每次执行都需要用户审批；sudo/rm/reboot/shutdown/dd 开头的命令会被"
+            "直接拒绝且不可审批覆盖。适合跑测试、看 git 状态、装依赖之前先确认。",
+            handler=bash,
+        ))
+
+    return tools
 
 
 def write_memory_fact(content: str, kind: str = "outcome",
@@ -263,7 +356,7 @@ ALL_TOOLS: list[Tool] = build_instant_tools(ALLOWED_ROOT)
 DEFERRED_TOOLS: list[Tool] = build_deferred_tools(ALLOWED_ROOT)
 
 
-def build_history_seed(root=None) -> list[dict]:
+def build_history_seed(root=None, max_steps: int | None = None) -> list[dict]:
     """sidecar 会话的起步历史：工具目录 system + 工作区记忆有界视图。
 
     两个刻意的取舍：
@@ -278,7 +371,7 @@ def build_history_seed(root=None) -> list[dict]:
     共享常量而不是就地写字符串字面量。
     """
 
-    seed = with_system([])
+    seed = with_system([], max_steps)
     memory = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
     context = memory.get_context_for_agent()
     if context and context != NO_MEMORY_PLACEHOLDER:
@@ -291,6 +384,11 @@ def build_history_seed(root=None) -> list[dict]:
 # 注意：策略看见的是桥接工具 ToolSearch / DeferExecuteTool 本身，不是
 # 延迟工具 tree_dir——延迟加载把执行藏在桥后面，策略管不到穿透后的
 # 那一层（已知边界：tree_dir 只读 + 沙箱内，风险可接受）。
+#
+# bash（2026-09-17）**绝不能**加进这份名单：它是唯一跑得出沙箱的能力
+# （fs_* 的路径被 _resolve_safe 拦住，命令拦不住）。它的治理路径是
+# permissions 里那两条专属规则——bash.hard_deny（DENY）+ bash.requires_approval
+# （ASK），而且规则顺序保证 ASK 先于白名单，即便有人误加也拦得住。
 SAFE_TOOLS: frozenset[str] = frozenset({
     "get_weather", "now", "fs_list", "fs_read",
     "calc", "fs_find", "fs_glob", "ToolSearch", "DeferExecuteTool",
@@ -334,7 +432,7 @@ def build_policy() -> PermissionPolicy:
     return build_policy_for(DEFAULT_WORKSPACE)
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(max_steps: int | None = None) -> str:
     """系统提示：会话开局常驻的"工具目录"（对齐 s03 设计）。
 
     WorkBuddy 里延迟工具的目录是独立工件：模型在启动时必须看到
@@ -345,8 +443,15 @@ def build_system_prompt() -> str:
 
     目录读模块级 DEFERRED_TOOLS（默认工作区的产物）：工具的名字和
     描述是静态的，不随工作区变化——变的只有 handler 绑定的沙箱根。
+
+    步数预算（2026-09-16 新增）：业界把上限分成两种——**运行时强制**的
+    ceiling（模型看不见，撞上就被硬截断，产出半截子结果）与**告知模型**的
+    budget（模型据此自我规划：先做关键部分、接近上限时主动收尾）。只给
+    前者不够，得把预算"讲出来"，它才可能优雅收尾而不是无声停顿。
+    max_steps=None 时退回默认值，所以无参调用照旧可用。
     """
 
+    limit = MAX_AGENT_STEPS_DEFAULT if max_steps is None else max_steps
     deferred_directory = "\n".join(
         f"  - {tool.name}: {tool.description}" for tool in DEFERRED_TOOLS
     )
@@ -356,22 +461,31 @@ def build_system_prompt() -> str:
         "  - 即时工具：直接可用，不需要额外步骤（见你的工具列表）。\n"
         "  - 延迟工具：schema 不在你的工具列表里，想用必须先调 ToolSearch"
         " 按名称或用途搜索、拿到完整 schema，再用 DeferExecuteTool 执行。\n"
-        f"当前可用的延迟工具：\n{deferred_directory}"
+        f"当前可用的延迟工具：\n{deferred_directory}\n"
+        f"步数预算：这一轮你最多有 {limit} 步（一次模型调用算一步，"
+        "一次调用里可以同时请求多个工具）。据此规划：先做最关键的部分，"
+        "不要重复已经做过的步骤；剩余步数不多时主动收尾——说清已完成什么、"
+        "还差什么、下一步该做什么，不要在中途无声停下。"
     )
 
 
-def with_system(history: list[dict] | None) -> list[dict]:
-    """把系统提示（工具目录）放到会话最前，且幂等——不重复添加。
+def with_system(history: list[dict] | None,
+                max_steps: int | None = None) -> list[dict]:
+    """把系统提示（工具目录 + 步数预算）放到会话最前，且幂等——不重复添加。
 
     对齐 s03 的目录设计：目录是独立工件，常驻模型上下文；历史截断
     可能把 system 切出窗口（窗口比消息少时），这里自动补回；若
     history 第一条已是 system（上一轮的 result.messages 带回来的），
     直接原样返回。谁也不用特判。
 
+    max_steps 透传给 build_system_prompt（步数预算要写进 system）。
+    幂等的代价：会话中途改 WYWD_MAX_STEPS，老会话的历史里那条旧 system
+    不会更新——预算是"开局讲一次"的约定，不是每轮刷新，这个取舍可接受。
+
     chat.py / web_app.py / electron_shell.py 三个入口共用。
     """
 
-    system_message = {"role": "system", "content": build_system_prompt()}
+    system_message = {"role": "system", "content": build_system_prompt(max_steps)}
     if not history:
         return [system_message]
     if history[0].get("role") == "system":

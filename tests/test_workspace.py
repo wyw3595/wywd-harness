@@ -191,10 +191,11 @@ class DefaultBehaviorTests(unittest.TestCase):
     def test_default_registry_has_same_tools(self) -> None:
         # names() 含延迟工具（注册在册、只是不进 model_schemas）——
         # 与改造前的注册名单逐一对齐。
+        # 2026-09-17：加 bash（默认启用，靠 WYWD_DISABLE_BASH=1 才不上架）。
         expected = {
             "get_weather", "now", "fs_list", "fs_read", "fs_write", "fs_edit",
             "calc", "fs_find", "fs_glob", "tree_dir", "memory_write",
-            "ToolSearch", "DeferExecuteTool",
+            "ToolSearch", "DeferExecuteTool", "bash",
         }
         self.assertEqual(set(build_registry().names()), expected)
 

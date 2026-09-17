@@ -911,6 +911,89 @@ class ShellReviveTests(unittest.TestCase):
         self.assertFalse(app.revive_shell())
         self.assertIs(app.shell, shell)
 
+    def test_revive_restores_the_workspace(self) -> None:
+        """换代后必须把工作区设回去（2026-09-17 事故的直接修复）。
+
+        现场：用户打开了某个上传目录，sidecar 因环境原因死掉 → 自愈换了新壳
+        → 新壳的 initial_workspace 是**启动态 = 项目根** → 工具静默换根。
+        表现就是上一句能 `fs_list` 出 `docs/`、下一句 `fs_read` 说"系统找不到
+        指定的路径"，而前端没刷新工作区还显示着旧路径——看上去像"工具在返回
+        假数据"。工作区是边界，边界不能悄悄变。
+        """
+
+        made: list = []
+
+        def factory() -> FakeRevivableShell:
+            shell = FakeRevivableShell(alive=False)
+            made.append(shell)
+            return shell
+
+        first = factory()
+        app = self._app(first, factory)
+
+        app.set_workspace("open", "D:/some/java-project")
+        self.assertEqual(app._workspace_root, "D:/some/java-project")
+
+        first.stop()                      # sidecar 死了
+        self.assertTrue(app.revive_shell())
+
+        self.assertIs(app.shell, made[-1])          # 确实换了新壳
+        self.assertIn(("set_workspace", "dir:D:/some/java-project"),
+                      app.shell.ops)                # 且新壳被设回了原目录
+
+    def test_reset_clears_the_workspace_memory(self) -> None:
+        """用户主动复位（回默认工作区）之后，换代不该再设回去。
+
+        复位是明确的意图表达。把"记住的目录"在这种时候也带过去，等于
+        用户点了复位却复位不掉。
+        """
+
+        made: list = []
+
+        def factory() -> FakeRevivableShell:
+            shell = FakeRevivableShell(alive=False)
+            made.append(shell)
+            return shell
+
+        first = factory()
+        app = self._app(first, factory)
+
+        app.set_workspace("open", "D:/some/java-project")
+        app.set_workspace("reset")
+        self.assertEqual(app._workspace_root, "")
+
+        first.stop()
+        app.revive_shell()
+
+        self.assertNotIn(("set_workspace", "dir:D:/some/java-project"),
+                         app.shell.ops)
+
+    def test_restore_failure_does_not_break_the_revive(self) -> None:
+        """恢复失败不能拖垮自愈，但也不能静默——记忆要清掉，免得每次换代
+        都拿一个死路径去试。
+        """
+
+        class UngratefulShell(FakeRevivableShell):
+            def set_workspace(self, kind: str, path: str) -> dict:
+                self.ops.append(("set_workspace", kind + ":" + path))
+                return {"error": "目录不在了"}
+
+        made: list = []
+
+        def factory() -> UngratefulShell:
+            shell = UngratefulShell(alive=False)
+            made.append(shell)
+            return shell
+
+        first = factory()
+        app = self._app(first, factory)
+
+        app.set_workspace("open", "D:/some/java-project")
+        first.stop()
+
+        self.assertTrue(app.revive_shell())          # 自愈照常成功
+        self.assertEqual(app._workspace_root, "")    # 但记忆清掉了
+
 
 if __name__ == "__main__":
     unittest.main()
