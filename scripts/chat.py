@@ -38,7 +38,7 @@ from scripts.toolbox import (
     with_system,
 )
 from src.harness.agent import run_agent
-from src.harness.memory import trim_history
+from src.harness.compact import compact, model_summarizer
 from src.harness.permissions import (
     AuditTrail,
     GovernedToolRunner,
@@ -349,7 +349,16 @@ def main() -> None:
         # 成本刹车（练习 19）：调 run_agent 之前先把历史瘦到窗口大小。
         # result.messages 以截断后的历史为前缀，下一问自动延续瘦身的记忆。
         if history:
-            history = trim_history(history, MAX_HISTORY_MESSAGES)
+            # s14：四层压缩（预算内不动；超了从最便宜的层开始压，够用就停）。
+            # 条数上限继续当第二道闸——两道闸各管一件事：token 管"贵不贵"，
+            # 条数管"太长"。
+            history, report = compact(
+                history,
+                summarizer=model_summarizer(model),
+                keep=MAX_HISTORY_MESSAGES,
+            )
+            if report.changed:
+                print(f"  ⚙️ 上下文压缩：{report.render()}")
         # 目录常驻：system 提示（含延迟工具目录）每次调到最前，幂等。
         history = with_system(history, max_steps)
         # 透明化：发出前展示这次"发给模型的所有东西"——请求体由两部分

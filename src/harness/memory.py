@@ -16,6 +16,12 @@
     （成本 + 延迟 + 不确定性），留作后续选做。
 
 完成标志：tests/test_memory.py 全过，chat 连问多轮账单不再线性上涨。
+
+📌 2026-09-17 起：两个入口（sidecar / chat）的主路径换成了 compact（s14 的
+四层压缩管线）。`trim_history` **保留**——它是那条管线第 3 层的基础实现
+（"保最新 N 条 + 不拆散 assistant(tool_calls)/tool 配对"这条规矩就是从这里
+来的），`compact.prune_old_messages` 是它的加强版（多留一条首消息、多剥一层
+切口处的孤儿 tool 消息）。想只按条数截断时它仍然够用。
 """
 
 def trim_history(history: list[dict], max_messages: int) -> list[dict]:

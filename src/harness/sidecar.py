@@ -57,7 +57,11 @@ import uuid
 from typing import Any, Callable, Optional
 
 from src.harness.agent import run_agent
-from src.harness.memory import trim_history
+from src.harness.compact import (
+    COMPACT_THRESHOLD_TOKENS,
+    compact,
+    model_summarizer,
+)
 from src.harness.permissions import Approver, AuditTrail, GovernedToolRunner
 from src.harness.session import (
     SessionLifecycleError,
@@ -216,6 +220,7 @@ class SidecarServer:
         idle_timeout: float = 0.0,
         sweep_interval: float = 60.0,
         externalize: Optional[Callable[[str, str], str]] = None,
+        compact_budget: int = COMPACT_THRESHOLD_TOKENS,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -244,6 +249,9 @@ class SidecarServer:
         # None = 不外化（既有行为零变化）——和 runner/history_seed 一样，
         # harness 只留接缝，不决定磁盘布局。
         self._externalize = externalize
+        # s14：压缩预算（token）。超过它才启动四层管线——低于阈值时 compact
+        # 只做一次深拷贝就返回，零改动、零成本。
+        self._compact_budget = compact_budget
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
         # s09：持久化注入 + 启动清账。
@@ -344,6 +352,16 @@ class SidecarServer:
         self.rpc_handlers["workspace/set"] = self._handle_workspace_set
         self.rpc_handlers["workspace/get"] = self._handle_workspace_get
 
+    def _make_summarizer(self) -> Callable[[list[dict]], Optional[str]]:
+        """L4 摘要器（s14）：直接复用 compact.model_summarizer。
+
+        留这个方法只是为了让"摘要用哪个模型"这件事在 sidecar 里有个明确的
+        落点——将来若要换更便宜的档位（比如用 router 的 lite 槽）摘要，
+        改这一处即可，不必动管线。
+        """
+
+        return model_summarizer(self._model)
+
     def _make_turn_runner(self):
         """造 turn_runner 闭包：session 层的执行入口 → 本文件的 run_agent。
 
@@ -359,9 +377,17 @@ class SidecarServer:
             可能串台，output 不受影响——它走返回值）。
         """
         def turn_runner(message: str, history: list[dict]):
+            # s14：先做四层压缩（预算内不动；超了从最便宜的层开始压），
+            # 再让条数上限兜底。两道闸各管一件事：token 管"贵不贵"，
+            # 条数管"太长"（很多条极短的寒暄——token 不高但条数吓人）。
+            view, report = compact(
+                history, budget_tokens=self._compact_budget,
+                summarizer=self._make_summarizer(), keep=self._max_history)
+            if report.changed:
+                print(f"[sidecar] 上下文压缩：{report.render()}")
             result = run_agent(
                 message, model=self._model, registry=self._registry,
-                history=trim_history(history, self._max_history),
+                history=view,
                 max_steps=self._max_steps,
                 externalize=self._externalize,   # s13：超阈值输出换到磁盘
                 on_event=self._on_event, runner=self._runner)
