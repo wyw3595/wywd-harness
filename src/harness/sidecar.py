@@ -215,6 +215,7 @@ class SidecarServer:
         initial_workspace: Optional[dict] = None,
         idle_timeout: float = 0.0,
         sweep_interval: float = 60.0,
+        externalize: Optional[Callable[[str, str], str]] = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -239,6 +240,10 @@ class SidecarServer:
         # 装配层（依赖方向铁律），所以这里是同一数值的第二处声明，
         # 改默认值时两处一起改。
         self._max_steps = max_steps
+        # 工具输出外化（s13）：装配层用 ArtifactStore.externalize 填这个洞。
+        # None = 不外化（既有行为零变化）——和 runner/history_seed 一样，
+        # harness 只留接缝，不决定磁盘布局。
+        self._externalize = externalize
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
         # s09：持久化注入 + 启动清账。
@@ -358,6 +363,7 @@ class SidecarServer:
                 message, model=self._model, registry=self._registry,
                 history=trim_history(history, self._max_history),
                 max_steps=self._max_steps,
+                externalize=self._externalize,   # s13：超阈值输出换到磁盘
                 on_event=self._on_event, runner=self._runner)
             self._last_turn_status = result.status
             # usage 是这一轮的账（run_agent 在轮内跨 step 累加出来的 totals）。

@@ -402,5 +402,68 @@ class RunAgentFailureTests(unittest.TestCase):
         self.assertEqual(result.messages[0]["content"], "随便什么任务")
 
 
+class ExternalizeHookTests(unittest.TestCase):
+    """s13 外化钩子：工具结果在**写进历史之前**过一道。
+
+    为什么是钩子而不是直接 import：harness 认识"外化"这个机制，但不认识
+    磁盘布局——放哪儿、存多久是装配层的事。不传 = 完全关掉（零行为变化）。
+    """
+
+    def setUp(self) -> None:
+        self.registry = ToolRegistry()
+        self.registry.register(Tool(
+            name="big", description="测试用：吐一段大输出",
+            handler=lambda: "重要内容" * 500,
+        ))
+
+    def _model(self) -> ScriptedModel:
+        return ScriptedModel([
+            ModelReply(kind="tool_calls",
+                       tool_calls=[ToolCall("c1", "big", {})]),
+            ModelReply(kind="final", text="done"),
+        ])
+
+    def test_hook_sees_full_content_and_its_result_lands_in_messages(self) -> None:
+        """钩子拿到**完整**内容（判断必须基于全文），只有返回值进 messages。"""
+
+        seen: list[tuple[str, str]] = []
+
+        def hook(tool_name: str, content: str) -> str:
+            seen.append((tool_name, content))
+            return "[指针]"
+
+        result = run_agent("跑大工具", model=self._model(),
+                           registry=self.registry, externalize=hook)
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], "big")
+        self.assertIn("重要内容" * 500, seen[0][1])           # 钩子看到的是全文
+        tool_messages = [m for m in result.messages if m["role"] == "tool"]
+        self.assertIn("[指针]", tool_messages[0]["content"])   # 上下文只留指针
+
+    def test_hook_failure_falls_back_to_the_original_content(self) -> None:
+        """外化失败必须回退原始内容——工具结果不能因为外化而丢。
+
+        底线：外化是**优化**，不是执行的一部分。它炸了，结果照常回灌。
+        """
+
+        def boom(tool_name: str, content: str) -> str:
+            raise RuntimeError("磁盘满了")
+
+        result = run_agent("x", model=self._model(),
+                           registry=self.registry, externalize=boom)
+
+        tool_messages = [m for m in result.messages if m["role"] == "tool"]
+        self.assertIn("重要内容", tool_messages[0]["content"])
+
+    def test_no_hook_means_zero_change(self) -> None:
+        """不传钩子 = 完全关掉：内容原样进 messages（既有行为零变化）。"""
+
+        result = run_agent("x", model=self._model(), registry=self.registry)
+
+        tool_messages = [m for m in result.messages if m["role"] == "tool"]
+        self.assertIn("重要内容" * 500, tool_messages[0]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

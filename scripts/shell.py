@@ -55,6 +55,7 @@ from scripts.toolbox import (
     build_registry_for,
     resolve_max_agent_steps,
 )
+from src.harness.artifact import ArtifactStore
 from src.harness.jsonl_store import JsonlSessionStore
 from src.harness.sidecar import MainProcessClient, RPCConnection, SidecarServer
 from src.harness.workspace import Workspace
@@ -155,6 +156,12 @@ def _sidecar_process(sock: socket.socket) -> None:
     让上限成为"看得见的预算"（模型据此规划、接近时收尾），而不是撞墙才知道。
     """
     max_steps = resolve_max_agent_steps()
+    # s13 工具输出外化：大输出换到 .sessions/artifacts/tool-results/，
+    # 上下文里只留"指针 + 头尾预览"。放 .sessions 下与证据文件同级——
+    # 都是运行时数据、都已 gitignore，而且"会话产物整目录带走"这条规矩
+    # 不用再学一遍。注意它**不随工作区变**：artifact 是 sidecar 的运行
+    # 产物（谁跑的就归谁），不是被处理目录里的文件。
+    artifacts = ArtifactStore(Path(_PROJECT_ROOT) / ".sessions" / "artifacts")
     server = SidecarServer(
         model=build_model_router(),
         registry=build_registry(),
@@ -166,6 +173,7 @@ def _sidecar_process(sock: socket.socket) -> None:
         initial_workspace={"kind": "default", "root": str(DEFAULT_WORKSPACE.root)},
         idle_timeout=_idle_reap_seconds(),    # s12：空闲回收（默认关）
         max_steps=max_steps,                  # 单轮步数上限（默认 30）
+        externalize=artifacts.externalize,    # s13：超阈值工具输出外化
     )
     server.handle_connection(RPCConnection(sock))
 

@@ -46,6 +46,7 @@ def run_agent(
     history: list[dict] | None = None,
     on_event: Callable[[str, dict], None] | None = None,
     runner: GovernedToolRunner | None = None,
+    externalize: Callable[[str, str], str] | None = None,
 ) -> RunResult:
     """驱动模型最多 max_steps 轮，直到它给出最终回答。
 
@@ -65,6 +66,12 @@ def run_agent(
     关键节点都会广播事件——round_start / model_reply / tool_start /
     tool_end——调用方借此"实时直播"过程（终端打印、网页步骤卡、
     日志、计费统计都吃同一份事件流）。不传则完全安静。
+
+    外化钩子（s13 起）：传入 externalize(tool_name, content) 后，工具结果
+    在**写进历史之前**过一道——超阈值的大输出被换成"指针 + 头尾预览"
+    （见 src/harness/artifact.py 的 ArtifactStore）。不传 = 完全关掉，
+    既有行为零变化。为什么是钩子而不是直接 import：harness 认识"外化"
+    这个机制，但不认识磁盘布局——放哪儿、存多久是装配层的事。
 
     保险丝：连续 max_steps 轮没等到最终回答 -> 返回 status="max_steps"
     的 RunResult，output 说明用了几轮、最后请求了哪些工具、以及可以
@@ -196,6 +203,19 @@ def run_agent(
                 # 错误也是信息：回灌给模型让它自己决定下一步，
                 # 一次工具失败绝不拖垮同轮的其他调用。
                 content = f"工具 {call.name} 出错：{error}"
+
+            # 外化（s13）：超阈值的大输出换到磁盘，上下文里只留"指针 + 预览"。
+            # 放在 emit **之前**，是为了让事件流与 messages 看到同一份内容——
+            # 否则前端会拿到几 MB 去渲染，浏览器先卡死。
+            if externalize is not None:
+                try:
+                    content = externalize(call.name, content)
+                except Exception as error:
+                    # 外化失败绝不能吞掉工具结果：回退成原始 content 照常回灌。
+                    # 但要喊一声——静默降级比失败更难查（同 _idle_reap_seconds
+                    # 的取舍）。这是运维事件、不是模型需要知道的事，所以进日志
+                    # 而不是塞进 content。
+                    print(f"[harness] 工具输出外化失败（{call.name}）：{error}")
 
             emit(
                 "tool_end",

@@ -1904,8 +1904,59 @@ s10 的冒烟脚本踩过同一个坑，这次是我自己踩。
 推送时顺带把本地那条 `78ae91f`（修 SyntaxWarning：文档串里的 `D://` 没做成 raw string）
 也带上了——它之前同样只在本地（`dfabcbd..ecf8bd9`）。
 
-复现这套环境的方式：`.workbuddy/scratch/` 下有四个可直接跑的脚本——
+复现这套环境的方式：`.workbuddy/scratch/` 下有五个可直接跑的脚本——
 `probe_step_limit.py`（步数上限对照）、`verify_long_task.py`（长任务改动 5 检查点）、
-`demo_bash.py`（bash 四场景）、`verify_workspace_revive.py`（工作区换代恢复）。
+`demo_bash.py`（bash 四场景）、`verify_workspace_revive.py`（工作区换代恢复）、
+`demo_externalize.py`（输出外化端到端）。
+
+## 2026-09-17（续）：s13 工具输出外化 —— 长任务的第二半之一
+
+**为什么做它**：步数上限放开之后（见上上节），长任务的另一半瓶颈是**上下文**。
+一条 `grep -r` 或 `pytest -v` 的输出能比上下文窗口还大，而历史窗口只有 20 条
+（≈6 轮）——跑到后半程，早期的工具输出会被 `trim_history` 直接丢掉。
+s13 解决前半段：让**单条大输出**不再是一次性的上下文杀手。
+
+**机制（教材 s13 的换页思想）**：超阈值的工具输出写磁盘，上下文里只留
+「指针 + 头尾预览」。三件事分开，各有各的生命周期：
+
+| 表示 | 装什么 | 服务谁 |
+|---|---|---|
+| artifact 文件 | 完整工具输出 | 审计、按需读回（**唯一正文所有者**）|
+| context pointer | 来源 ID / 摘要 / SHA-256 / 路径 / 头尾预览 | 当前 turn 的模型 |
+| 缺页中断 | —— | 模型用 `fs_read` 按指针里的路径读回全文 |
+
+**新增 `src/harness/artifact.py`**：`ArtifactStore`（独占创建计数器、绝不覆盖）
++ `Artifact`（档案件）+ `summarize`（确定性摘要，不调模型）。
+**接缝**：`run_agent(..., externalize=...)` 钩子（可选、默认 None = 完全关掉，
+既有行为零变化）→ `SidecarServer(externalize=...)` → `shell.py` 装配
+`ArtifactStore(.sessions/artifacts)`。钩子放在 `emit("tool_end")` **之前**，
+让事件流与 messages 看到同一份内容（否则前端要渲染几 MB）。
+
+**与教材的三处刻意差异**
+1. **目录按工作区、不按会话**：我们的 `TurnRunner` 协议是
+   `(message, history) -> (output, messages)`，**拿不到会话 id**（session 层
+   不认识 agent 层，这条隔离不值得为了外化去破坏）。所以共享目录 +
+   独占创建保序。
+2. **只做两级表示**：教材的第三种（memory reference）属于 s10–s12 的保留策略。
+3. **数值全部重调，并补了一条教材没有的底线**：
+   - 教材 `BASH_MAX_OUTPUT_LENGTH = 30000` 与它的预览总长（head 6KB + tail 24KB
+     ≈ 30720）**几乎相等**——一旦触发外化，指针比原文还长，换页白做；
+   - 它按 KB（字节）算，而我们的输出里可能有大段中文（一字符三字节，
+     按字符切会放大三倍）；
+   - 我们的：预览 `head 2K + tail 8K = 10K 字符`，阈值 `bash 20K 字符 / 其它
+     20KB 字节`，外加 **`MIN_SHRINK_RATIO = 2`**（输出不到预览预算的两倍
+     就不换页）。
+   - **实测对比**：同一段 54913 字符的输出——按教材数值那版只压到 56.7%，
+     新数值压到 **19.4%**（10653 字符）。
+
+**验收**
+- **510 条测试全绿**（495 + 15 = 12 条 `test_artifact.py` + 3 条 agent 集成）
+- `.workbuddy/scratch/demo_externalize.py` 端到端：大输出 → 指针进 messages →
+  磁盘留全文 → 用 `fs_read` 读回成功。顺带实证了"绝不覆盖"：第二次跑生成的是
+  `tool_result_002`，而不是踩掉第一次的 `001`。
+
+**仍未做（s14）**：四层压缩管线（截断 → 去重 → 剪枝 → 摘要）+ durable context
+state。现在历史窗口仍是 20 条**硬截断**——s13 让单条输出不再是杀手，s14 才能
+让**整条历史**在长任务里活下来。
 
 
