@@ -1896,4 +1896,16 @@ L10 用 bash 干正事（含审批闸门）。
 **所有副作用必须进 `main()`，顶层只留 `if __name__ == "__main__"`** ——
 s10 的冒烟脚本踩过同一个坑，这次是我自己踩。
 
+### 提交
+
+**已提交并推送**：`ecf8bd9`「长任务上限可配 + bash 工具上架 + 修换代时工作区静默复位
+（495 绿）」——16 files changed, 1221 insertions(+)，含新增 `scripts/smoke_capability.py`。
+
+推送时顺带把本地那条 `78ae91f`（修 SyntaxWarning：文档串里的 `D://` 没做成 raw string）
+也带上了——它之前同样只在本地（`dfabcbd..ecf8bd9`）。
+
+复现这套环境的方式：`.workbuddy/scratch/` 下有四个可直接跑的脚本——
+`probe_step_limit.py`（步数上限对照）、`verify_long_task.py`（长任务改动 5 检查点）、
+`demo_bash.py`（bash 四场景）、`verify_workspace_revive.py`（工作区换代恢复）。
+
 
