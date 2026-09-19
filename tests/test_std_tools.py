@@ -344,6 +344,40 @@ class ToolboxAssemblyTests(unittest.TestCase):
         for deferred in DEFERRED_TOOLS:
             self.assertIn(deferred.name, prompt)
 
+    def test_states_the_hard_boundaries(self) -> None:
+        """四类硬边界必须写清楚——它们对应代码里**真实存在**的拒绝路径。
+
+        提示词与实现对不上（写了不存在的边界、或漏了存在的边界）都会让模型
+        白撞一次，而撞墙的代价是一次完整的工具往返。
+        """
+
+        from scripts.toolbox import build_system_prompt
+
+        prompt = build_system_prompt()
+        for fragment in ("工作目录", "审批", "硬性拒绝", "[Artifact:"):
+            self.assertIn(fragment, prompt, f"缺了边界说明：{fragment}")
+
+    def test_states_the_step_budget(self) -> None:
+        """预算要跟着参数走——它是"讲给模型听的上限"，不是写死的文案。"""
+
+        from scripts.toolbox import MAX_AGENT_STEPS_DEFAULT, build_system_prompt
+
+        self.assertIn(f"{MAX_AGENT_STEPS_DEFAULT} 步", build_system_prompt())
+        self.assertIn("7 步", build_system_prompt(max_steps=7))
+
+    def test_does_not_hardcode_user_preferences(self) -> None:
+        """用户偏好（语言、风格）**不进**系统提示——那归 s11 的用户记忆管。
+
+        硬编码在这里，换个人用就得改代码。这条测试就是那个设计决定的钉子：
+        提示词里一旦出现具体语言名，说明有人把偏好写回了代码。
+        """
+
+        from scripts.toolbox import build_system_prompt
+
+        prompt = build_system_prompt()
+        for leak in ("中文", "English", "Chinese"):
+            self.assertNotIn(leak, prompt, f"系统提示里不该出现语言偏好：{leak}")
+
     def test_tool_search_description_stays_clean(self) -> None:
         """ToolSearch 描述与目录职责分离：目录常驻 system，描述只负责
         "按名/按词召回"——不挟带目录（s03 原版：描述干净，前置检查
