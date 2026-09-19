@@ -60,18 +60,61 @@ agent 跑得越久消息越多。一次对话几十条消息，每条工具返�
 
 import copy
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Callable
 
-# 4 字符 ≈ 1 token 的粗略估算（教材口径）。精确计数要 tiktoken 那种外部词典，
-# 那会让"压不压"依赖词典版本；估算只需要单调 + 相对准——它决定的是**要不要压**，
-# 不是"花了多少钱"（后者由 provider 的 usage 说了算）。
-CHARS_PER_TOKEN = 4
+# ── Token 估算：**中英分开算** ────────────────────────────────────
+#
+# 教材用「4 字符 ≈ 1 token」，那是**英文**的经验值。中文的 token/字符比高得多
+# （1 个汉字 ≈ 0.6 token），照搬会**低估**：实测一个中文占 24% 的会话低估 1.34 倍，
+# 纯中文会低估到 2.4 倍。
+#
+# 这不是学术问题：阈值现在是「模型上限 × 90%」，估算偏小意味着**实际早已逼近上限
+# 而系统以为还宽裕**——压缩不触发，请求被 API 拒（HTTP 400）。
+CJK_CHARS_PER_TOKEN = 0.6      # 汉字
+OTHER_CHARS_PER_TOKEN = 0.25   # 非汉字（≈ 4 字符 / token，教材原口径）
 
-# 超过它就开始压（token）。给得比模型的硬上限低不少：压缩本身要留出余量，
-# 而且"刚好卡在线上"会让每一轮都触发压缩（抖动）。
-COMPACT_THRESHOLD_TOKENS = 60_000
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+
+# ── 压缩阈值：**模型上限的百分比** ────────────────────────────────
+#
+# 默认 1_000_000：现在跑的 `deepseek-chat` 是 **DeepSeek-V4-Flash 非思考模式的
+# 别名**（官方文档口径，2026-09），context length 1M。换模型要跟着改
+# （V3 时代是 128K）——`WYWD_CONTEXT_LIMIT` 可覆盖。
+DEFAULT_CONTEXT_LIMIT = 1_000_000
+
+# 用到上限的多少才压。留出的那 10% 给"这一轮还要长出来的输出"和估算误差。
+COMPACT_THRESHOLD_RATIO = 0.9
+
+
+def resolve_context_limit() -> int:
+    """模型上下文上限（token）。`WYWD_CONTEXT_LIMIT` 可覆盖。
+
+    非法值**喊一声再退回默认**（同 `resolve_max_agent_steps` 的取舍）——
+    静默吞掉错配置比报错难查得多。
+    """
+
+    raw = (os.environ.get("WYWD_CONTEXT_LIMIT") or "").strip()
+    if not raw:
+        return DEFAULT_CONTEXT_LIMIT
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[compact] WYWD_CONTEXT_LIMIT 不是整数（{raw!r}），"
+              f"用默认 {DEFAULT_CONTEXT_LIMIT}")
+        return DEFAULT_CONTEXT_LIMIT
+    if value <= 0:
+        print(f"[compact] WYWD_CONTEXT_LIMIT 必须为正数（{value}），"
+              f"用默认 {DEFAULT_CONTEXT_LIMIT}")
+        return DEFAULT_CONTEXT_LIMIT
+    return value
+
+
+# 注意：**import 时求值一次**——改环境变量要重启服务（与 WYWD_MAX_STEPS 的取舍
+# 一致：那个是函数所以每次读，这里要当函数默认参数用，只能是常量）。
+COMPACT_THRESHOLD_TOKENS = int(resolve_context_limit() * COMPACT_THRESHOLD_RATIO)
 
 # L1：单条 tool 消息的 token 上限。与 s13 的外化阈值（20K 字符）同量级——
 # s13 处理"值得落盘的大输出"，L1 是**不依赖 s13 的兜底**（外化关掉时它顶上）。
@@ -89,8 +132,20 @@ DEDUPABLE_TOOLS = frozenset({"fs_read", "fs_list"})
 # 一、Token 估算
 # ═══════════════════════════════════════════════════════════════
 
+def _count_text_tokens(text: str) -> int:
+    """一段文本的 token 估算：**中英分开算**。
+
+    用正则数汉字（C 实现，比逐字符循环快），其余按 4 字符/token。
+    返回值可能是 0（很短的英文片段）——调用方负责累加，不做"至少 1"的下限。
+    """
+
+    cjk = len(_CJK_PATTERN.findall(text))
+    other = len(text) - cjk
+    return int(cjk * CJK_CHARS_PER_TOKEN + other * OTHER_CHARS_PER_TOKEN)
+
+
 def estimate_tokens(messages: list[dict]) -> int:
-    """粗略估算消息列表的 token 数。
+    """估算消息列表的 token 数（**中英分开**，见上面常量的说明）。
 
     算三样：正文、tool_calls 里的参数、以及 tool 消息的正文。参数也要算——
     模型看得见它们，工具目录越大，真实账单越高。
@@ -100,10 +155,10 @@ def estimate_tokens(messages: list[dict]) -> int:
     for message in messages:
         content = message.get("content")
         if isinstance(content, str):
-            total += len(content) // CHARS_PER_TOKEN
+            total += _count_text_tokens(content)
         for call in message.get("tool_calls") or []:
             blob = json.dumps(call, ensure_ascii=False)
-            total += len(blob) // CHARS_PER_TOKEN
+            total += _count_text_tokens(blob)
     return total
 
 
@@ -250,16 +305,18 @@ def truncate_tool_results(
         content = message.get("content")
         if not isinstance(content, str):
             continue
-        tokens = len(content) // CHARS_PER_TOKEN
-        if tokens <= max_tokens:
+        if _count_text_tokens(content) <= max_tokens:
             continue
-        keep_chars = max_tokens * CHARS_PER_TOKEN
+        # 反推"保留多少字符"：按**最保守**的系数（汉字 0.6 token/字），
+        # 保证留下那段的 token 不会又超上限。内容若是英文，实际会截得更少
+        # ——L1 的目的是把 token 压下去，不是字符数精确对账。
+        keep_chars = int(max_tokens / CJK_CHARS_PER_TOKEN)
         message["content"] = (
             content[:keep_chars]
             + f"\n\n[... 已截断：原始 {len(content)} 字符，"
               f"此处保留前 {keep_chars} 字符 ...]"
         )
-        saved += tokens - max_tokens
+        saved += _count_text_tokens(content) - max_tokens
     return messages, saved
 
 
@@ -299,7 +356,7 @@ def dedup_file_reads(messages: list[dict]) -> tuple[list[dict], int]:
             continue
         content = message.get("content")
         if isinstance(content, str):
-            saved += len(content) // CHARS_PER_TOKEN
+            saved += _count_text_tokens(content)
         message["content"] = (
             f"（{key[1]} 这之后又被读过一次，此处内容已省略）"
         )

@@ -129,6 +129,9 @@ def run_agent(
             "model_reply",
             kind=reply.kind,
             text=reply.text,
+            # 思考模式的推理过程（s16 之后加的）：它不是回答的一部分，
+            # 单独走 reasoning 字段，前端拿去折叠展示；非思考模式是空串。
+            reasoning=getattr(reply, "reasoning", ""),
             tool_names=[call.name for call in reply.tool_calls],
         )
 

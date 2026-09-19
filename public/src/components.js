@@ -327,6 +327,7 @@ export const ChatArea = {
                 <template v-if="line.kind === 'call'">调用 <span class="t-name">{{ line.name }}</span> {{ line.text }}</template>
                 <template v-else-if="line.kind === 'out'"><span class="lf-arrow">↳</span> {{ line.text }}</template>
                 <template v-else-if="line.kind === 'round'">── {{ line.text }} ──</template>
+                <template v-else-if="line.kind === 'think'"><span class="lf-think-tag">💭 思考</span> <span class="lf-think">{{ line.text }}</span></template>
                 <template v-else-if="line.kind === 'model'">{{ line.text }}</template>
                 <template v-else>{{ line.text }}</template>
               </div>

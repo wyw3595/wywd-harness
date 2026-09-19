@@ -34,6 +34,23 @@ from src.harness.models import ModelReply, ToolCall
 # 无需改代码即可换到别的 OpenAI 兼容网关（WYWD_API_BASE）或模型档位（WYWD_MODEL）。
 DEEPSEEK_URL = os.environ.get("WYWD_API_BASE") or "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("WYWD_MODEL") or "deepseek-chat"
+
+# 思考模式（2026-09-19，配合"把思考发给前端"）：
+# - `deepseek-chat` 是 v4-flash **非思考模式**的兼容别名，服务端锁死了模式——
+#   对它发 thinking 参数没有用。要拿 reasoning_content 就得用 `deepseek-flash`
+#   并在请求里显式 `thinking: {"type": "enabled"}`。
+# - 代价要心里有数：思考模式的输出 $3.48/1M，是非思考（$0.28）的 **12 倍**；
+#   而且思考链条很长（每轮多几百到几千 token）。`WYWD_THINKING=0` 关掉。
+THINKING_MODEL = "deepseek-flash"
+
+
+def _thinking_enabled() -> bool:
+    """`WYWD_THINKING` 控制要不要走思考模式，**默认开**（用户要求看思考）。"""
+
+    raw = (os.environ.get("WYWD_THINKING") or "").strip().lower()
+    if raw:
+        return raw not in {"0", "false", "no", "off"}
+    return True
 REQUEST_TIMEOUT = 30  # 秒。网络调用必须设超时，否则可能永远卡住。
 MAX_RETRIES = 3
 
@@ -130,6 +147,7 @@ def _parse_reply(payload: dict) -> ModelReply:
                 raise ValueError(f"响应畸形：tool_calls 但没有工具调用。原始 message：{message}")
             return ModelReply(
                 kind="tool_calls",
+                reasoning=str(message.get("reasoning_content") or ""),
                 usage=usage,
                 tool_calls=[
                     ToolCall(
@@ -154,6 +172,7 @@ def _parse_reply(payload: dict) -> ModelReply:
     return ModelReply(
         kind="final",
         text=message.get("content") or "",
+        reasoning=str(message.get("reasoning_content") or ""),
         usage=usage,
         truncated=(choice.get("finish_reason") == "length"),
     )
@@ -179,8 +198,9 @@ class RealModel:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = DEEPSEEK_MODEL,
+        model: str | None = None,
         tools: list[dict] | None = None,
+        thinking: bool | None = None,
     ) -> None:
         # 参数优先、环境变量兜底；都没有就立刻失败——密钥缺失不能被重试掩盖。
         self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
@@ -189,7 +209,10 @@ class RealModel:
                 "缺少 DeepSeek API 密钥。请前往 platform.deepseek.com 申请，"
                 "并将其设置为环境变量 DEEPSEEK_API_KEY，或在初始化时直接传入。"
             )
-        self.model = model
+        # 模型名没显式给的话，按思考开关决定：deepseek-chat 别名锁死非思考，
+        # 要 reasoning_content 就得用 deepseek-flash + thinking enabled。
+        self.thinking = _thinking_enabled() if thinking is None else thinking
+        self.model = model or (THINKING_MODEL if self.thinking else DEEPSEEK_MODEL)
 
         # 连接复用（练习 18）：Session 自带连接池——每次 requests.post 都要
         # 重新 TCP+TLS 握手（一次几百毫秒），而 Agent 循环"短间隔、多次、
@@ -213,6 +236,8 @@ class RealModel:
         }
         if self.tools:
             payload["tools"] = self.tools
+        if self.thinking:
+            payload["thinking"] = {"type": "enabled"}
 
         # 永久性错误快速失败（练习 16）：401 这类错误重试一万次也是它，
         # 所以先判策略再 raise_for_status。RuntimeError 不在 RequestException

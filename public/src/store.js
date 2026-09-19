@@ -410,6 +410,14 @@ function handleEvent(ev) {
   if (ev.event === "round_start") {
     pushLive("round", "第 " + ((ev.step || 0) + 1) + " 轮");
   } else if (ev.event === "model_reply") {
+    // 思考模式（s16 之后）：reasoning_content 单独展示——它**不是回答**，
+    // 只是"模型刚才在想什么"的痕迹。全文可能很长（几百到几千 token），
+    // live-feed 里截 300 字符；要全文的话那不是这行的事。
+    if (ev.reasoning) {
+      let thought = String(ev.reasoning);
+      if (thought.length > 300) thought = thought.slice(0, 300) + "…";
+      pushLive("think", thought);
+    }
     if (ev.kind === "tool_calls") {
       pushLive("model", "决定调用：" + ((ev.tool_names || []).join("、") || "?"));
     } else {

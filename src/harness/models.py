@@ -44,6 +44,11 @@ class ModelReply:
     # 预算掐断 ≠ 完成，harness 必须如实告诉调用方"答案不完整"。
     # 离线模型不截断，默认 False——协议加字段，旧实现零改动。
     truncated: bool = False
+    # 思考模式（s16 之后新增）：DeepSeek 思考模式的输出里有一个独立的
+    # reasoning_content 字段——模型的推理过程。它**不是**回答的一部分
+    # （不该进历史、不该被引用），但用户可能想看"它刚才在想什么"。
+    # 默认空串：非思考模式的响应没有这个字段，协议加字段旧实现零变化。
+    reasoning: str = ""
 
 
 class Model(Protocol):
