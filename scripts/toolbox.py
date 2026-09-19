@@ -55,6 +55,7 @@ from src.harness.std_tools import (
     run_bash,
     tree_dir,
 )
+from src.harness.skills import SKILLS_DIR_NAME, SkillError, SkillIndex
 from src.harness.tools import Tool, ToolRegistry
 from src.harness.user_memory import (
     NO_USER_MEMORY_PLACEHOLDER,
@@ -169,6 +170,29 @@ def build_user_memory() -> UserMemory:
     """按当前配置造一个 UserMemory（轻对象，只存路径，每次现造没成本）。"""
 
     return UserMemory(user_memory_root(), current_user_id())
+
+
+def user_skills_dir() -> Path:
+    """用户级技能目录（跨项目）。`WYWD_SKILLS_ROOT` 可覆盖（测试要用临时目录）。"""
+
+    override = (os.environ.get("WYWD_SKILLS_ROOT") or "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".workbuddy" / SKILLS_DIR_NAME
+
+
+def build_skill_index(root=None) -> SkillIndex:
+    """建技能索引：**用户级 + 项目级**两级。
+
+    项目级目录跟着**工作区**走（`{workspace}/.workbuddy/skills`）——和记忆一样，
+    "这个项目的约定"属于这个项目；个人习惯放用户级。同名时项目级优先。
+    """
+
+    workspace = Path(root) if root is not None else ALLOWED_ROOT
+    return SkillIndex(
+        user_dir=user_skills_dir(),
+        project_dir=workspace / ".workbuddy" / SKILLS_DIR_NAME,
+    )
 
 
 def get_weather(city: str) -> str:
@@ -393,7 +417,26 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
             return f"没改成功：{error}"
         return f"已更新用户资料：{result.render()}"
 
+    def load_skill(name: str) -> str:
+        """展开一个技能的完整操作指南。
+
+        Args:
+            name: 技能名，如 git-commit（系统提示的技能目录里列的那些）。
+        """
+
+        try:
+            return build_skill_index(root_).load(name)
+        except SkillError as error:
+            return f"没取到：{error}"
+
     return [
+        Tool(
+            name="load_skill",
+            description="展开一个技能的完整操作指南。技能**目录**已经在系统提示里"
+            "（名字 + 用途 + 什么时候用）；要照某一份指南做事时就取它的全文。",
+            handler=load_skill,
+            defer=True,
+        ),
         Tool(
             name="save_user_preference",
             description="记下一条**跨项目**长期有效的偏好（如 response.language、"
@@ -453,12 +496,16 @@ DEFERRED_TOOLS: list[Tool] = build_deferred_tools(ALLOWED_ROOT)
 
 
 def build_history_seed(root=None, max_steps: int | None = None,
-                       user_memory: "UserMemory | None" = None) -> list[dict]:
-    """sidecar 会话的起步历史：工具目录 + 工作区记忆 + 用户记忆。
+                       user_memory: "UserMemory | None" = None,
+                       skill_index: "SkillIndex | None" = None) -> list[dict]:
+    """sidecar 会话的起步历史：工具目录 + 工作区记忆 + 用户记忆 + 技能目录。
 
-    三块**各自成一条 system**，不合并：所有权不同（项目 / 个人），
+    四块**各自成一条 system**，不合并：所有权不同（项目 / 个人 / 扩展），
     分开注入才能在日志里一眼看出哪块是谁的；到 s15 做 Prompt 组装时，
     顺序与预算由那一层统一决定——现在先各就各位。
+
+    技能这里只放**目录**（名字 + 摘要 + 何时用，每个技能约 50 token）；
+    正文等命中触发词再展开——见 SkillIndex.render_matches 与 load_skill 工具。
 
     两个刻意的取舍：
 
@@ -485,6 +532,13 @@ def build_history_seed(root=None, max_steps: int | None = None,
         if user_context and user_context != NO_USER_MEMORY_PLACEHOLDER:
             seed.append({"role": "system", "content": user_context})
 
+    # 技能目录（s16）：**只列目录**，正文等命中触发词再展开。这一段是常驻的，
+    # 所以它必须便宜——每个技能约 50 token，而不是 500~5000。
+    if skill_index is not None:
+        directory = skill_index.render_directory()
+        if directory:
+            seed.append({"role": "system", "content": directory})
+
     return seed
 
 # 免审批白名单（练习 s04）：只读 / 沙箱内的工具显式放行。fs_write
@@ -507,6 +561,10 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     # 取舍的另一面：跨项目 + 跨会话的影响面确实比工作区记忆大；但"改一次
     # 偏好弹一次窗"会让这个功能根本没法用（偏好本来就是随手记的）。
     "save_user_preference", "update_user_profile",
+    # 技能加载（s16）同样免审批：它只是**读**一份操作指南，不改任何东西。
+    # 真正要设防的是技能正文里让你做的那些事——那要过各自的闸门
+    # （bash 审批、写文件审批），而不是在这里卡"读指南"。
+    "load_skill",
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions

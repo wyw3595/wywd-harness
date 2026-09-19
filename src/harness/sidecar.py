@@ -69,6 +69,7 @@ from src.harness.session import (
     SessionState,
     SessionStore,
 )
+from src.harness.skills import SkillIndex
 from src.harness.tools import ToolRegistry
 
 # 工作区运行件工厂（s11 上传目录）：由装配层注入，harness 不认识 Workspace。
@@ -221,6 +222,7 @@ class SidecarServer:
         sweep_interval: float = 60.0,
         externalize: Optional[Callable[[str, str], str]] = None,
         compact_budget: int = COMPACT_THRESHOLD_TOKENS,
+        skill_index: Optional[SkillIndex] = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -252,6 +254,9 @@ class SidecarServer:
         # s14：压缩预算（token）。超过它才启动四层管线——低于阈值时 compact
         # 只做一次深拷贝就返回，零改动、零成本。
         self._compact_budget = compact_budget
+        # 技能索引（s16）：None = 这个 sidecar 不带技能（老装配零感知）。
+        # 目录由装配层放进 history_seed，正文由这里的 _inject_skills 按需展开。
+        self._skill_index = skill_index
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
         # s09：持久化注入 + 启动清账。
@@ -352,6 +357,46 @@ class SidecarServer:
         self.rpc_handlers["workspace/set"] = self._handle_workspace_set
         self.rpc_handlers["workspace/get"] = self._handle_workspace_get
 
+    def _inject_skills(self, view: list[dict], message: str) -> list[dict]:
+        """把命中触发词的技能**正文**追加进本轮视图（已注入过的跳过）。
+
+        分工：**目录**由装配层放进 history_seed（常驻、便宜）；**正文**在这里
+        按需展开（贵、只在命中时）。
+
+        两个刻意的取舍：
+        - **重复命中就跳过**：同一个技能在长对话里可能被命中很多次，每次都追加
+          就是白烧 token，而"再提醒一遍"的收益几乎为零——上文里已经有它了；
+        - **注入的正文会进 transcript**（因为它是本轮 messages 的一部分）。
+          这是**有意**的：重放会话时能看到"当时凭什么那么做"，可审计的价值
+          高于那点存储。老化的副本交给 compact 的 L1/L3 处理。
+
+        任何异常都**不影响本轮**：技能是锦上添花，不是关键路径。
+        """
+
+        if self._skill_index is None:
+            return view
+
+        try:
+            hits = self._skill_index.match(message)
+        except Exception as error:
+            print(f"[sidecar] 技能匹配失败（不影响本轮）：{error}")
+            return view
+
+        existing = "\n".join(str(item.get("content", ""))
+                             for item in view if item.get("role") == "system")
+        for skill in hits:
+            marker = f"# 技能：{skill.name}"
+            if marker in existing:
+                continue
+            try:
+                body = self._skill_index.load(skill.name)
+            except Exception as error:
+                print(f"[sidecar] 技能 {skill.name} 加载失败（跳过）：{error}")
+                continue
+            view.append({"role": "system",
+                         "content": f"{marker}（命中触发词后自动展开）\n\n{body}"})
+        return view
+
     def _make_summarizer(self) -> Callable[[list[dict]], Optional[str]]:
         """L4 摘要器（s14）：直接复用 compact.model_summarizer。
 
@@ -385,6 +430,8 @@ class SidecarServer:
                 summarizer=self._make_summarizer(), keep=self._max_history)
             if report.changed:
                 print(f"[sidecar] 上下文压缩：{report.render()}")
+            # s16：命中触发词的技能正文在这里**按需展开**（目录早就在 system 里）。
+            view = self._inject_skills(view, message)
             result = run_agent(
                 message, model=self._model, registry=self._registry,
                 history=view,

@@ -53,6 +53,7 @@ from scripts.toolbox import (
     build_policy_for,
     build_registry,
     build_registry_for,
+    build_skill_index,
     build_user_memory,
     resolve_max_agent_steps,
 )
@@ -163,20 +164,27 @@ def _sidecar_process(sock: socket.socket) -> None:
     # 不用再学一遍。注意它**不随工作区变**：artifact 是 sidecar 的运行
     # 产物（谁跑的就归谁），不是被处理目录里的文件。
     artifacts = ArtifactStore(Path(_PROJECT_ROOT) / ".sessions" / "artifacts")
+    # s16 技能索引：**建一次、两处共用**——目录（进 seed）与正文（按需展开）
+    # 必须是同一份视图，否则"列出来的"和"能加载的"可能对不上。
+    # 代价：运行中新增/修改技能不会被察觉（要重启服务，或手动 reload()）。
+    skills = build_skill_index()
     server = SidecarServer(
         model=build_model_router(),
         registry=build_registry(),
         policy=build_policy(),
         # s10：工具目录 + 工作区记忆（空记忆时与旧行为一致）。
-        # s11：再加上用户记忆（跨项目的那一份）——两者各自成一条 system。
+        # s11：用户记忆（跨项目）。s16：技能**目录**（正文按需展开）。
         history_seed=lambda: build_history_seed(
-            max_steps=max_steps, user_memory=build_user_memory()),
+            max_steps=max_steps,
+            user_memory=build_user_memory(),
+            skill_index=skills),
         store=JsonlSessionStore(root=Path(_PROJECT_ROOT) / ".sessions"),
         runtime_builder=_workspace_runtime,   # s11：上传目录 / 换沙箱
         initial_workspace={"kind": "default", "root": str(DEFAULT_WORKSPACE.root)},
         idle_timeout=_idle_reap_seconds(),    # s12：空闲回收（默认关）
         max_steps=max_steps,                  # 单轮步数上限（默认 30）
         externalize=artifacts.externalize,    # s13：超阈值工具输出外化
+        skill_index=skills,                   # s16：命中触发词时展开正文
     )
     server.handle_connection(RPCConnection(sock))
 

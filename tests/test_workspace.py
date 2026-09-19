@@ -198,6 +198,8 @@ class DefaultBehaviorTests(unittest.TestCase):
             "ToolSearch", "DeferExecuteTool", "bash",
             # s11 用户记忆（2026-09-19）：跨项目的那一份
             "save_user_preference", "update_user_profile",
+            # s16 技能（2026-09-19）：目录常驻、正文按需展开
+            "load_skill",
         }
         self.assertEqual(set(build_registry().names()), expected)
 
