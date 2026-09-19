@@ -2085,4 +2085,21 @@ keep=max_history)`。两道闸各管一件事：token 预算管"贵不贵"，条
 教材 24 章，现在覆盖 **s01~s11 + s13 + s14**（s12 云端记忆仍未做）。
 **s15 的前置还差 s12 的召回链。**
 
+### 环境坑（2026-09-19 补充，两条都当场踩到过）
+
+**① 这个 shell 里不要用任何 POSIX 文本工具。**
+`ls` / `mkdir` / `grep` / `tail` / `head` / `sed` / `dirname` 在 PATH 里**时有时无**
+——同一条 `tail -6` 报 "command not found"，而 `tail -c 600` 又跑通了。
+对策：用 `echo` 的通配符展开列目录，把输出**重定向到文件再读**，
+不要试图用文本工具做后处理。09-17 和 09-19 各踩一次，每次白跑一轮。
+
+**② `git push` 会卡住。**
+这个远程偶发长时间无响应：09-17 是 `SSL_ERROR_SYSCALL`（报错退出），
+09-19 是**挂起 3 分钟毫无输出**（连命令末尾的 `echo DONE` 都没写进去）。
+对策：
+- 一律后台跑 + 重定向；
+- 给 git 自己设低速超时：`git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 push origin master`；
+- 卡住就停掉重试（原地重试通常就好）；
+- **push 前先确认 commit 已在本地**——push 卡住不影响提交，重试是安全的。
+
 
