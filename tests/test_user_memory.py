@@ -325,5 +325,64 @@ class PromptContextTests(UserMemoryCase):
         self.assertIn("# 用户偏好", context)
 
 
+class ToolWiringTests(unittest.TestCase):
+    """接线契约：工具 schema 不该暴露 provenance，白名单不能漏。"""
+
+    def test_schema_hides_provenance(self) -> None:
+        """`source_event_id` 是 Harness provenance——**不能**出现在工具 schema 里。
+
+        给了模型这个参数，它就会编一个出来（而那是要写进审计记录的东西）。
+        所以它只在程序化入口上，不在工具签名里。
+        """
+
+        from scripts.toolbox import build_registry
+        from src.harness.tools import tool_to_schema
+
+        params = tool_to_schema(
+            build_registry().get("save_user_preference")
+        )["function"]["parameters"]
+
+        self.assertEqual(set(params["properties"]),
+                         {"key", "value", "expires_at"})
+        self.assertNotIn("source_event_id", json.dumps(params))
+
+    def test_tools_are_allowlisted(self) -> None:
+        """两个工具都要在免审批白名单里——漏了就是 default.deny，根本用不了。"""
+
+        from scripts.toolbox import SAFE_TOOLS
+
+        self.assertIn("save_user_preference", SAFE_TOOLS)
+        self.assertIn("update_user_profile", SAFE_TOOLS)
+
+    def test_seed_carries_user_context_as_its_own_message(self) -> None:
+        """用户记忆注入成**独立的一条 system**（工作区记忆是另一条）。
+
+        分开注入是刻意的：所有权不同，日志里要能一眼看出哪块是谁的。
+        同时工具目录必须仍在**第一条**——FakeModel 只读第一条消息。
+        """
+
+        from scripts.toolbox import build_history_seed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = UserMemory(Path(tmp), "u1")
+            memory.set_preference("response.language", "Chinese")
+            seed = build_history_seed(user_memory=memory)
+
+        self.assertEqual(seed[0]["role"], "system")
+        self.assertIn("工具", seed[0]["content"])        # 第一条还是工具目录
+        self.assertTrue(any("response.language" in str(item.get("content"))
+                            for item in seed if item["role"] == "system"))
+
+    def test_empty_user_memory_adds_no_message(self) -> None:
+        """空记忆不追加消息——"没记忆"和"有记忆"的区别只该是多一条 system。"""
+
+        from scripts.toolbox import build_history_seed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = build_history_seed(user_memory=UserMemory(Path(tmp), "u1"))
+
+        self.assertEqual(len(seed), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
