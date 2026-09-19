@@ -2093,13 +2093,26 @@ keep=max_history)`。两道闸各管一件事：token 预算管"贵不贵"，条
 对策：用 `echo` 的通配符展开列目录，把输出**重定向到文件再读**，
 不要试图用文本工具做后处理。09-17 和 09-19 各踩一次，每次白跑一轮。
 
-**② `git push` 会卡住。**
-这个远程偶发长时间无响应：09-17 是 `SSL_ERROR_SYSCALL`（报错退出），
-09-19 是**挂起 3 分钟毫无输出**（连命令末尾的 `echo DONE` 都没写进去）。
+**② `git push` 会卡住 —— 根因通常是凭据 401，不是网络。**
+2026-09-19 查清：三次 push 都零输出挂起（3m20s / 36s / 31s），**但 `ls-remote` 通**
+（公开仓库只读、不需要认证）。用
+`GIT_CURL_VERBOSE=1 GIT_TERMINAL_PROMPT=0 git push` 看到真相：
+
+```
+Established connection to github.com (20.205.243.166 port 443)   ← 连接是通的
+<= Recv header: HTTP/1.1 401 Unauthorized
+<= Recv header: www-authenticate: Basic realm="GitHub"
+```
+
+`credential.helper = helper-selector`（宿主注入）取不到有效凭据，git 就挂在那里
+等——后台没有 TTY，`GIT_TERMINAL_PROMPT=0` 也拦不住 helper 的等待。
+
 对策：
-- 一律后台跑 + 重定向；
-- 给 git 自己设低速超时：`git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 push origin master`；
-- 卡住就停掉重试（原地重试通常就好）；
-- **push 前先确认 commit 已在本地**——push 卡住不影响提交，重试是安全的。
+- **先 `git ls-remote origin`**：通了就说明网络没问题，别再折腾网络；
+- 再上 verbose 看真实响应：**401 = 凭据问题**，需要**在你自己的终端 push**
+  （只有那边有 TTY 能走凭据交互，或先重新登录 GitHub 凭据）；
+- `git -c http.lowSpeedLimit=... -c http.lowSpeedTime=...` 只管**传输速率**，
+  管不了建连与认证，别指望它；
+- 一律后台跑 + 重定向，卡住就停掉——**commit 早就在本地了，重试是安全的**。
 
 
