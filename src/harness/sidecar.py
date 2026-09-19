@@ -443,7 +443,23 @@ class SidecarServer:
             # dict() 复制是防御习惯：存引用的话，将来谁在返回后动了那个字典，
             # 这里会跟着变——"快照存的应该是那一刻的值"（练习 08 的老教训）。
             self._last_turn_usage = dict(result.usage)
-            return result.output, result.messages
+
+            # 落盘的必须是【原始历史 + 本轮新增】——压缩视图只发给模型，
+            # **不进证据**。
+            #
+            # 为什么不直接 return result.messages：jsonl_store 是 append-only，
+            # save 时校验「record.messages 的前缀 == 已落盘的内容」，而
+            # session.py 写明的不变量是「record.messages **单调增长**，
+            # trim 从不回写 Record」。早先直接把 result.messages 回写，
+            # 压缩一旦真改了内容（L1 截断 / L2 去重 / L3 修剪 / L4 摘要**
+            # 任一出面**），前缀就变了 → 第二轮保存被拒
+            # （TranscriptCorruptionError），整个会话卡死。
+            # 正确的分工：**模型看压缩视图，证据记原始历史**。
+            #
+            # 副产品：_inject_skills 展开的技能正文也不再落盘了——它每轮
+            # 按需重生，本来就不该进证据。
+            appended = result.messages[len(view):]
+            return result.output, list(history) + appended
         return turn_runner
 
     def _log(self, msg: str) -> None:

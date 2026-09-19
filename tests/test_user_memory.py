@@ -374,12 +374,20 @@ class ToolWiringTests(unittest.TestCase):
                             for item in seed if item["role"] == "system"))
 
     def test_empty_user_memory_adds_no_message(self) -> None:
-        """空记忆不追加消息——"没记忆"和"有记忆"的区别只该是多一条 system。"""
+        """空记忆不追加消息——"没记忆"和"有记忆"的区别只该是多一条 system。
+
+        **root 必须也指向临时目录**：否则会读到真实的工作区记忆，而它随时可能
+        因为一次 memory_write 变成非空——测试不该依赖会变的外部状态。
+        （这个坑 2026-09-19 真的踩到了：另一个会话写了条记忆，这条测试就红了。）
+        """
 
         from scripts.toolbox import build_history_seed
 
         with tempfile.TemporaryDirectory() as tmp:
-            seed = build_history_seed(user_memory=UserMemory(Path(tmp), "u1"))
+            seed = build_history_seed(
+                root=Path(tmp),
+                user_memory=UserMemory(Path(tmp), "u1"),
+            )
 
         self.assertEqual(len(seed), 1)
 

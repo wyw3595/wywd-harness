@@ -804,5 +804,75 @@ class MainProcessClientTests(unittest.TestCase):
             client.call("sidecar/ping")
 
 
+class CompactionTranscriptTests(unittest.TestCase):
+    """压缩与 append-only 证据的共存：**压缩不能改落盘历史**。
+
+    回归 2026-09-19 那个 P0：`turn_runner` 早先把 `result.messages`（含压缩视图）
+    直接回写 Record，而 session.py 的不变量是「record.messages 单调增长、trim
+    从不回写 Record」。压缩一旦真出手（L1~L4 任一），回写的前缀就与已落盘的不同
+    → `jsonl_store.save` 判"证据被回改" → **第二轮直接卡死**。
+
+    触发条件刻意压得很小（预算 100 + 保留 4 条），否则默认 60K 预算下短会话
+    压根不压缩，这个坑测不出来。
+    """
+
+    def _build(self, budget: int, max_history: int) -> SidecarServer:
+        registry = ToolRegistry()
+        registry.register(Tool(name="probe", description="测试用工具",
+                               handler=lambda: "填充内容。" * 300))
+        model = ScriptedModel([
+            ModelReply(kind="tool_calls",
+                       tool_calls=[ToolCall("c1", "probe", {})]),
+            ModelReply(kind="tool_calls",
+                       tool_calls=[ToolCall("c2", "probe", {})]),
+            ModelReply(kind="final", text="第一条回答"),
+            ModelReply(kind="final", text="第二条回答"),
+        ])
+        return SidecarServer(
+            model=model,
+            registry=registry,
+            policy=build_default_policy(),
+            store=JsonlSessionStore(root=Path(tempfile.mkdtemp())),
+            history_seed=lambda: [{"role": "system", "content": "系统提示"}],
+            compact_budget=budget,
+            max_history=max_history,
+        )
+
+    def test_compaction_keeps_the_evidence_append_only(self) -> None:
+        """压缩真出手时，落盘的仍是**原始历史**——第二轮照常能发。"""
+
+        server = self._build(budget=100, max_history=4)
+        store = server._manager.store
+        sid = server._handle_session_create({})["sessionId"]
+
+        first = server._handle_agent_send({"sessionId": sid, "message": "第一问"})
+        self.assertEqual(first.get("status"), "completed")
+        after_first = store.load(sid).messages
+
+        # 第二轮：压缩会动手（日志里能看到 L3/L4），但**不能碰落盘前缀**
+        second = server._handle_agent_send({"sessionId": sid, "message": "第二问"})
+        self.assertEqual(second.get("status"), "completed")
+
+        after_second = store.load(sid).messages
+        self.assertGreater(len(after_second), len(after_first))
+        self.assertEqual(
+            after_second[:len(after_first)], after_first,
+            "落盘历史被改写了——append-only 不变量被破坏（压缩视图不该进证据）")
+
+    def test_compaction_leaves_transcript_untouched_when_idle(self) -> None:
+        """预算充裕时压缩不跑，落盘自然也不受影响（既有行为的回归）。"""
+
+        server = self._build(budget=60_000, max_history=20)
+        store = server._manager.store
+        sid = server._handle_session_create({})["sessionId"]
+
+        server._handle_agent_send({"sessionId": sid, "message": "第一问"})
+        after_first = store.load(sid).messages
+        server._handle_agent_send({"sessionId": sid, "message": "第二问"})
+        after_second = store.load(sid).messages
+
+        self.assertEqual(after_second[:len(after_first)], after_first)
+
+
 if __name__ == "__main__":
     unittest.main()
