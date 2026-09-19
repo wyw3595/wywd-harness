@@ -48,13 +48,14 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional
+
+from src.harness.file_tools import atomic_write_text
 
 
 SCHEMA_VERSION = 1
@@ -420,46 +421,18 @@ class WorkspaceMemory:
         return sorted(facts, key=lambda item: item.recorded_at)
 
     def _atomic_write_text(self, path: Path, content: str) -> None:
-        """原子替换：要么是完整的新文件，要么旧文件原封不动（本课新机制）。
+        """原子写文本——转发到 `file_tools.atomic_write_text`。
 
-        四步，顺序不能换：
+        2026-09-19 收敛：这里原来抄了一份同机制的实现，并在 docstring 里
+        留了话——"等这一课过了，再把其中一份改成调用另一份"。那天到了：
+        s11 用户记忆也要原子写，再不收敛就会变成**三份**。四步机制的讲解
+        随实现搬去了 `file_tools._atomic_write_bytes` 的 docstring，一处讲、
+        多处用。
 
-          1. `tempfile.mkstemp(dir=path.parent)` —— 临时文件必须和目标
-             **同目录**。`os.replace` 只保证"同一文件系统内"原子；跨盘会
-             退化成"复制 + 删除"，那个窗口里文件是半截的。
-          2. 写入 + `flush` + `os.fsync` —— fsync 把数据真正推给磁盘。少了
-             它，改名之后断电仍可能丢内容（改名是原子的，但数据可能还躺在
-             操作系统的页缓存里）。
-          3. `os.replace(tmp, path)` —— 原子改名：任何观察者要么看到旧的完整
-             文件、要么看到新的完整文件，不存在中间态。
-          4. `finally: tmp.unlink(missing_ok=True)` —— 成功时 tmp 已经不存在
-             （`missing_ok=True` 所以不炸），失败时清掉残骸。
-
-        为什么不直接 `open(path, "w")`：写一半崩溃 = 半个文件顶着正式名字，
-        `MEMORY.md` / `curated.json` 当场就坏了。tempfile + replace 保证崩溃点
-        只会留下一个多余的 `.tmp`（下次覆盖），canonical 永远是完整版本。
-
-        落盘走 `"wb"`（二进制）而不是 `"w"`：文本模式会把 `\\n` 翻译成
-        `os.linesep`，写出来的字节就不是你给的那一串了——2026-09-12 在
-        file_tools 上刚栽过这个坑（CR 翻倍），同一个坑不踩第二遍。
-
-        与 `file_tools._atomic_write_bytes` 是同一套机制的**两份实现**（工具线
-        那天也补了一份）。这里先各写一份：s10 的教学点就在这四步里，直接调用
-        会把这一课省掉。等这一课过了，再把其中一份改成调用另一份，收敛成单
-        实现（记为已知待办）。
+        保留这个薄方法只是为了不动既有调用点，不是第二份机制。
         """
 
-        descriptor, temp_name = tempfile.mkstemp(
-            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-        temp_path = Path(temp_name)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(content.encode("utf-8"))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, path)
-        finally:
-            temp_path.unlink(missing_ok=True)
+        atomic_write_text(path, content)
 
     def _load_curated(self) -> list[CuratedEntry]:
         """curated.json → 条目清单（scope/schema 校验 + 结构校验）。"""

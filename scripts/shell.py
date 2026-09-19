@@ -53,6 +53,7 @@ from scripts.toolbox import (
     build_policy_for,
     build_registry,
     build_registry_for,
+    build_user_memory,
     resolve_max_agent_steps,
 )
 from src.harness.artifact import ArtifactStore
@@ -167,7 +168,9 @@ def _sidecar_process(sock: socket.socket) -> None:
         registry=build_registry(),
         policy=build_policy(),
         # s10：工具目录 + 工作区记忆（空记忆时与旧行为一致）。
-        history_seed=lambda: build_history_seed(max_steps=max_steps),
+        # s11：再加上用户记忆（跨项目的那一份）——两者各自成一条 system。
+        history_seed=lambda: build_history_seed(
+            max_steps=max_steps, user_memory=build_user_memory()),
         store=JsonlSessionStore(root=Path(_PROJECT_ROOT) / ".sessions"),
         runtime_builder=_workspace_runtime,   # s11：上传目录 / 换沙箱
         initial_workspace={"kind": "default", "root": str(DEFAULT_WORKSPACE.root)},

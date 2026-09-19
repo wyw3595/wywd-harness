@@ -196,6 +196,8 @@ class DefaultBehaviorTests(unittest.TestCase):
             "get_weather", "now", "fs_list", "fs_read", "fs_write", "fs_edit",
             "calc", "fs_find", "fs_glob", "tree_dir", "memory_write",
             "ToolSearch", "DeferExecuteTool", "bash",
+            # s11 用户记忆（2026-09-19）：跨项目的那一份
+            "save_user_preference", "update_user_profile",
         }
         self.assertEqual(set(build_registry().names()), expected)
 

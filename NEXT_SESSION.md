@@ -2013,4 +2013,76 @@ keep=max_history)`。两道闸各管一件事：token 预算管"贵不贵"，条
 外化（s13）+ 整条历史分层压缩（s14）。剩下可做的：真正的端到端实测——
 用真模型跑一遍 `smoke_capability.py` 的 10 层，看 L7 长任务是否真的走通。
 
+## 2026-09-19：核对进度 + 补 s11 用户记忆
+
+### 先说核对出来的事：s11/s12 被跳过了
+
+教材共 **24 章**（s01~s24）。项目按章节推进，但**从 s10 直接跳到了 s13**：
+`src/` 里 grep 不到任何 `RecallHit` / `recall` / `cloud_memory`——那些只存在于
+`learn-workbuddy/`（教材）里。所以 **s11_user_memory 与 s12_cloud_memory 从没实现过**。
+
+⚠️ 别被项目代码里那两处注释误导：`# s11：上传目录 / 换沙箱`、`# s12：空闲回收`
+是**项目自己的编号**，与教材章节号不是一回事。
+
+权威的依赖表是 `learn-workbuddy/docs/progression-contract.md`：
+`s10 → s11 → s12 → s13 → s14 → s15 …`。**s15 的前置虽然是 s14（已做），
+但 s15 的输入——召回候选——来自 s12**。断点就在这里。
+
+### 补上 s11：`src/harness/user_memory.py`
+
+两个契约刻意分开：
+
+| | 回答什么 | 更新方式 | 例子 |
+|---|---|---|---|
+| Profile（`profile.json`）| 这个用户**是谁** | 显式字段级 patch，`None` = 删字段 | name / call_them / timezone |
+| Preference（`preferences.json`）| 跨项目**默认怎样** | 按语义 key 冲突替换 | response.language |
+
+- **三态** CREATED / UNCHANGED / UPDATED（后者 revision +1）。**完整幂等身份**
+  = value + source + expires_at + source_event_id：只有 `updated_at` 不同 = 重试
+  = UNCHANGED（否则 revision 会被推高到没意义）；延长期限或补来源 = 真更新。
+- **防回滚**：新写入时间必须晚于 canonical 的 `updated_at`，否则
+  `StalePreferenceUpdateError`——重放旧 transcript 不能把新偏好改回旧的。
+- **过期不是删除**：`expires_at` 到点即失活（边界取开区间：正好等于就算过期），
+  记录留在 JSON 里可审计，但不再进投影、不进 Prompt。
+- **scope**：目录名是 `scope_id`（标识的 sha256 前 16 位）——邮箱/空格不该进路径；
+  canonical 里另存 `user_scope` 并在读取时校验，**目录被错放就拒绝加载**，
+  而不是静默把张三的偏好注给李四。
+- **Canonical vs projection**：JSON 是真相，`MEMORY.md` / `persona/user.md` 是
+  可重建的投影（沿用 s10 那套）。
+
+**与教材的差异**：不做 `persona/core.md` / `identity.md` / `bootstrap.md`——
+那三件是**助手自己的身份**，不属于"用户记忆"这个所有权边界。
+
+**接线**
+- `toolbox.build_history_seed(..., user_memory=...)`：用户记忆**独立成第三条
+  system**（工作区记忆是第二条）。所有权不同就不合并——分开注入才能在日志里
+  一眼看出哪块是谁的；到 s15 再按预算排顺序。
+- 两个**延迟工具**（低频，与 `memory_write` 同级）：`save_user_preference`
+  （key + value + 可选 expiry）与 `update_user_profile`（4 个可选字段）。都进
+  `SAFE_TOOLS`——只写自己的记忆文件，而且写进去的内容**下一轮就出现在 system
+  里**，用户看得见，没有"悄悄发生"的空间。
+- 存储：`~/.workbuddy/user-memory`（**跨项目**，与项目的 `.workbuddy/` 不同层）；
+  `WYWD_USER_MEMORY_ROOT` / `WYWD_USER_ID` 可覆盖。写的 source 是 `model_tool`，
+  且**工具 schema 不接受 `source_event_id`**——那是 Harness provenance，
+  不给模型伪造的机会。
+
+### 顺手清掉一个已登记的遗留
+
+`workspace_memory._atomic_write_text` 与 `file_tools._atomic_write_bytes` 的
+"两份实现待收敛"解决：新增 `file_tools.atomic_write_text`，s10 与 s11 都走它。
+那个方法的 docstring 里本来就留着话——「等这一课过了，再把其中一份改成调用
+另一份」——这天到了。
+
+### 验收
+
+- **568 条测试全绿**（541 + 27 条 `test_user_memory.py`）
+- `.workbuddy/scratch/demo_user_memory.py` 五步：三态输出、防回滚被拒、
+  过期前后 active 集合的变化（边界正好等于 `expires_at` 即失活）、
+  投影从"手工改坏"重建、注入提示的最终形状。
+
+### 进度
+
+教材 24 章，现在覆盖 **s01~s11 + s13 + s14**（s12 云端记忆仍未做）。
+**s15 的前置还差 s12 的召回链。**
+
 

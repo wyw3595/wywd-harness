@@ -212,6 +212,20 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
         temp_path.unlink(missing_ok=True)
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本文件（UTF-8）——`_atomic_write_bytes` 的文本入口。
+
+    谁在用：工作区记忆（s10）与用户记忆（s11）的 canonical JSON 与投影
+    Markdown 都走这里。2026-09-19 收敛：此前 s10 自己抄了一份同机制的
+    实现，两份就会漂移（一份补了 fsync、另一份没补，谁也不知道）。
+
+    **不做换行翻译**：文本原样编码写入。要 CRLF 的调用方自己先换好
+    （见 `_write_text_bytes` 记的那个坑）。
+    """
+
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
 def _write_text_bytes(path: Path, text: str, newline: str = "\n") -> None:
     """按指定换行风格把正文**原子地**写回磁盘。必须写字节，不能用 write_text。
 

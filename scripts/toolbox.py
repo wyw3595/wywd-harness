@@ -56,6 +56,11 @@ from src.harness.std_tools import (
     tree_dir,
 )
 from src.harness.tools import Tool, ToolRegistry
+from src.harness.user_memory import (
+    NO_USER_MEMORY_PLACEHOLDER,
+    UserMemory,
+    UserMemoryError,
+)
 from src.harness.workspace import Workspace
 from src.harness.workspace_memory import (
     NO_MEMORY_PLACEHOLDER,
@@ -63,6 +68,7 @@ from src.harness.workspace_memory import (
     WorkspaceMemory,
 )
 
+import getpass
 import os
 
 # 历史窗口大小（练习 19）：按"条数"计（一条 = 一条消息，一轮工具往返
@@ -132,6 +138,37 @@ def bash_enabled() -> bool:
 
     raw = (os.environ.get("WYWD_DISABLE_BASH") or "").strip().lower()
     return raw not in {"1", "true", "yes", "on"}
+
+
+def user_memory_root() -> Path:
+    """用户记忆的根目录——**跨项目**，所以不放在项目的 `.workbuddy/` 下。
+
+    默认 `~/.workbuddy/user-memory`。`WYWD_USER_MEMORY_ROOT` 可覆盖：
+    测试要用临时目录（绝不能往真实用户目录写），多人共用一台机器时也可能
+    想各放各的。
+    """
+
+    override = (os.environ.get("WYWD_USER_MEMORY_ROOT") or "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".workbuddy" / "user-memory"
+
+
+def current_user_id() -> str:
+    """当前用户标识。`WYWD_USER_ID` 优先，否则用系统登录名。
+
+    为什么不强制先配环境变量：s11 的价值是"开箱就跨项目记住偏好"，
+    要求先设一个变量才能用，等于把门槛设在门口。
+    """
+
+    override = (os.environ.get("WYWD_USER_ID") or "").strip()
+    return override or getpass.getuser()
+
+
+def build_user_memory() -> UserMemory:
+    """按当前配置造一个 UserMemory（轻对象，只存路径，每次现造没成本）。"""
+
+    return UserMemory(user_memory_root(), current_user_id())
 
 
 def get_weather(city: str) -> str:
@@ -313,7 +350,66 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
         # .workbuddy/——会话产物（含记忆）整目录带走，不留在本项目。
         return write_memory_fact(content, kind, importance, root=root_)
 
+    # ---- 用户记忆（s11）：跨项目的那一份，与上面那条（跟着工作区走）并列 ----
+
+    def save_user_preference(key: str, value: str,
+                             expires_at: str = "") -> str:
+        """记下一条跨项目的长期偏好。
+
+        Args:
+            key: 偏好键，小写并用 . - _ 分段，如 response.language、editor.tab_size。
+            value: 这条偏好当前的值。
+            expires_at: 可选，ISO 时间戳且**必须带时区**；不填表示长期有效。
+        """
+
+        try:
+            written = build_user_memory().set_preference(
+                key, value, source="model_tool",
+                expires_at=expires_at.strip() or None)
+        except UserMemoryError as error:
+            return f"没记下来：{error}"
+        return f"已记住：{written.render()}"
+
+    def update_user_profile(name: str = "", call_them: str = "",
+                            timezone: str = "", notes: str = "") -> str:
+        """更新用户资料——**只改传进来的字段**，留空表示不动。
+
+        Args:
+            name: 用户的名字。
+            call_them: 希望怎么称呼他。
+            timezone: 时区，如 UTC+8。
+            notes: 其他值得长期记住的用户信息。
+        """
+
+        patch = {field: raw for field, raw in
+                 (("name", name), ("call_them", call_them),
+                  ("timezone", timezone), ("notes", notes))
+                 if raw and raw.strip()}
+        if not patch:
+            return "没给任何字段，什么都没改。"
+        try:
+            result = build_user_memory().update_profile(patch)
+        except UserMemoryError as error:
+            return f"没改成功：{error}"
+        return f"已更新用户资料：{result.render()}"
+
     return [
+        Tool(
+            name="save_user_preference",
+            description="记下一条**跨项目**长期有效的偏好（如 response.language、"
+            "editor.tab_size）。只在用户明确说「以后都这样」时用；"
+            "同一个 key 再写一次是更新而不是新增。"
+            "写进去的内容下一轮就会出现在你的系统提示里。",
+            handler=save_user_preference,
+            defer=True,
+        ),
+        Tool(
+            name="update_user_profile",
+            description="更新用户资料：名字 / 怎么称呼 / 时区 / 备注。"
+            "只改传进来的字段，留空表示不动。",
+            handler=update_user_profile,
+            defer=True,
+        ),
         Tool(
             name="tree_dir",
             description="渲染一棵目录树，看清项目结构（低频、参数多）",
@@ -356,13 +452,17 @@ ALL_TOOLS: list[Tool] = build_instant_tools(ALLOWED_ROOT)
 DEFERRED_TOOLS: list[Tool] = build_deferred_tools(ALLOWED_ROOT)
 
 
-def build_history_seed(root=None, max_steps: int | None = None) -> list[dict]:
-    """sidecar 会话的起步历史：工具目录 system + 工作区记忆有界视图。
+def build_history_seed(root=None, max_steps: int | None = None,
+                       user_memory: "UserMemory | None" = None) -> list[dict]:
+    """sidecar 会话的起步历史：工具目录 + 工作区记忆 + 用户记忆。
+
+    三块**各自成一条 system**，不合并：所有权不同（项目 / 个人），
+    分开注入才能在日志里一眼看出哪块是谁的；到 s15 做 Prompt 组装时，
+    顺序与预算由那一层统一决定——现在先各就各位。
 
     两个刻意的取舍：
 
-    - **记忆放第二条 system**：第一条是工具目录（`with_system` 的产物），
-      保持它在最前面，FakeModel"只读第一条消息"的老怪癖就不受影响；
+    - **工具目录永远第一条**：FakeModel"只读第一条消息"的老怪癖不受影响；
     - **每会话开局读一次**，不是每 turn：记忆在会话中途变化不会被察觉，
       换来的是一个固定的、可预期的起步成本（有界视图的教学取舍）。
 
@@ -372,10 +472,19 @@ def build_history_seed(root=None, max_steps: int | None = None) -> list[dict]:
     """
 
     seed = with_system([], max_steps)
-    memory = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
-    context = memory.get_context_for_agent()
+
+    workspace = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
+    context = workspace.get_context_for_agent()
     if context and context != NO_MEMORY_PLACEHOLDER:
         seed.append({"role": "system", "content": context})
+
+    # 用户记忆（s11）：跨项目的那一份。注意它**不接收 workspace path**——
+    # 两个来源的存储与更新策略完全分开，只在这里并排出现一次。
+    if user_memory is not None:
+        user_context = user_memory.get_context_for_agent()
+        if user_context and user_context != NO_USER_MEMORY_PLACEHOLDER:
+            seed.append({"role": "system", "content": user_context})
+
     return seed
 
 # 免审批白名单（练习 s04）：只读 / 沙箱内的工具显式放行。fs_write
@@ -393,6 +502,11 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     "get_weather", "now", "fs_list", "fs_read",
     "calc", "fs_find", "fs_glob", "ToolSearch", "DeferExecuteTool",
     "memory_write",   # 只追加 .memory/ 原始日志，晋升由蒸馏闸门管（s10）
+    # 用户记忆（s11）同样免审批：它们只写自己的记忆文件，而且写进去的内容
+    # **下一轮就出现在 system 里**，用户看得见——没有"悄悄发生"的空间。
+    # 取舍的另一面：跨项目 + 跨会话的影响面确实比工作区记忆大；但"改一次
+    # 偏好弹一次窗"会让这个功能根本没法用（偏好本来就是随手记的）。
+    "save_user_preference", "update_user_profile",
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions
