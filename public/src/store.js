@@ -411,11 +411,12 @@ function handleEvent(ev) {
     pushLive("round", "第 " + ((ev.step || 0) + 1) + " 轮");
   } else if (ev.event === "model_reply") {
     // 思考模式（s16 之后）：reasoning_content 单独展示——它**不是回答**，
-    // 只是"模型刚才在想什么"的痕迹。全文可能很长（几百到几千 token），
-    // live-feed 里截 300 字符；要全文的话那不是这行的事。
+    // 只是"模型刚才在想什么"的痕迹。两个刻意的限制（都是被撑爆过的教训）：
+    // ① 截得短（160 字符）：思考链动辄几千字，轨迹区只留一行痕迹就够；
+    // ② 单行显示（CSS 里的 nowrap + ellipsis）：按原文展开会把整块轨迹撑烂。
     if (ev.reasoning) {
-      let thought = String(ev.reasoning);
-      if (thought.length > 300) thought = thought.slice(0, 300) + "…";
+      let thought = String(ev.reasoning).replace(/\s+/g, " ").trim();
+      if (thought.length > 160) thought = thought.slice(0, 160) + "…";
       pushLive("think", thought);
     }
     if (ev.kind === "tool_calls") {
