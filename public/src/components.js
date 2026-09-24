@@ -166,7 +166,7 @@ export const SessionList = {
       </div>
       <div id="session-list" role="list">
         <div v-if="state.listError" class="err">{{ state.listError }}</div>
-        <div v-else-if="!rows.length" class="empty">{{ ui.search ? '没有匹配的会话' : '还没有会话，点 ＋ 开始' }}</div>
+        <div v-else-if="!rows.length" class="empty">{{ ui.search ? '没有匹配的会话' : (state.listLoading ? '清单加载中…（后端正忙，跑完这轮就好）' : '还没有会话，点 ＋ 开始') }}</div>
         <template v-for="row in rows" :key="row.id || row.error">
           <div v-if="row.error" class="err">{{ row.error }}</div>
           <div v-else class="row" role="listitem" :class="{ cur: row.id === state.sid }" @click="selectSession(row.id)">
@@ -213,8 +213,15 @@ function bubble(m) {
   // 对话一进来先看到一大段系统提示是纯噪音——Codex/ChatGPT 都不展示它。
   if (role === "system") return { cls: "system", body: text, sys: true };
   if (role === "tool") {
-    return { cls: "tool", label: "工具结果",
-             body: text.length > 400 ? text.slice(0, 400) + "…" : text };
+    // 工具结果**默认收起、点开看全文**（2026-09-23 改）。
+    // 以前是硬截 400 字符 + "…"：既看不到全文、也没法展开——读一个文件
+    // 几百行时，用户想核对细节只能去翻 .sessions 里的 transcript。
+    // 现在全文都在（历史=真相，不该丢），收起只是**显示**上的事。
+    const firstLine = text.split("\n")[0] || text;
+    const summary = firstLine.length > 90
+      ? firstLine.slice(0, 90) + "…" : firstLine;
+    return { cls: "tool", label: "工具结果", fold: true,
+             summary, body: text, lines: text.split("\n").length };
   }
   return { cls: "system", body: "[" + role + "] " + text };
 }
@@ -298,6 +305,14 @@ export const ChatArea = {
               <details v-if="b.sys" class="msg system">
                 <summary>系统提示</summary>
                 <div class="sys-body">{{ b.body }}</div>
+              </details>
+              <details v-else-if="b.fold" class="msg tool">
+                <summary>
+                  <span class="t-name">{{ b.label }}</span>
+                  <span class="fold-meta">{{ b.summary }}</span>
+                  <span class="fold-hint">{{ b.lines }} 行 · 点击展开</span>
+                </summary>
+                <pre class="fold-body">{{ b.body }}</pre>
               </details>
               <div v-else class="msg" :class="[b.cls, { 'md-body': b.md }]">
                 <span v-if="b.label" class="t-name">{{ b.label }}</span>

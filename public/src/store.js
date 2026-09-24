@@ -37,6 +37,8 @@ export const state = reactive({
   notice: null,       // { level, text } —— 本轮结局，非历史的一部分
   chatError: "",      // 历史拉取失败（显示在聊天区）
   listError: "",      // 清单拉取失败（显示在侧边栏）
+  listLoading: true,  // 清单在途（2026-09-23：区分"还没拉到"和"真的没有"——
+                      // turn 阻塞期间清单 GET 排队，不能显示"还没有会话"撒谎）
   posting: false,     // 正在等一轮 turn 结束
   locked: false,      // 当前会话被关闭：历史还能看，但不能再发
   streamUp: null,     // SSE 状态：null=还没连过 / true=连着 / false=断了
@@ -146,7 +148,21 @@ export function sessionById(sid) {
 // 动作：清单 / 生命周期
 // ═══════════════════════════════════════════════════════════
 
+let listing = false;    // 防重入：上一趟清单还没回来就不发新的一趟
+let listRetry = false;  // 被跳过的那趟是"数据可能已过期"的信号，回来后补一刷
+
 export async function refreshSessions() {
+  // **2026-09-23 修（审批回执发不出去的真正元凶）**：清单 GET 走 RPC，
+  // turn 期间被 _rpc_lock 堵死。老代码 setInterval 每 5 秒**照发不误**，
+  // 每条在途 GET 各占一条浏览器连接（HTTP/1.1 同源上限 6：SSE 1 + 发消息
+  // POST 1 + 堆 4 条就满）。池一满，用户按"允许"的回执 POST 在浏览器里
+  // **排队发不出去**（fetch 不报错、一直 pending）→ 票 60 秒超时 →
+  // permission_blocked。前 1~2 次审批能过、三四次之后全失灵，就是池
+  // 被堆满的时间点。防重入后任何时刻最多 1 条清单 GET 占连接，回执
+  // 永远有路可走。
+  if (listing) { listRetry = true; return; }
+  listing = true;
+  state.listLoading = true;
   try {
     const data = await api.listSessions();
     // 壳把 sidecar 的报错翻译成 {"error": 人话} 直通了——不接住的话
@@ -156,6 +172,11 @@ export async function refreshSessions() {
     state.listError = "";
   } catch (err) {
     state.listError = "后端没起来（127.0.0.1:8765）";
+  } finally {
+    listing = false;
+    state.listLoading = false;
+    // 在途期间有人想刷（手动操作触发的）→ 现在补上，最多晚一趟、不丢
+    if (listRetry) { listRetry = false; refreshSessions(); }
   }
 }
 
@@ -163,7 +184,13 @@ export async function refreshSessions() {
     日志是几 KB 的文本，闲着就拉是白花带宽。
 
     失败不弹错：这是旁路观测，不是主链路；拉不到就在面板上留一行说明。 */
+let statusing = false;  // 防重入：与 refreshSessions 同理（抽屉开着时每 3 秒
+                        // 一发 status+logs，turn 阻塞期间不防重入会把浏览器
+                        // 连接池更快堆满——2026-09-23 审批回执发不出去的共犯）
+
 export async function refreshStatus(includeLogs = false) {
+  if (statusing) return;
+  statusing = true;
   try {
     const data = await api.fetchStatus();
     // 用 Array.isArray 而不是 `|| null`：错误响应 {"error": …} 也是 truthy，
@@ -174,6 +201,8 @@ export async function refreshStatus(includeLogs = false) {
     ops.at = Date.now();
   } catch (err) {
     ops.status = { error: "取不到 sidecar 状态（后端没起来？）" };
+  } finally {
+    statusing = false;
   }
 }
 
@@ -431,6 +460,16 @@ function handleEvent(ev) {
     pushLive("call", args, ev.name || "tool");
   } else if (ev.event === "tool_end") {
     let out = String(ev.content == null ? "" : ev.content);
+    // 审批已经出结果了（被拒 / 超时）→ **把还挂着的卡片收掉**。
+    // 后端在 `ApprovalBoard.request` 超时后就不等了、直接放行 BLOCKED，
+    // 但它**不会告诉前端"这张票作废了"**——于是卡片一直显示"需要批准"，
+    // 用户看到的就还是"卡住"（2026-09-23 第二次报的就是这个：工具明明
+    // 已经返回 permission_blocked，卡片却还在）。
+    if (approval.ticket && out.includes("permission_blocked")) {
+      approval.ticket = null;
+      approval.submitting = false;
+      pushLive("warn", "审批已结束（被拒或超时），这条没执行");
+    }
     if (out.length > 240) out = out.slice(0, 240) + "…";
     pushLive("out", out);
   } else if (ev.event === "approval_request") {
@@ -452,12 +491,29 @@ function handleEvent(ev) {
 export async function answerApproval(approved) {
   if (!approval.ticket || approval.submitting) return;
   const ticket = approval.ticket;
-  approval.submitting = true;     // 点了立刻锁按钮：等 turn 收尾
+  approval.submitting = true;
   try {
-    await api.respondApproval(ticket, approved);
-  } catch (err) { /* 回执失败：等待超时 fail-closed */ }
-  // 不立刻关卡——先给"已提交"的反馈，turn 结束才整体消失
-  setTimeout(() => { if (approval.ticket === ticket) approval.ticket = null; }, 1200);
+    // **2026-09-23：回执加 10 秒超时。** 以前 fetch 挂多久都不吭声——
+    // 连接池被占满时它会永远 pending（浏览器排队不发），票在服务端
+    // 60 秒超时，用户全程只看到"按了没反应"。现在至少把"没送到"喊出来。
+    const res = await api.respondApproval(ticket, approved,
+                                          AbortSignal.timeout(10000));
+    // 回执失败**必须说出来**（2026-09-23 修）：以前这里是空 catch，
+    // 点了"允许"没任何反应，只能干等超时——现场完全看不出发生了什么。
+    if (res && res.ok === false) notify(res.detail || "回执没送到");
+  } catch (err) {
+    const msg = (err && err.name === "TimeoutError")
+      ? "10 秒没送到（连接被占用或后端卡住）"
+      : (err && err.message ? err.message : err);
+    notify("回执失败：" + msg);
+  }
+  // 点完**立刻收卡**。旧实现是"等 turn 收尾自己消失"，只靠一个 1.2 秒的
+  // 定时器兜底；但只要这期间又来了一个审批（**同一轮里 agent 连调两次 bash
+  // 就会**），`approval.ticket === ticket` 永远不成立 → 卡片挂着不收，
+  // submitting 还停在 true → 再点被 `if (approval.submitting) return`
+  // 直接挡掉。用户看到的"按了没反应"就是这个。
+  approval.ticket = null;
+  approval.submitting = false;
 }
 
 export function dismissApproval() {
@@ -479,7 +535,8 @@ export const workspace = reactive({
 
 export async function refreshWorkspace() {
   try {
-    const data = await api.fetchWorkspace();
+    // 工作区是**会话级**的：读的是当前这个会话的目录
+    const data = await api.fetchWorkspace(state.sid || "");
     const info = (data && data.workspace) || null;
     workspace.info = info;
     workspace.error = info ? "" : "工作区不可读";
@@ -519,7 +576,8 @@ function applyWorkspaceResult(res) {
 export async function runWorkspace(action, opts = {}, busyText = "") {
   workspace.busy = busyText;
   try {
-    const res = await api.workspaceAction(action, opts);
+    // 换的是**当前会话**的目录（没会话时后端会明确回绝，不静默失败）
+    const res = await api.workspaceAction(action, opts, state.sid || "");
     return applyWorkspaceResult(res);
   } catch (err) {
     notify("后端没响应");

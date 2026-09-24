@@ -16,11 +16,12 @@ async function get(path) {
   return res.json();
 }
 
-async function post(path, body, headers = {}) {
+async function post(path, body, headers = {}, signal = undefined) {
   const res = await fetch(path, {
     method: "POST",
     headers: { ...JSON_HEADERS, ...headers },
     body: JSON.stringify(body),
+    signal,
   });
   return res.json();
 }
@@ -54,8 +55,9 @@ export function sendMessage(sid, message) {
 
 // ── 审批回执 ────────────────────────────────────────────
 
-export function respondApproval(ticket, approved) {
-  return post("/api/approvals/" + encodeURIComponent(ticket), { approved });
+export function respondApproval(ticket, approved, signal) {
+  return post("/api/approvals/" + encodeURIComponent(ticket), { approved },
+              {}, signal);
 }
 
 // ── sidecar 自述状态 / 日志（成本表挂在状态里）──────────
@@ -72,9 +74,11 @@ export function fetchLogs() {
 
 // ── 工作区（让 agent 在哪个目录里干活）───────────────────
 
-/** 读当前工作区。壳不认识 workspace/get 时后端会如实降级为"默认"。 */
-export function fetchWorkspace() {
-  return get("/api/workspace");
+/** 读**这个会话**的工作目录（工作区是会话级的，读谁的要说明白）；
+    壳不认识 workspace/get 时后端会如实降级为"默认"。 */
+export function fetchWorkspace(sid = "") {
+  const query = sid ? `?sid=${encodeURIComponent(sid)}` : "";
+  return get(`/api/workspace${query}`);
 }
 
 /** 工作区操作。action ∈ browse | open | upload | reset。
@@ -84,8 +88,9 @@ export function fetchWorkspace() {
     CORS 预检，而本服务不答预检），所以这一个头就把它挡在门外了。
     后端只对 browse 校验这个头（见 web_app 的 do_POST）。
 */
-export function workspaceAction(action, opts = {}) {
-  return post("/api/workspace", { action, ...opts }, { "X-Wywd-Ui": "1" });
+export function workspaceAction(action, opts = {}, sid = "") {
+  return post("/api/workspace", { action, ...opts, sid },
+              { "X-Wywd-Ui": "1" });
 }
 
 // ── 文件系统浏览（工作区选择器的数据源）─────────────────
