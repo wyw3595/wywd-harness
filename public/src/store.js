@@ -420,8 +420,12 @@ export function startEventStream() {
   };
 }
 
-function pushLive(kind, text, name = "") {
-  state.live.push({ id: ++liveSeq, kind, name, text });
+function pushLive(kind, text, name = "", extra = null) {
+  // extra：个别行要带额外字段（思考行的 summary/lines 给折叠块用）。
+  // 用展开而不是给每行都塞两个空键——绝大多数行不需要它们。
+  const row = { id: ++liveSeq, kind, name, text };
+  if (extra) Object.assign(row, extra);
+  state.live.push(row);
   // 上限：事件环 500 条管的是服务端内存，这一条管的是浏览器内存
   if (state.live.length > LIVE_MAX) {
     state.live.splice(0, state.live.length - LIVE_MAX);
@@ -440,13 +444,22 @@ function handleEvent(ev) {
     pushLive("round", "第 " + ((ev.step || 0) + 1) + " 轮");
   } else if (ev.event === "model_reply") {
     // 思考模式（s16 之后）：reasoning_content 单独展示——它**不是回答**，
-    // 只是"模型刚才在想什么"的痕迹。两个刻意的限制（都是被撑爆过的教训）：
-    // ① 截得短（160 字符）：思考链动辄几千字，轨迹区只留一行痕迹就够；
-    // ② 单行显示（CSS 里的 nowrap + ellipsis）：按原文展开会把整块轨迹撑烂。
+    // 只是"模型刚才在想什么"的痕迹。
+    // 2026-09-24：**不再截断**。旧版截 160 字符 + 单行省略（理由是思考链
+    // 动辄几千字会把轨迹区撑烂）——但那样"看全文"就永远不可能了。现在改成
+    // 折叠块：全文留在行里，撑烂的问题交给**收起**解决（和工具结果同一套
+    // 手法），摘要只取首行 90 字符给收起时看。换行也保留：思考是有段落的，
+    // 压成一行反而读不出结构。
     if (ev.reasoning) {
-      let thought = String(ev.reasoning).replace(/\s+/g, " ").trim();
-      if (thought.length > 160) thought = thought.slice(0, 160) + "…";
-      pushLive("think", thought);
+      const thought = String(ev.reasoning).trim();
+      if (thought) {
+        const firstLine = thought.split("\n")[0] || thought;
+        const summary = firstLine.length > 90
+          ? firstLine.slice(0, 90) + "…" : firstLine;
+        pushLive("think", thought, "", {
+          summary, lines: thought.split("\n").length,
+        });
+      }
     }
     if (ev.kind === "tool_calls") {
       pushLive("model", "决定调用：" + ((ev.tool_names || []).join("、") || "?"));

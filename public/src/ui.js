@@ -25,6 +25,12 @@ export const ui = reactive({
   sidebarCollapsed: false,
   drawerOpen: false,
   search: "",
+  // 本轮轨迹（直播区）在 turn 结束后是否保持展开。2026-09-24：改成默认
+  // 收起——历史区已经把同一轮的思考/工具/结果按组收好了，底下再平铺一份
+  // 全量轨迹又长又重复（"回答为什么在思考前面"就是它造成的）。发消息
+  // 期间强制展开（watch 实时看过程），跑完自动收起，用户想回看再点开。
+  // 不持久化：每次发消息都该是展开的，收不收是一次性的视线，不是偏好。
+  liveOpen: true,
 });
 
 const saved = load();

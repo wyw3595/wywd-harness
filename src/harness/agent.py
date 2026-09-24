@@ -137,7 +137,13 @@ def run_agent(
 
         if reply.kind == "final":
             # 每轮发言先入历史——最终回答也留在对话记录里。
-            messages.append({"role": "assistant", "content": reply.text})
+            # 思考链持久化（2026-09-24）：reasoning **只有在这条消息里才有**
+            # ——emit 出去的是瞬态直播，jsonl 才是真相。非空才带，省得每条
+            # assistant 消息都背一个空字段（历史里 99% 的轮次没有思考）。
+            final_record = {"role": "assistant", "content": reply.text}
+            if getattr(reply, "reasoning", ""):
+                final_record["reasoning"] = reply.reasoning
+            messages.append(final_record)
             # s01 整合：provider 以 finish_reason="length" 掐断输出时
             # （reply.truncated），沉默地当成 completed 是骗调用方——
             # 显式承认"答案不完整"，RunResult 才诚实。一行三元，
@@ -154,20 +160,23 @@ def run_agent(
 
         # 工具调用轮：先把调用清单存入历史（这是我们的方言，
         # 练习 09 的 RealModel 负责把它翻译成 wire 格式）。
-        messages.append(
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "call_id": call.call_id,
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    }
-                    for call in reply.tool_calls
-                ],
-            }
-        )
+        # reasoning 同上：**决定调工具之前**的推理同样属于思考链，
+        # 一起落盘（否则历史里只剩"调了什么"，看不出"为什么调"）。
+        call_record = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }
+                for call in reply.tool_calls
+            ],
+        }
+        if getattr(reply, "reasoning", ""):
+            call_record["reasoning"] = reply.reasoning
+        messages.append(call_record)
 
         for call in reply.tool_calls:
             emit(

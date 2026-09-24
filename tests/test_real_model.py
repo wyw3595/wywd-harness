@@ -64,6 +64,29 @@ class ToWireMessagesTests(unittest.TestCase):
         self.assertEqual(wire[0], messages[0])
         self.assertEqual(wire[1], messages[1])
 
+    def test_reasoning_never_reaches_the_api_payload(self) -> None:
+        """reasoning 是**记录用**字段，不许混进**发送用**的结构。
+
+        思考链持久化（2026-09-24）之后 assistant 消息会带 reasoning；
+        wire 格式不认这个键，原样发出去就是 API 请求体里的未知字段
+        ——严格校验的 provider 会直接 400。所以这里白名单挑键。
+        同时 tool_call_id 必须在名单内：tool 结果消息靠它对号入座。
+        """
+
+        messages = [
+            {"role": "user", "content": "2 加 3 是多少？"},
+            {"role": "assistant", "content": "算一下",
+             "reasoning": "这题简单，我直接心算"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "5"},
+        ]
+
+        wire = _to_wire_messages(messages)
+
+        self.assertEqual(wire[1], {"role": "assistant", "content": "算一下"})
+        self.assertNotIn("reasoning", wire[1])
+        self.assertEqual(wire[2]["tool_call_id"], "call_1")
+        self.assertEqual(wire[2]["content"], "5")
+
     def test_system_message_passes_through(self) -> None:
         """s03 目录注入：system 消息（含延迟工具目录）由应用层塞进
         history 最前，wire 翻译必须原样放行——OpenAI 兼容协议认

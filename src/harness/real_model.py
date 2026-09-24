@@ -99,7 +99,17 @@ def _to_wire_messages(messages: list[dict]) -> list[dict]:
                 }
             )
         else:
-            wire_messages.append(message)
+            # 白名单复制（2026-09-24）：历史里的 assistant 消息现在可能带
+            # reasoning（思考链持久化），而 wire 格式**不认**这个键——原样
+            # append 会把它塞进 API 请求体，严格校验的 provider 会直接 400。
+            # "记录用"的字段不许混进"发送用"的结构：这里显式挑键，
+            # 白名单之外的（reasoning 及将来任何新字段）一律不进 payload。
+            # 注意 tool_call_id 必须在名单里——tool 结果消息靠它对号入座。
+            wire_messages.append({
+                key: message[key]
+                for key in ("role", "content", "name", "tool_call_id")
+                if key in message
+            })
 
     return wire_messages
 
@@ -201,6 +211,7 @@ class RealModel:
         model: str | None = None,
         tools: list[dict] | None = None,
         thinking: bool | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         # 参数优先、环境变量兜底；都没有就立刻失败——密钥缺失不能被重试掩盖。
         self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
@@ -213,6 +224,14 @@ class RealModel:
         # 要 reasoning_content 就得用 deepseek-flash + thinking enabled。
         self.thinking = _thinking_enabled() if thinking is None else thinking
         self.model = model or (THINKING_MODEL if self.thinking else DEEPSEEK_MODEL)
+
+        # 系统提示：不传 = 用那条极简兜底（**单独用 RealModel 时**——比如
+        # scripts/smoke_deepseek.py——至少有个角色说明）。
+        # ⚠️ 装配层**有完整系统提示时必须传 ""**：历史第一条 system 已经是
+        # build_system_prompt() 的产物，再叠一条极简的"简洁、直接地完成任务"
+        # 压在它前面，等于让旧口径跟完整提示抢方向盘——模型会挑更省事的那条
+        # 走（实测现象：该一轮发多个只读工具时它偏要一次一个）。
+        self.system_prompt = SYSTEM_PROMPT if system_prompt is None else system_prompt
 
         # 连接复用（练习 18）：Session 自带连接池——每次 requests.post 都要
         # 重新 TCP+TLS 握手（一次几百毫秒），而 Agent 循环"短间隔、多次、
@@ -227,12 +246,17 @@ class RealModel:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        # 系统提示只在配置了的时候插（装配层传 "" 就完全不加）——
+        # 历史里已经有 build_system_prompt() 那条完整的，这里再加一条就是抢方向盘。
+        wire_messages = _to_wire_messages(messages)
+        if self.system_prompt:
+            wire_messages = [
+                {"role": "system", "content": self.system_prompt},
+                *wire_messages,
+            ]
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                *_to_wire_messages(messages),
-            ],
+            "messages": wire_messages,
         }
         if self.tools:
             payload["tools"] = self.tools

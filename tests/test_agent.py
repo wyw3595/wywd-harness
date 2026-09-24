@@ -235,6 +235,44 @@ class AgentHistoryTests(unittest.TestCase):
             second_round[1]["tool_calls"][0]["arguments"], {"a": 2, "b": 3}
         )
 
+    def test_reasoning_is_persisted_in_history(self) -> None:
+        """思考链落盘（2026-09-24）：emit 出去的是瞬态直播，jsonl 才是真相。
+
+        不落盘的话，刷新页面 / 切换会话之后思考过程就彻底蒸发——用户要的
+        "看到全部 + 持久化"里，持久化就是这一条。工具调用轮同样要带：
+        只有"调了什么"没有"为什么调"，复盘时等于少了一半信息。
+        """
+
+        model = ScriptedModel(
+            [
+                ModelReply(
+                    kind="tool_calls",
+                    reasoning="先想清楚：2 加 3 应该是 5，用工具确认一下",
+                    tool_calls=[ToolCall("call_1", "add", {"a": 2, "b": 3})],
+                ),
+                ModelReply(kind="final", text="等于 5",
+                           reasoning="工具结果确认了，可以回答"),
+            ]
+        )
+
+        result = run_agent("加法任务", model=model, registry=self.registry)
+
+        tool_turn = [m for m in result.messages if m.get("tool_calls")][0]
+        self.assertEqual(tool_turn["reasoning"],
+                         "先想清楚：2 加 3 应该是 5，用工具确认一下")
+        self.assertEqual(result.messages[-1]["reasoning"],
+                         "工具结果确认了，可以回答")
+
+    def test_no_reasoning_leaves_no_empty_field(self) -> None:
+        """没有思考时不留空字段：历史里绝大多数轮次没有 reasoning，
+        每条消息都背一个空串会让记录平白变胖。"""
+
+        model = ScriptedModel([ModelReply(kind="final", text="直接回答")])
+
+        result = run_agent("简单任务", model=model)
+
+        self.assertNotIn("reasoning", result.messages[-1])
+
     def test_second_question_receives_full_history(self) -> None:
         model_a = ScriptedModel(
             [ModelReply(kind="final", text="北京下紫色雪花")]

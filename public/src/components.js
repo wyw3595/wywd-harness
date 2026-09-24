@@ -197,21 +197,46 @@ export const SessionList = {
 // ChatArea — 聊天区（历史 + 直播 + 输入栏）
 // ═══════════════════════════════════════════════════════════
 
-/** 把一条原始消息整形为"画哪张卡"的决定——视图里不该有 if/else 七连。 */
+/** 思考块（2026-09-24）：模型的推理过程，默认收起、点开看全文。
+
+    位置由用户拍板：**折叠在回答上方**（ChatGPT 式）——思考是"过程"不是
+    "结论"，平铺会把聊天区淹没；但它是真相的一部分（已随消息落盘），
+    所以只收起不丢弃，点开就是完整原文（不截断）。 */
+function thinkBlock(reasoning) {
+  const body = String(reasoning || "").trim();
+  const firstLine = body.split("\n")[0] || body;
+  const summary = firstLine.length > 90 ? firstLine.slice(0, 90) + "…" : firstLine;
+  return { cls: "think", think: true, label: "思考过程",
+           summary, body, lines: body.split("\n").length };
+}
+
+/** 把一条原始消息整形为"画哪张卡"的决定——视图里不该有 if/else 七连。
+
+    返回值一律是**数组**：带思考的 assistant 消息要画两张卡（思考块 +
+    回答正文），其余画一张。rendered 用 flatMap 收。 */
 function bubble(m) {
   const role = m.role || "?";
   let text = (m.content || "").trim();
   if (!text && m.tool_calls && m.tool_calls.length) {
     text = "🤖 调用工具：" + m.tool_calls.map((t) => t.name || "?").join(", ");
   }
-  if (!text) return { cls: "system", body: "（空消息）" };
-  if (role === "user") return { cls: "user", body: text };
+  if (!text) return [{ cls: "system", body: "（空消息）" }];
+  if (role === "user") return [{ cls: "user", body: text }];
   // 只有模型/系统的发言过 markdown：用户输入原样显示（别把用户打的字符
   // 当语法解释），工具结果是机器输出（缩进敏感，原样更准）
-  if (role === "assistant") return { cls: "assistant", body: text, md: true };
+  if (role === "assistant") {
+    const cards = [];
+    // reasoning 是落盘字段（2026-09-24）：有就先画思考块，再画回答。
+    // 空的话一个字都不多画——绝大多数轮次没有思考。
+    if (m.reasoning && String(m.reasoning).trim()) {
+      cards.push(thinkBlock(m.reasoning));
+    }
+    cards.push({ cls: "assistant", body: text, md: true });
+    return cards;
+  }
   // 系统提示折起来。它是 transcript 的第一条（历史=真相，不能藏），但每段
   // 对话一进来先看到一大段系统提示是纯噪音——Codex/ChatGPT 都不展示它。
-  if (role === "system") return { cls: "system", body: text, sys: true };
+  if (role === "system") return [{ cls: "system", body: text, sys: true }];
   if (role === "tool") {
     // 工具结果**默认收起、点开看全文**（2026-09-23 改）。
     // 以前是硬截 400 字符 + "…"：既看不到全文、也没法展开——读一个文件
@@ -220,10 +245,56 @@ function bubble(m) {
     const firstLine = text.split("\n")[0] || text;
     const summary = firstLine.length > 90
       ? firstLine.slice(0, 90) + "…" : firstLine;
-    return { cls: "tool", label: "工具结果", fold: true,
-             summary, body: text, lines: text.split("\n").length };
+    return [{ cls: "tool", label: "工具结果", fold: true,
+              summary, body: text, lines: text.split("\n").length }];
   }
-  return { cls: "system", body: "[" + role + "] " + text };
+  return [{ cls: "system", body: "[" + role + "] " + text }];
+}
+
+/** 把消息序列按 turn 分组（2026-09-24）：过程收进折叠组，回答裸露。
+
+    用户要的形态（参考 WorkBuddy 自己的对话页）：一轮里几十条"思考/调用
+    工具/工具结果"平铺会把聊天区拖成流水账——最后关心的只有最终回答。
+    所以：
+      - user 消息、系统提示 → 正常显示；
+      - 过程消息（assistant+tool_calls、tool 结果，含各轮的思考）→ 全部
+        收进一个「执行过程」折叠组（默认收起，点开按原样逐条渲染）；
+      - 最终回答（assistant 且无 tool_calls 且有正文）→ 正常显示，它自己
+        的思考仍是回答上方的独立折叠块（ChatGPT 式）。
+
+    turn 的边界就是"遇到最终回答"：过程缓冲 flush 成组，回答单独出卡。
+    返回值是渲染条目的数组：普通条目是 bubble 的单卡，组是带 items 的条目。 */
+function groupTurns(messages) {
+  const entries = [];
+  let procItems = [];          // 当前 turn 攒下的过程卡
+
+  function flushGroup() {
+    if (!procItems.length) return;
+    const thinkCard = procItems.find((c) => c.think);
+    entries.push({
+      group: true,
+      count: procItems.length,
+      summary: thinkCard ? thinkCard.summary : "",
+      items: procItems,
+    });
+    procItems = [];
+  }
+
+  for (const m of messages) {
+    const role = m.role || "?";
+    const isFinal = role === "assistant"
+      && !(m.tool_calls && m.tool_calls.length)
+      && String(m.content || "").trim();
+    if (role === "system" || role === "user" || isFinal) {
+      flushGroup();
+      entries.push(...bubble(m));
+      continue;
+    }
+    // 过程消息：工具调用轮 / 工具结果——攒着，凑成一个折叠组
+    procItems.push(...bubble(m));
+  }
+  flushGroup();
+  return entries;
 }
 
 export const ChatArea = {
@@ -237,7 +308,10 @@ export const ChatArea = {
     const inputEl = ref(null);
     const atBottom = ref(true);      // 用户是不是正贴着底部看
 
-    const rendered = computed(() => state.messages.map(bubble));
+    // 分组渲染（2026-09-24）：groupTurns 内部对每条消息过 bubble（带思考
+    // 的 assistant 出思考块+正文两张卡），再把过程消息收进折叠组——
+    // 页面上只露最终回答，过程默认收起、点开逐条看。
+    const rendered = computed(() => groupTurns(state.messages));
 
     function toBottom() {
       nextTick(() => {
@@ -270,6 +344,16 @@ export const ChatArea = {
            () => state.chatError, () => state.notice],
           () => { if (atBottom.value) toBottom(); });
 
+    // 本轮轨迹（直播区）：发消息期间强制展开（实时看过程），turn 一结束
+    // 自动收起——历史区已经把同一轮的过程按组收好了，底下再平铺一份全量
+    // 轨迹又长又重复。用户想回看再点开（onLiveToggle 同步手动开合）。
+    watch(() => state.posting, (posting) => {
+      if (!posting) ui.liveOpen = false;
+    });
+    function onLiveToggle(e) {
+      if (!state.posting) ui.liveOpen = e.target.open;
+    }
+
     function submit() {
       const text = draft.value;
       if (!text.trim() || !canSend.value) return;
@@ -280,7 +364,7 @@ export const ChatArea = {
 
     return { state, ui, canSend, costLine, costTitle, draft, box, inputEl,
              rendered, atBottom, onScroll, toBottom, autoGrow, submit,
-             toggleDrawer };
+             toggleDrawer, onLiveToggle };
   },
 
   template: `
@@ -305,6 +389,44 @@ export const ChatArea = {
               <details v-if="b.sys" class="msg system">
                 <summary>系统提示</summary>
                 <div class="sys-body">{{ b.body }}</div>
+              </details>
+              <details v-else-if="b.group" class="msg turn-group">
+                <summary>
+                  <span class="t-name">🔧 执行过程</span>
+                  <span class="fold-meta">{{ b.summary }}</span>
+                  <span class="fold-hint">{{ b.count }} 项 · 点击展开</span>
+                </summary>
+                <div class="group-body">
+                  <template v-for="(card, j) in b.items" :key="j">
+                    <details v-if="card.think" class="msg think">
+                      <summary>
+                        <span class="t-name">💭 {{ card.label }}</span>
+                        <span class="fold-meta">{{ card.summary }}</span>
+                        <span class="fold-hint">{{ card.lines }} 行 · 点击展开</span>
+                      </summary>
+                      <div class="think-body">{{ card.body }}</div>
+                    </details>
+                    <details v-else-if="card.fold" class="msg tool">
+                      <summary>
+                        <span class="t-name">{{ card.label }}</span>
+                        <span class="fold-meta">{{ card.summary }}</span>
+                        <span class="fold-hint">{{ card.lines }} 行 · 点击展开</span>
+                      </summary>
+                      <pre class="fold-body">{{ card.body }}</pre>
+                    </details>
+                    <div v-else class="msg" :class="card.cls">
+                      <span v-if="card.label" class="t-name">{{ card.label }}</span>{{ card.body }}
+                    </div>
+                  </template>
+                </div>
+              </details>
+              <details v-else-if="b.think" class="msg think">
+                <summary>
+                  <span class="t-name">💭 {{ b.label }}</span>
+                  <span class="fold-meta">{{ b.summary }}</span>
+                  <span class="fold-hint">{{ b.lines }} 行 · 点击展开</span>
+                </summary>
+                <div class="think-body">{{ b.body }}</div>
               </details>
               <details v-else-if="b.fold" class="msg tool">
                 <summary>
@@ -336,16 +458,32 @@ export const ChatArea = {
               <span class="n-tag">{{ state.notice.level === 'error' ? '本轮没能开始' : '本轮结局' }}</span>
               <span class="n-text">{{ state.notice.text }}</span>
             </div>
-            <div id="live-feed" :class="{ 'lf-hidden': !state.live.length && !state.posting }"
-                 aria-live="polite" aria-label="本轮执行轨迹">
-              <div v-for="line in state.live" :key="line.id" class="lf-line" :class="'lf-' + line.kind">
+            <details id="live-feed"
+                     :class="{ 'lf-hidden': !state.live.length && !state.posting }"
+                     :open="state.posting || ui.liveOpen"
+                     @toggle="onLiveToggle"
+                     aria-live="polite" aria-label="本轮执行轨迹">
+              <summary class="lf-summary">
+                {{ state.posting ? '本轮轨迹（执行中…）'
+                   : '本轮轨迹（' + state.live.length + ' 项）· 点击' + (ui.liveOpen ? '收起' : '展开') }}
+              </summary>
+              <template v-for="line in state.live" :key="line.id">
+                <details v-if="line.kind === 'think'" class="lf-line lf-think-box">
+                  <summary>
+                    <span class="lf-think-tag">💭 思考</span>
+                    <span class="lf-think-sum">{{ line.summary }}</span>
+                    <span class="fold-hint">{{ line.lines }} 行 · 点击展开</span>
+                  </summary>
+                  <div class="think-body">{{ line.text }}</div>
+                </details>
+                <div v-else class="lf-line" :class="'lf-' + line.kind">
                 <template v-if="line.kind === 'call'">调用 <span class="t-name">{{ line.name }}</span> {{ line.text }}</template>
                 <template v-else-if="line.kind === 'out'"><span class="lf-arrow">↳</span> {{ line.text }}</template>
                 <template v-else-if="line.kind === 'round'">── {{ line.text }} ──</template>
-                <template v-else-if="line.kind === 'think'"><span class="lf-think-tag">💭 思考</span> <span class="lf-think">{{ line.text }}</span></template>
                 <template v-else-if="line.kind === 'model'">{{ line.text }}</template>
                 <template v-else>{{ line.text }}</template>
-              </div>
+                </div>
+              </template>
               <div v-if="!state.live.length && state.posting" class="lf-empty">思考中…</div>
             </div>
           </div>
