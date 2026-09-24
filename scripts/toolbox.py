@@ -48,11 +48,14 @@ from src.harness.permissions import (
 )
 from src.harness.real_model import RealModel
 from src.harness.std_tools import (
+    bash_output,
+    bash_stop,
     calc,
     find_text,
     glob_files,
     now,
     run_bash,
+    run_bash_background,
     tree_dir,
 )
 from src.harness.skills import SKILLS_DIR_NAME, SkillError, SkillIndex
@@ -265,6 +268,10 @@ def build_instant_tools(root_: Path) -> list[Tool]:
             name="get_weather",
             description="查询一个城市今天的天气（演示用模拟数据，不代表真实天气）",
             handler=get_weather,
+            # 降级成延迟工具（2026-09-23）：实测「工具说明书发得越多，模型越不
+            # 给思考」——deepseek-flash 在 12 个 schema 时 reasoning 直接为空。
+            # 这是纯演示工具，不该占 schema 预算。详见 build_model() 的注释。
+            defer=True,
         ),
         Tool(
             name="now",
@@ -299,6 +306,8 @@ def build_instant_tools(root_: Path) -> list[Tool]:
             name="calc",
             description="安全计算数学表达式，如 (1 + 2) * 3 或 sqrt(16) * 2",
             handler=calc,
+            # 同上：模型自己会算，没必要为它花 schema 预算。
+            defer=True,
         ),
         Tool(
             name="fs_find",
@@ -321,20 +330,48 @@ def build_instant_tools(root_: Path) -> list[Tool]:
     # bash.requires_approval）是按名字匹配的，换个名字就落进 default.deny
     # （fail-closed，安全但用不了）。
     if bash_enabled():
-        def bash(command: str, timeout: int = 60) -> str:
+        def bash(command: str, timeout: int = 60,
+                 background: bool = False) -> str:
             # 与 fs_* 同一套规矩：root_ 被闭包吃掉，不进签名=不进 schema。
             # 沙箱根在这里只是"工作目录"，挡不住命令自己 cd 出去——真正的
             # 闸门是权限层那条 ASK（每次执行都要人点头）。
+            # background=True 分流到后台出口（2026-09-24 改造③）：长驻进程
+            # 走这里，立即返回 task_id，dev server 不再把 turn 拖死。
+            if background:
+                return run_bash_background(command, sandbox_root=root_)
             return run_bash(command, timeout, sandbox_root=root_)
         bash.__doc__ = run_bash.__doc__
 
         tools.append(Tool(
             name="bash",
+            # description 是**行为规范**不是说明书：昨晚 agent 起
+            # `npm run dev`，前台进程永不退出 → turn 假死 26 分钟。它并非
+            # 不知道"这是长驻进程"（思考里写明了），而是工具没给它后台的
+            # 路。现在后台能力有了（改造③），规范跟着升级：长驻进程必须
+            # background=true；起完用 bash_output 探活确认，别拿"跑过"当"起好"。
             description="在项目目录里执行一条 shell 命令（工作目录固定为项目根，"
-            "默认超时 60 秒，输出上限 8000 字符）。"
-            "每次执行都需要用户审批；sudo/rm/reboot/shutdown/dd 开头的命令会被"
-            "直接拒绝且不可审批覆盖。适合跑测试、看 git 状态、装依赖之前先确认。",
+            "默认超时 60 秒、上限 300，输出上限 8000 字符）。"
+            "本命令是**同步等待**的：命令不结束，调用就不返回。"
+            "起 dev server / watch / 服务等长驻进程必须传 background=true："
+            "立即返回 task_id，进程在后台持续运行，不会被超时误杀；随后用 "
+            "bash_output 读输出并探活（如 curl -s http://localhost:3000/api/health"
+            " 看到 200 才算起好），用 bash_stop 停止。短命令（跑测试、看 git "
+            "状态、装依赖）直接同步跑即可。每次执行都需要用户审批；"
+            "sudo/rm/reboot/shutdown/dd 开头的命令会被直接拒绝且不可审批覆盖。",
             handler=bash,
+        ))
+        tools.append(Tool(
+            name="bash_output",
+            description="读一个后台任务（bash 的 background=true 返回的 task_id）"
+            "的新增输出与状态：仍在运行 / 已结束 + exit code。增量交付，已读过"
+            "的行不会重复。探活后台服务就看它，或往命令里 curl healthcheck。",
+            handler=bash_output,
+        ))
+        tools.append(Tool(
+            name="bash_stop",
+            description="停止一个后台任务（连同其全部子进程一起终止）。"
+            "只能停自己用 background=true 起过的任务；返回尾部输出。",
+            handler=bash_stop,
         ))
 
     return tools
@@ -571,6 +608,12 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     # 真正要设防的是技能正文里让你做的那些事——那要过各自的闸门
     # （bash 审批、写文件审批），而不是在这里卡"读指南"。
     "load_skill",
+    # 后台任务的两个管理口（2026-09-24 改造③）：bash_output 是纯读（增量
+    # 输出 + 状态）；bash_stop 只能停 registry 里登记的、当初**经过审批**
+    # 才起来的任务——参数是 task_id 不是 pid，影响面被关死在"agent 自己
+    # 起的东西"。真要设防的仍然是 bash 本身那道 ASK：起进程那一瞬有人点头，
+    # 之后读它的输出、停它的进程，不再重复打扰。
+    "bash_output", "bash_stop",
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions
@@ -634,7 +677,10 @@ SYSTEM_PROMPT_TEMPLATE = """你是运行在 wywd-harness 里的 Agent：能读�
 - **需要事实就查，不要猜。** 文件内容、目录结构、命令输出，先用工具拿到再下结论。
 - **改文件之前先读它。** fs_edit 要求你给出原文片段——写不出来就说明还没读。
   这不是刁难，是防止你在错的位置动手。
-- 能并行拿到的信息放在同一轮请求里（多个文件、多个搜索），不要一个一个来。
+- **一轮里把能一起要的都要来。** 要读三个文件，就在**同一条消息**里发三个 fs_read
+  ——不要读一个、等一次回复、再读下一个。每多一次往返就多一次**完整的模型调用**，
+  那是全场最贵的开销（工具执行本身几乎免费，一次读一个文件也是读）。判据：这些调用
+  之间**没有先后依赖**（不需要拿 A 的结果来决定 B 的参数）就该同轮发；真有依赖才分轮。
 - **工具报错时先读错误信息。** 它通常已经说了原因和下一步
   （"路径不存在"会提示你先 fs_list 看看有什么）。
 - 没做完就说没做完。把"看起来完成了"和"确实完成了"分开。
@@ -834,9 +880,14 @@ def build_model() -> RealModel:
 
     由 registry 的 model_schemas() 出目录——即时工具全量，延迟工具
     用目录摘要代替。schema 生成只发生在 tool_to_schema 一处（单一真源）。
+
+    `system_prompt=""`：**不要**那条极简兜底。历史第一条 system 已经是
+    build_system_prompt() 的完整提示，两条叠在一起模型会两头看——实测它更听
+    「简洁、直接地完成任务」那句，于是"该一轮发多个只读工具"被它理解成
+    "一步步来"，退化成一次一个工具。
     """
 
-    return RealModel(tools=build_registry().model_schemas())
+    return RealModel(tools=build_registry().model_schemas(), system_prompt="")
 
 
 def build_model_router() -> ModelRouter:

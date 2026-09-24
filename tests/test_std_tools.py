@@ -2,8 +2,10 @@
 
 import json
 import os
+import re
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -15,11 +17,14 @@ from src.harness.std_tools import (
     _clean_env,
     _glob_to_regex,
     _should_skip_file,
+    bash_output,
+    bash_stop,
     calc,
     find_text,
     glob_files,
     now,
     run_bash,
+    run_bash_background,
     tree_dir,
 )
 
@@ -394,7 +399,11 @@ class ToolboxAssemblyTests(unittest.TestCase):
 
         registry = build_registry()
         names = [schema["function"]["name"] for schema in registry.model_schemas()]
-        self.assertIn("calc", names)
+        # calc / get_weather 自 2026-09-23 起**也是**延迟工具：实测
+        # 「发出去的 schema 越多，deepseek-flash 越不给思考」（12 个时 reasoning
+        # 直接为空），而这两个又不常用——降级它们省 schema 预算。
+        self.assertNotIn("calc", names)
+        self.assertNotIn("get_weather", names)
         self.assertIn("ToolSearch", names)
         self.assertNotIn("tree_dir", names)  # 延迟工具对模型不可见
 
@@ -497,6 +506,123 @@ class BashToolTests(unittest.TestCase):
         # 且不把等 10 秒才攒到的输出也端着：超时返回的是"已产生的部分"。
         self.assertLess(len(result), 500)
 
+    def test_timeout_kills_the_whole_tree_not_just_the_shell(self) -> None:
+        """超时必须连**孙进程**一起杀（2026-09-24 树杀改造的验收）。
+
+        现场（2026-09-23）：agent 跑 npm install 超时，旧实现只杀 cmd 外壳，
+        npm/node 孙进程成孤儿继续写盘 20 分钟，turn 假死。本用例复刻该结构：
+
+            外壳（python -c ... sleep 30）
+              └─ 孙进程（每 0.2s 往哨兵文件写一笔，共 40s）
+
+        杀干净 → 哨兵不再增长；只杀外壳的旧实现会让它继续写 20 秒。
+        孙进程由外壳 Popen 后**不 wait**——它就是那个"工具已返回、进程还
+        活着"的孤儿，正是要验证被连杀的对象。
+        """
+
+        sentinel = self.root / "_sentinel.txt"
+        script = self.root / "_grandchild.py"
+        script.write_text(
+            "import time\n"
+            f"with open(r'{sentinel}', 'a', encoding='utf-8') as f:\n"
+            "    for _ in range(200):\n"
+            "        f.write('x')\n"
+            "        f.flush()\n"
+            "        time.sleep(0.2)\n",
+            encoding="utf-8",
+        )
+        inner = (
+            "import subprocess,sys;"
+            f"subprocess.Popen([sys.executable, r'{script}']);"
+            "import time;time.sleep(30)"
+        )
+        command = f'"{sys.executable}" -c "{inner}"'
+
+        # timeout=3（不是 1）：外壳要先"cmd 解析 + python 冷启动"才轮到
+        # Popen 孙进程——1 秒会在孙进程出生前就把整棵树杀了，前提不成立
+        #（今天实测就翻过车）。3 秒对"出生 + 写哨兵"足够宽裕。
+        result = run_bash(command, timeout=3, sandbox_root=self.root)
+        self.assertIn("超时", result)
+
+        # 给"没死透的孙进程"留出继续写哨兵的窗口：旧实现下它每 0.2s 写一次，
+        # 这 2 秒里至少再写 8 笔——mtime 会紧贴检查时刻，下面的断言必炸。
+        time.sleep(2)
+
+        self.assertTrue(sentinel.exists(), "孙进程没跑起来，测试前提不成立")
+        gap = time.time() - sentinel.stat().st_mtime
+        self.assertGreater(
+            gap, 1.2,
+            "哨兵 1.2 秒内还在被写——孙进程没被连杀，树杀没生效")
+
+    # ── 后台任务（2026-09-24 改造③）─────────────────────────
+
+    def _start_bg(self, code: str) -> str:
+        """后台起一个任务并从返回里抠出 task_id（各用例的公共第一步）。"""
+
+        result = run_bash_background(self._py(code), sandbox_root=self.root)
+        match = re.search(r"task (bg-[0-9a-f]{8})", result)
+        self.assertIsNotNone(match, f"返回里没有 task_id：{result}")
+        return match.group(1)
+
+    def test_background_returns_at_once_and_streams_output(self) -> None:
+        """后台启动必须**立即**返回（长驻进程不拖 turn），且输出可增量读到。
+
+        这就是"dev server 场景"的形状：print 一行 → sleep 挂住。同步版会把
+        turn 拖到超时；后台版 t=0 返回，t≈1s 就能看到那行日志。
+        """
+
+        started = time.time()
+        # flush=True 是必须的：子进程 stdout 接管道时是全缓冲，不 flush 的
+        # print 会一直躺在子进程缓冲里，drain 线程什么都读不到。
+        task_id = self._start_bg(
+            "print('bg-ok', flush=True); import time; time.sleep(8)")
+        self.assertLess(time.time() - started, 5, "后台启动不该等命令结束")
+
+        deadline = time.time() + 8
+        out = ""
+        while time.time() < deadline:
+            out = bash_output(task_id)
+            if "bg-ok" in out:
+                break
+            time.sleep(0.3)
+        self.assertIn("bg-ok", out)
+        self.assertIn("仍在运行", out)
+        bash_stop(task_id)   # 收尾：不留孤儿进程挂在测试机上
+
+    def test_background_output_reports_exit_code(self) -> None:
+        """任务结束后 bash_output 要如实报 exit code（非零也是**数据**）。"""
+
+        task_id = self._start_bg("print('done-mark'); import sys; sys.exit(5)")
+
+        deadline = time.time() + 10
+        out = ""
+        while time.time() < deadline:
+            out = bash_output(task_id)
+            if "已结束" in out:
+                break
+            time.sleep(0.3)
+
+        self.assertIn("已结束", out)
+        self.assertIn("exit 5", out)
+        self.assertIn("done-mark", out)
+
+    def test_bash_stop_terminates_the_task(self) -> None:
+        """bash_stop 之后任务不再是 running——dev server 的正常收尾通道。"""
+
+        task_id = self._start_bg("import time; time.sleep(60)")
+
+        stopped = bash_stop(task_id)
+        self.assertIn("已终止", stopped)
+
+        out = bash_output(task_id)
+        self.assertNotIn("仍在运行", out)
+
+    def test_bash_output_unknown_task_is_data_not_exception(self) -> None:
+        """错误的 task_id 回人话 + 列出现有任务，不抛异常打断 turn。"""
+
+        out = bash_output("bg-nope")
+        self.assertIn("没有这个后台任务", out)
+
     def test_timeout_lower_bound_is_clamped(self) -> None:
         """模型传 timeout=0 时钳到 1 秒，而不是"一启动就掐断"。
 
@@ -546,14 +672,18 @@ class BashToolTests(unittest.TestCase):
         self.assertNotIn("WYWD_FAKE_SECRET", _clean_env())
 
     def test_policy_sends_bash_to_approval(self) -> None:
-        """普通命令必须走 ASK——"每次都要人点头"是它敢默认上架的唯一理由。"""
+        """普通命令必须走 ASK——"每次都要人点头"是它敢默认上架的唯一理由。
+
+        注意：**只读白名单内的命令不走 ASK**（2026-09-23 起，`git status`
+        之类免审批）。所以这里要用一条**不在白名单里**的命令来验 ASK。
+        """
 
         from src.harness.permissions import PermissionAction, ToolRequest
         from scripts.toolbox import build_policy
 
         decision = build_policy().decide(ToolRequest(
             tool_use_id="t1", name="bash",
-            arguments={"command": "git status --short"},
+            arguments={"command": "git commit -m wip"},
         ))
 
         self.assertIs(decision.action, PermissionAction.ASK)
@@ -607,7 +737,10 @@ class BashToolTests(unittest.TestCase):
             build_registry_for(DEFAULT_WORKSPACE).get("bash")
         )["function"]["parameters"]
 
-        self.assertEqual(set(params["properties"]), {"command", "timeout"})
+        # background 是 2026-09-24 改造③的合法新增（长驻进程出口）；这条
+        # 测试真正要守的是**沙箱根不外泄**——新增参数可以，多出 root 不行。
+        self.assertEqual(set(params["properties"]),
+                         {"command", "timeout", "background"})
         self.assertNotIn("sandbox_root", json.dumps(params))
         self.assertEqual(params["required"], ["command"])
 

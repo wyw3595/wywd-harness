@@ -32,7 +32,11 @@ import math
 import operator
 import os
 import re
+import signal
 import subprocess
+import threading
+import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -497,6 +501,36 @@ def _clip_output(text: str) -> str:
     )
 
 
+def _kill_process_tree(pid: int) -> None:
+    """杀掉 pid 及其全部子孙进程（失败吞掉——杀树不该炸工具本身）。
+
+    为什么必须杀"树"而不能只杀直接子进程：shell=True 时 Popen 的 pid 是
+    cmd/sh 外壳，真正的活（npm install、dev server、node -e）是它的
+    **子孙**。只杀外壳 = 杀了壳留下躯干：npm 继续写盘、dev server 继续
+    占端口，工具说"已终止"系统里却还挂着一堆孤儿——2026-09-23 现场：
+    超时返回 20 分钟后 node_modules 还在被写（turn 也因此假死）。
+
+    两平台的"整树"语义：
+    - Windows：taskkill /T 沿进程树连杀（/F 强制）。树信息由 OS 维护，
+      不依赖我们记录父子关系；
+    - POSIX：spawn 时 start_new_session=True 让外壳自成**进程组**，
+      对组发 SIGKILL 一网打尽（子进程没再 setsid 逃逸的普通命令都覆盖）。
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            timeout=15,
+        )
+        # taskkill 对"进程已退出"会非零退出+报错文本——那是好事（没东西可
+        # 杀），不值得关心细节，所以不检查返回码。
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # 组已不存在 / 无权杀：同样吞掉
+
+
 def run_bash(command: str, timeout: int = BASH_TIMEOUT_DEFAULT,
              sandbox_root: Path | None = None) -> str:
     """在项目目录里执行一条 shell 命令，返回退出码与输出。
@@ -504,7 +538,8 @@ def run_bash(command: str, timeout: int = BASH_TIMEOUT_DEFAULT,
     Args:
         command: 要执行的命令，如 "git status --short" 或
             "python -m unittest discover -s tests"。
-        timeout: 超时秒数，默认 60、上限 300；超时会终止命令并返回已产生的输出。
+        timeout: 超时秒数，默认 60、上限 300；超时会**连同全部子进程一起**
+            终止命令（杀整棵进程树，见 _kill_process_tree）并返回已产生的输出。
 
     （sandbox_root 是内部沙箱根参数，由装配层注入，不暴露给模型。）
 
@@ -523,25 +558,208 @@ def run_bash(command: str, timeout: int = BASH_TIMEOUT_DEFAULT,
     # 复用沙箱解析拿工作目录（"." 一定在界内），顺带确认它确实存在。
     cwd = _resolve_safe(".", sandbox)
 
+    # run → Popen（2026-09-24 改造）：subprocess.run 的 TimeoutExpired 只
+    # kill 直接子进程（cmd/sh 外壳），npm/node 这些**孙进程**全部成为孤儿
+    # ——dev server 场景下 turn 必然假死（见 _kill_process_tree 的注释）。
+    # Popen + 手动杀树才能把"整棵树"清干净。
+    popen_kwargs = {}
+    if os.name != "nt":
+        # POSIX：外壳自成进程组，超时后 killpg 一组全杀（Windows 上此参数
+        # 无意义，条件传参避免歧义）。Windows 的整树靠 taskkill /T。
+        popen_kwargs["start_new_session"] = True
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
             cwd=str(cwd),
-            capture_output=True,     # stdout / stderr 都由我们接管，不直接喷终端
-            timeout=limit,
+            stdout=subprocess.PIPE,   # stdout / stderr 都由我们接管，不直接喷终端
+            stderr=subprocess.PIPE,
             env=_clean_env(),
-        )
-    except subprocess.TimeoutExpired as expired:
-        # 超时也要把"已经产生的输出"还给模型——它可能就是问题本身
-        # （比如卡在一个交互式提示上，输出里留着半句提示语）。
-        partial = _decode_output((expired.stdout or b"") + (expired.stderr or b""))
-        return (
-            f"(超时：{limit} 秒内没有结束，命令已被终止)\n"
-            f"{_clip_output(partial)}"
+            **popen_kwargs,
         )
     except OSError as error:
         return f"(无法执行：{error})"
 
-    merged = _decode_output(completed.stdout + completed.stderr)
-    return f"(exit {completed.returncode})\n{_clip_output(merged)}"
+    try:
+        stdout_b, stderr_b = proc.communicate(timeout=limit)
+    except subprocess.TimeoutExpired as expired:
+        # 先杀整棵树，再收尸拿"已经产生的输出"——它可能就是问题本身
+        # （比如卡在一个交互式提示上，输出里留着半句提示语）。
+        _kill_process_tree(proc.pid)
+        try:
+            stdout_b, stderr_b = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # 树里有刺头不肯死（极少见）：管道还开着，communicate 就等不到。
+            # 放弃残留输出，把工具调用诚实地还回去，别让它把 turn 拖死。
+            stdout_b, stderr_b = expired.stdout or b"", expired.stderr or b""
+        partial = _decode_output((stdout_b or b"") + (stderr_b or b""))
+        return (
+            f"(超时：{limit} 秒内没有结束，命令连同其全部子进程已被终止)\n"
+            f"{_clip_output(partial)}"
+        )
+
+    merged = _decode_output(stdout_b + stderr_b)
+    return f"(exit {proc.returncode})\n{_clip_output(merged)}"
+
+
+# ═══════════════════════════════════════════════════════════
+# 后台任务（2026-09-24 改造③）：dev server 等长驻进程的正确出口
+# ═══════════════════════════════════════════════════════════
+
+_BG_BUF_LINES = 500      # 每任务缓冲的尾部行数（长日志只留尾巴，内存有界）
+_BG_MAX_TASKS = 32       # 登记上限：满了挤掉最老的已结束任务
+
+
+class _BgTask:
+    """一个后台任务的全部状态：进程 + 行缓冲 + 读游标。
+
+    缓冲用 deque(maxlen=...)：dev server 一打就是几千行日志，全留会把
+    内存和上下文一起撑爆——只留尾部，输出端再由 _clip_output 二次限流。
+    total_written 是 drain 线程累计写入的行数，delivered 是已交付给模型
+    的行数，两者之差就是 bash_output 该给的增量（deque 淘汰头部后，差值
+    超过缓冲的部分自然只取到尾部——丢的是"被淘汰还没读"的，有界取舍）。
+    """
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self.proc = proc
+        self.buf: deque = deque(maxlen=_BG_BUF_LINES)
+        self.total_written = 0
+        self.delivered = 0
+        self.lock = threading.Lock()
+
+
+_BG_TASKS: dict = {}          # task_id -> _BgTask；模块级：跨工具调用/跨 turn 存活
+_BG_LOCK = threading.Lock()
+
+
+def _drain(stream, task: _BgTask) -> None:
+    """把一根管道持续读进行缓冲（每任务两根线程，stdout/stderr 各一）。
+
+    为什么必须持续读：不读的话管道缓冲（约 64KB）一满，子进程的写入就会
+    阻塞——dev server 打几屏日志就冻住，比同步等待还隐蔽。读一行存一行，
+    管道 EOF 后线程自然退出。
+    """
+    for raw in iter(stream.readline, b""):
+        with task.lock:
+            task.buf.append(_decode_output(raw).rstrip("\r\n"))
+            task.total_written += 1
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def run_bash_background(command: str,
+                        sandbox_root: Path | None = None) -> str:
+    """后台起一条命令，**立即**返回 task_id（run_bash 的长驻进程出口）。
+
+    与 run_bash 的三个不同：
+    - 不等待：Popen 后立即返回，turn 马上继续（dev server 不再拖死收尾）；
+    - 不设超时：长驻进程"活多久"由业务决定，bash_stop 才是它的终点；
+    - 输出走 bash_output 增量读，缓冲只留尾部 _BG_BUF_LINES 行。
+
+    registry 是模块级的：sidecar 进程内跨工具调用、跨 turn 存活。
+    sidecar 重启后清空，旧进程成孤儿继续跑（服务本来就该活着；要停
+    bash_stop 或让用户自己杀——已知边界，注释在此立此存照）。
+    """
+    if not command or not command.strip():
+        return "（命令为空，没有执行任何东西）"
+    sandbox = sandbox_root if sandbox_root is not None else file_tools.ALLOWED_ROOT
+    cwd = _resolve_safe(".", sandbox)
+
+    popen_kwargs = {}
+    if os.name != "nt":
+        # POSIX：自成进程组，bash_stop 的 killpg 才能连树杀净（同 run_bash）
+        popen_kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_clean_env(),
+            **popen_kwargs,
+        )
+    except OSError as error:
+        return f"(无法执行：{error})"
+
+    task = _BgTask(proc)
+    threading.Thread(target=_drain, args=(proc.stdout, task), daemon=True).start()
+    threading.Thread(target=_drain, args=(proc.stderr, task), daemon=True).start()
+
+    with _BG_LOCK:
+        # 登记上限：挤掉最老的已结束任务（running 的不动——那是活着的进程）
+        if len(_BG_TASKS) >= _BG_MAX_TASKS:
+            for old_id in list(_BG_TASKS):
+                old = _BG_TASKS[old_id]
+                if old.proc.poll() is not None:
+                    old.proc.wait()          # 顺手回收（POSIX 防僵尸）
+                    del _BG_TASKS[old_id]
+                    break
+        task_id = "bg-" + uuid.uuid4().hex[:8]
+        _BG_TASKS[task_id] = task
+
+    return (f"(后台已启动 task {task_id}；用 bash_output 查看输出与探活，"
+            f"bash_stop 停止。不要再用同步方式跑同一条命令——会等到超时)")
+
+
+def _get_task(task_id: str) -> "_BgTask | None":
+    with _BG_LOCK:
+        return _BG_TASKS.get(task_id)
+
+
+def bash_output(task_id: str) -> str:
+    """读一个后台任务的新增输出与状态（增量：已交付过的行不再重复）。
+
+    返回三件事：任务状态（仍在运行 / 已结束 + exit code）、本次新增行数、
+    新增内容。探活就用它——curl healthcheck 是往命令里写，这里是看任务
+    自己的输出，两个都通。
+    """
+    task = _get_task(task_id or "")
+    if task is None:
+        with _BG_LOCK:
+            known = "、".join(sorted(_BG_TASKS)) or "（无）"
+        return f"(没有这个后台任务：{task_id}。现有的：{known})"
+
+    with task.lock:
+        unread = task.total_written - task.delivered
+        lines = list(task.buf)
+        take = lines[max(0, len(lines) - unread):] if unread > 0 else []
+        task.delivered = task.total_written
+
+    running = task.proc.poll() is None
+    if not running:
+        task.proc.wait()      # 已退出：顺手回收（POSIX 防僵尸）
+    head = (f"(task {task_id}: "
+            f"{'仍在运行' if running else '已结束，exit ' + str(task.proc.returncode)}"
+            f"，本次新增 {len(take)} 行)")
+    body = "\n".join(take) if take else "（无新增输出）"
+    return f"{head}\n{_clip_output(body)}"
+
+
+def bash_stop(task_id: str) -> str:
+    """停止一个后台任务——杀整棵进程树（复用 run_bash 超时的那把刀）。
+
+    只能停 registry 里登记过的任务：参数是 task_id 不是 pid，影响面
+    被关死在"agent 自己起的东西"，这也是它敢进免审批白名单的底气。
+    """
+    task = _get_task(task_id or "")
+    if task is None:
+        with _BG_LOCK:
+            known = "、".join(sorted(_BG_TASKS)) or "（无）"
+        return f"(没有这个后台任务：{task_id}。现有的：{known})"
+    if task.proc.poll() is not None:
+        return f"(task {task_id} 已经结束（exit {task.proc.returncode}），无需停止)"
+
+    _kill_process_tree(task.proc.pid)
+    try:
+        task.proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return (f"(task {task_id} 已发送终止信号但进程 5 秒内未退出"
+                "——罕见；可用系统工具确认)")
+    with task.lock:
+        tail = list(task.buf)[-50:]
+        task.delivered = task.total_written
+    return (f"(task {task_id} 已终止，exit {task.proc.returncode})\n"
+            f"{_clip_output(chr(10).join(tail)) if tail else '（无输出）'}")
