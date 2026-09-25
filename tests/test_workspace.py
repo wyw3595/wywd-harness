@@ -200,6 +200,8 @@ class DefaultBehaviorTests(unittest.TestCase):
             "save_user_preference", "update_user_profile",
             # s16 技能（2026-09-19）：目录常驻、正文按需展开
             "load_skill",
+            # bash 后台出口（2026-09-24）：长驻进程的 task_id 探活/停止
+            "bash_output", "bash_stop",
         }
         self.assertEqual(set(build_registry().names()), expected)
 

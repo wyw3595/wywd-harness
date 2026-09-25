@@ -65,8 +65,32 @@ HOST = "127.0.0.1"
 PORT = 8765
 PUBLIC_DIR = Path(_PROJECT_ROOT) / "public"
 SESSIONS_ROOT = Path(_PROJECT_ROOT) / ".sessions"
-# 审批超时秒数：沉默 = 拒绝（fail-closed，与 chainlit 版语义一致）
-APPROVAL_TIMEOUT = 300
+# 审批超时秒数：沉默 = 拒绝（fail-closed，与 chainlit 版语义一致）。
+#
+# **2026-09-23：300 → 60。** 审批是**阻塞式**的，而且占着唯一的 RPC 通道
+# （scripts/shell.py 的 _rpc_lock）——300 秒意味着"没人应答时整个前端要堵
+# 5 分钟"（实测就是这个现象：除审批回执本身外，所有请求都在排队）。
+# 60 秒是"够人反应、又不至于把界面堵死"的量级。
+# `WYWD_APPROVAL_TIMEOUT` 可覆盖（排查时想放宽就设它）。
+def resolve_approval_timeout() -> float:
+    """审批超时（秒）。`WYWD_APPROVAL_TIMEOUT` 可覆盖；非法值喊一声退回默认。"""
+
+    default = 60.0
+    raw = (os.environ.get("WYWD_APPROVAL_TIMEOUT") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"[web_app] WYWD_APPROVAL_TIMEOUT 不是数字（{raw!r}），用默认 {default}")
+        return default
+    if value <= 0:
+        print(f"[web_app] WYWD_APPROVAL_TIMEOUT 必须为正数（{value}），用默认 {default}")
+        return default
+    return value
+
+
+APPROVAL_TIMEOUT = resolve_approval_timeout()
 EVENT_RING_MAX = 500
 # SSE 心跳间隔：静默这么久就写一行注释保活，同时借此发现对面已经走了。
 # 15 秒是常识区间——小于常见中间设备 60 秒空闲断连，又不至于太吵。
@@ -354,6 +378,13 @@ class WebApp:
         工作区是**边界**，边界不能悄悄变。所以换代时把它一起带过去。
         """
 
+        # 会话级工作区之后（2026-09-23）**这一步不再需要**：目录跟着会话记录走，
+        # sidecar 换代不会丢它——每个会话 resume 时按自己的 cwd 造运行时
+        # （见 sidecar 的 _make_turn_runner_for）。留着函数壳是为了不动
+        # revive_shell 的调用点（它只拿返回值拼一句日志）。
+        # 下面那段旧实现是"进程级工作区"时代的产物，下次清理时删。
+        return ""
+
         if not self._workspace_root:
             return ""
         try:
@@ -571,13 +602,14 @@ class WebApp:
 
     # ── API：工作区（上传目录）──────────────────────────────
 
-    def workspace(self) -> dict:
+    def workspace(self, sid: str = "") -> dict:
         """读当前工作区。壳不认识 workspace/get 时如实降级为"默认"。"""
 
-        return self.shell.workspace()
+        return self.shell.workspace(sid)
 
     def set_workspace(self, action: str, path: str = "",
-                      filename: str = "", data: str = "") -> dict:
+                      filename: str = "", data: str = "",
+                      sid: str = "") -> dict:
         """工作区操作：browse（弹系统选框）/ open（用给定路径）/ upload（上传
         zip）/ reset（回到默认工作区）。
 
@@ -587,23 +619,26 @@ class WebApp:
         机制不可用时额外带 "fallback": "manual"（前端降级为手输路径）。
         """
 
+        if not sid:
+            return {"ok": False, "detail": "没指定会话——先打开一个会话再换目录"}
+
         if action == "browse":
             # 弹系统选框这条路自己拿路径，走完再交给下面同一段收尾
-            picked = self._browse_workspace()
+            picked = self._browse_workspace(sid)
             if isinstance(picked, dict):      # 取消 / 降级：直接就是答复
                 return picked
-            result = self.shell.set_workspace("dir", picked)
+            result = self.shell.set_workspace("dir", picked, sid)
         elif action == "open":
             if not path.strip():
                 return {"ok": False, "detail": "没给路径"}
-            result = self.shell.set_workspace("dir", path.strip())
+            result = self.shell.set_workspace("dir", path.strip(), sid)
         elif action == "upload":
-            result = self._upload_zip(filename, data)
+            result = self._upload_zip(filename, data, sid)
         elif action == "reset":
             # 空路径：复位不需要坐标，"默认"是 sidecar 的启动态（见 sidecar
             # 的 _handle_workspace_set）。浏览器拿不到项目根路径，这也正是
             # 必须由后端说"回哪儿"的原因。
-            result = self.shell.set_workspace("default", "")
+            result = self.shell.set_workspace("default", "", sid)
         else:
             return {"ok": False, "detail": f"未知的工作区操作: {action}"}
 
@@ -622,7 +657,7 @@ class WebApp:
             detail = "工作区已切换"
         return {"ok": True, "detail": detail, "workspace": workspace}
 
-    def _browse_workspace(self) -> "str | dict":
+    def _browse_workspace(self, sid: str = "") -> "str | dict":
         """弹系统目录选择框，返回路径字符串；返回 dict 表示"这一趟到此为止"
         （用户取消 / 机制不可用要降级），那个 dict 就是最终答复。
 
@@ -637,7 +672,7 @@ class WebApp:
         """
 
         # 起始目录：当前就在某个工作区里，就从那儿开始，省得每次从头翻
-        current = (self.workspace().get("workspace") or {}).get("root") or ""
+        current = (self.workspace(sid).get("workspace") or {}).get("root") or ""
         print(f"[web_app] browse 开始（起始目录 {current or '用户主目录'}）")
         try:
             picked = native_dialog.pick_directory(
@@ -658,7 +693,7 @@ class WebApp:
         print(f"[web_app] browse 选中 → {picked}")
         return picked
 
-    def _upload_zip(self, filename: str, data_b64: str) -> dict:
+    def _upload_zip(self, filename: str, data_b64: str, sid: str = "") -> dict:
         """把浏览器上传的 zip 落成临时文件 → 交 sidecar 解压 → 删临时文件。
 
         为什么走 base64 JSON 而不是 multipart/form-data：multipart 要手写
@@ -690,7 +725,7 @@ class WebApp:
         try:
             with os.fdopen(descriptor, "wb") as sink:
                 sink.write(raw)
-            return self.shell.set_workspace("zip", str(temp_path))
+            return self.shell.set_workspace("zip", str(temp_path), sid)
         finally:
             # 解压由 sidecar 在 RPC 内完成：返回即意味着包已经不需要了。
             temp_path.unlink(missing_ok=True)
@@ -842,7 +877,8 @@ class _Handler(BaseHTTPRequestHandler):
                 after = 0
             self._send_json(200, app.events(after))
         elif path == "/api/workspace":
-            self._send_json(200, app.workspace())
+            # sid 走查询串：工作区是**会话级**的，读谁的要说明白
+            self._send_json(200, app.workspace((query.get("sid") or [""])[0]))
         elif path == "/api/fs/list":
             # 工作区选择器的数据源：列一个目录的子目录（纯读，无副作用）
             self._send_json(200, app.list_fs((query.get("path") or [""])[0]))
@@ -917,7 +953,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, app.set_workspace(
                 action, body.get("path", ""),
-                body.get("filename", ""), body.get("data", "")))
+                body.get("filename", ""), body.get("data", ""),
+                body.get("sid", "")))
         else:
             self._send_json(404, {"error": "not found"})
 

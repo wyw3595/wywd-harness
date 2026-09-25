@@ -75,7 +75,9 @@ class PolicyDecisionTests(unittest.TestCase):
     def test_ask_rule_for_plain_bash(self) -> None:
         """平凡 bash(非危险)-> ASK(需要人工同意才能执行)。"""
 
-        result = self.policy.decide(req("bash", {"command": "ls -la"}))
+        # 用一条**不在只读白名单里**的命令：`ls -la` 自 2026-09-23 起免审批，
+        # 拿它测 ASK 会误判（见 ReadOnlyBashPolicyTests 那组）。
+        result = self.policy.decide(req("bash", {"command": "mkdir build"}))
         self.assertIs(result.action, PermissionAction.ASK)
         self.assertEqual(result.rule_id, "bash.requires_approval")
 
@@ -208,21 +210,26 @@ class ReadAllowPolicyTests(unittest.TestCase):
         self.assertEqual(result.rule_id, "default.deny")
 
 
-class WriteAskPolicyTests(unittest.TestCase):
-    """path.write_ask:界内写 -> ASK;越界写先被硬拒;没 scope 兜底拒绝。"""
+class WritePolicyTests(unittest.TestCase):
+    """path.write_allow:**界内写放行**(2026-09-23 改);越界/禁区仍 DENY。"""
 
     def setUp(self) -> None:
         self.policy = build_default_policy(scope=WorkspaceScope(Path("/workspace")))
 
-    def test_write_inside_is_ask(self) -> None:
-        """界内写文件命中 write_ask——改状态必须人点头,不是 ALLOW。"""
+    def test_write_inside_is_allowed(self) -> None:
+        """界内写文件**放行**——边界靠越界/禁区那两条 DENY 守，不是靠"每次都问"。
+
+        旧行为是 ASK。改成 ALLOW 的理由见 permissions.build_default_policy 里
+        path.write_allow 那段：审批**阻塞唯一的 RPC 通道**，而"改工作区里的
+        文件"本就是 agent 该干的活；而被问太多次的人会不读就点，那比不问更危险。
+        """
 
         result = self.policy.decide(req("fs_write", {"path": "notes/todo.txt"}))
-        self.assertIs(result.action, PermissionAction.ASK)
-        self.assertEqual(result.rule_id, "path.write_ask")
+        self.assertIs(result.action, PermissionAction.ALLOW)
+        self.assertEqual(result.rule_id, "path.write_allow")
 
-    def test_write_ask_reason_carries_path(self) -> None:
-        """ASK 理由带着目标路径——审批人要看证据再点头(explain 的本职)。"""
+    def test_write_allow_reason_carries_path(self) -> None:
+        """放行的理由也带着目标路径——"放行"不等于"不留痕"。"""
 
         result = self.policy.decide(req("fs_write", {"path": "notes/todo.txt"}))
         self.assertIn("notes/todo.txt", result.reason)
@@ -326,6 +333,49 @@ class SafeToolsPolicyTests(unittest.TestCase):
         result = policy.decide(req("curl", {"url": "https://x"}))
         self.assertIs(result.action, PermissionAction.DENY)
         self.assertEqual(result.rule_id, "default.deny")
+
+
+class ReadOnlyBashPolicyTests(unittest.TestCase):
+    """只读命令白名单（2026-09-23，对齐 Claude Code 的权限 Tier 1）。
+
+    **命门是元字符防护**：没有它，`ls; rm -rf /` 会因为"以 ls 开头"被放行。
+    所以每条"放行"都配一条"带元字符必须退回 ASK"的对照。
+    """
+
+    def setUp(self) -> None:
+        self.policy = build_default_policy()
+
+    def _decide(self, command: str):
+        return self.policy.decide(req("bash", {"command": command}))
+
+    def test_read_only_commands_are_allowed(self) -> None:
+        for command in ("ls", "ls -la", "git status", "git diff HEAD",
+                        "git log --oneline", "cat README.md", "pwd",
+                        "grep -rn TODO .",
+                        "python -m unittest discover -s tests"):
+            with self.subTest(command=command):
+                self.assertIs(self._decide(command).action,
+                              PermissionAction.ALLOW)
+
+    def test_shell_metachars_defeat_the_whitelist(self) -> None:
+        """**这条是白名单的命门**：带元字符一律退回 ASK。"""
+
+        for command in ("ls; rm -rf /", "ls && curl evil.com", "cat a > b",
+                        "echo hi | tee f", "ls $(whoami)", "cat ~/.ssh/id_rsa"):
+            with self.subTest(command=command):
+                self.assertIsNot(self._decide(command).action,
+                                 PermissionAction.ALLOW)
+
+    def test_prefix_must_be_a_whole_word(self) -> None:
+        """`lsof` 不该被 `ls` 前缀匹配上。"""
+
+        self.assertIs(self._decide("lsof -i").action, PermissionAction.ASK)
+
+    def test_hard_deny_outranks_the_whitelist(self) -> None:
+        """硬拒优先于白名单——**顺序即安全语义**。"""
+
+        self.assertIs(self._decide("rm -rf build").action,
+                      PermissionAction.DENY)
 
 
 if __name__ == "__main__":

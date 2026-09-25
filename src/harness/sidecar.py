@@ -54,6 +54,7 @@ import socket
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from src.harness.agent import run_agent
@@ -66,6 +67,7 @@ from src.harness.permissions import Approver, AuditTrail, GovernedToolRunner
 from src.harness.session import (
     SessionLifecycleError,
     SessionManager,
+    SessionNotFoundError,
     SessionState,
     SessionStore,
 )
@@ -239,6 +241,9 @@ class SidecarServer:
         # 默认 info 说明"我跑在启动时那套边界上"，UI 拿它显示"项目根"。
         self._runtime_builder = runtime_builder
         self._workspace_info: dict = dict(self._initial_workspace_info)
+        # "一个会话一个目录"：按 **cwd** 缓存的运行时（registry/policy/info）。
+        # 同目录的多个会话共用一份（它们本就是同一个工作区），不同目录互不影响。
+        self._runtime_cache: dict = {}
         self._max_history = max_history
         # 单轮步数上限（2026-09-16）：run_agent 的签名默认是 5，那只是"循环
         # 保险丝"；但用户接触的是这一层，默认值就是用户实际拿到的上限，
@@ -262,7 +267,11 @@ class SidecarServer:
         # s09：持久化注入 + 启动清账。
         # 1. store 透传（None → Manager 自己落 InMemory，离线测试零感知）：
         self._manager = SessionManager(
-            turn_runner=self._make_turn_runner(), store=store)
+            turn_runner=self._make_turn_runner(),   # 兜底：没有 factory 时才用它
+            store=store,
+            # "一个会话一个目录"：每个会话按自己的 cwd 造 runner
+            # （registry/policy 绑到它自己的沙箱根）。
+            turn_runner_factory=self._make_turn_runner_for)
         # 2. 启动清账（startup reconciliation）：崩溃/直接退出遗留的
         #    creating/idle/running/closing 记录没有 runtime，证据文件却写着
         #    "活着"。close_session 对不 live 的记录会把状态抹成 closed（s07
@@ -407,8 +416,12 @@ class SidecarServer:
 
         return model_summarizer(self._model)
 
-    def _make_turn_runner(self):
+    def _make_turn_runner(self, registry=None, runner=None):
         """造 turn_runner 闭包：session 层的执行入口 → 本文件的 run_agent。
+
+        `registry` / `runner` 不传就用 sidecar 级那套（老装配：所有会话共享）；
+        传了就用传进来的——**这是"一个会话一个目录"的落点**：每个会话的 runner
+        绑着它自己 cwd 的 registry 与 policy，"互不越界"才成立。
 
         两个设计点：
           - 闭包捕获 self、调用那一刻才读 self._runner / self._on_event：
@@ -433,11 +446,13 @@ class SidecarServer:
             # s16：命中触发词的技能正文在这里**按需展开**（目录早就在 system 里）。
             view = self._inject_skills(view, message)
             result = run_agent(
-                message, model=self._model, registry=self._registry,
+                message, model=self._model,
+                registry=registry if registry is not None else self._registry,
                 history=view,
                 max_steps=self._max_steps,
                 externalize=self._externalize,   # s13：超阈值输出换到磁盘
-                on_event=self._on_event, runner=self._runner)
+                on_event=self._on_event,
+                runner=runner if runner is not None else self._runner)
             self._last_turn_status = result.status
             # usage 是这一轮的账（run_agent 在轮内跨 step 累加出来的 totals）。
             # dict() 复制是防御习惯：存引用的话，将来谁在返回后动了那个字典，
@@ -461,6 +476,48 @@ class SidecarServer:
             appended = result.messages[len(view):]
             return result.output, list(history) + appended
         return turn_runner
+
+    def _runtime_for(self, cwd: str) -> tuple:
+        """按目录取运行时三件套（registry, policy, info）——**带缓存**。
+
+        为什么按目录缓存而不是按会话：同一个目录开两个会话时，它们**本该**共用
+        同一套沙箱边界（那是同一个"工作区"），各建一份只会白吃内存；而不同目录
+        **必须**互不影响——这正是"会话级沙箱"要的效果。
+
+        没有 runtime_builder 的 sidecar（老装配）退回启动时那套：行为与改造前一致。
+        """
+
+        cached = self._runtime_cache.get(cwd)
+        if cached is not None:
+            return cached
+        if self._runtime_builder is None:
+            bundle = (self._initial_registry, self._initial_policy,
+                      dict(self._initial_workspace_info))
+        else:
+            # 参数形状跟 workspace/set 保持一致（kind + path）——**同一座工厂**，
+            # 不要为"按会话建"再造第二种方言。
+            registry, policy, info = self._runtime_builder(
+                {"kind": "dir", "path": cwd})
+            bundle = (registry, policy, dict(info))
+        self._runtime_cache[cwd] = bundle
+        return bundle
+
+    def _make_turn_runner_for(self, record: "SessionRecord"):
+        """给**一个会话**造 runner：它的 cwd 决定用哪套沙箱。
+
+        这是 SessionProcess 的 turn_runner_factory 入口（"一个会话一个目录"）。
+        approver 绑当前连接的 socket——RPC 进来时连接一定在，所以拿得到
+        （和 handle_connection 里造 runner 的时机同理）。
+        """
+
+        registry, policy, _info = self._runtime_for(record.cwd)
+        runner = GovernedToolRunner(
+            policy=policy,
+            approver=self._make_approver(self._conn),
+            registry=registry,
+            audit=AuditTrail(),
+        )
+        return self._make_turn_runner(registry=registry, runner=runner)
 
     def _log(self, msg: str) -> None:
         """写进 RingBuffer（模拟生产侧捕获子进程 stdout/stderr）。"""
@@ -649,32 +706,38 @@ class SidecarServer:
     # ── 工作区（s11：上传目录）──────────────────────────────
 
     def _handle_workspace_set(self, params: dict) -> dict:
-        """换工作区：让装配层现做一套运行件，换掉本进程的 registry/policy。
+        """换**这个会话**的工作目录（"一个会话一个目录"）。
 
-        三层连带更新，缺一层就是"半换沙箱"（且失败是静默的）：
-          1. registry —— 工具闭包捕获的 root（换成新目录）；
-          2. policy   —— WorkspaceScope 的根（决策层必须和执行层同一个根，
-             否则模型越界时决策层以为在界内、执行层才炸）；
-          3. runner   —— 它**构造时**绑定 registry/policy，不重建就还在用
-             旧沙箱（这一层最容易漏：前两层改了、跑起来还是老边界）。
+        目录属于**会话**（`Record.cwd` 本来就带着它），不属于进程——所以这里
+        不再换本进程的 registry/policy，而是：
 
-        model 刻意不换：工具 schema 与沙箱根无关（名字/描述/签名不变），
-        说明书可以复用；换它反而是浪费（RealModel 每次重建都有连接池成本）。
+          1. 按请求造一套运行件（kind=dir 直接引用本机目录 / default 复位）；
+          2. 把新目录写进**这个会话的 record.cwd**（可序列化，重启后还在）；
+          3. 让它**重建运行时**——close 掉，下次发消息时前端会自动 resume，
+             resume 走的 factory 会按新 cwd 造 runner。
 
-        已建会话的历史**不动**：历史属于会话（应用层状态），工作区属于
-        边界——混在一起会让"换个目录看看"变成"清空对话"。代价是旧历史里
-        的路径在新沙箱可能不存在（模型会收到"没有这个路径"，它会自己适应）。
+        为什么用"重建"而不是"就地换 runner"：runner 是**运行时**的资源
+        （它构造时绑死 registry/policy），"重建一代"比"给活着的运行时换心脏"
+        干净——这也正是 SessionProcess 的设计意图（resume 不是复活旧进程，
+        而是用旧记录造一个新的运行时）。
 
-        kind="default" 是**复位**：回启动态（构造时注入的那套运行件），
-        不走工厂——"默认"不是一个可解析的目录，而是这个进程出生的地方。
-        所以复位永远可用，哪怕没注入工厂（`_runtime_builder is None`）。
+        已建会话的历史**不动**：历史属于会话，目录属于边界——混在一起会让
+        "换个目录看看"变成"清空对话"。代价是旧历史里的路径在新沙箱可能不存在
+        （模型会收到"没有这个路径"，它会自己适应）。
+
+        kind="default" 是**复位**：cwd 回到启动态那个根（装配时注入的）。
         """
 
+        sid = str(params.get("sessionId") or "").strip()
+        runtime = self._manager.get_session(sid) if sid else None
+        if runtime is None:
+            return {"error": f"会话 {sid or '（未指定）'} 不在运行——先把它打开再换目录"}
+
         if params.get("kind") == "default":
-            # 复位：不碰工厂，直接把初始运行件放回去（info 也回启动态）。
-            registry, policy, info = (
-                self._initial_registry, self._initial_policy,
-                dict(self._initial_workspace_info))
+            # 复位：不碰工厂，回启动态那套运行件（info 也回启动态）。
+            registry, policy = self._initial_registry, self._initial_policy
+            info = dict(self._initial_workspace_info)
+            new_root = str(self._initial_workspace_info.get("root") or ".")
         else:
             if self._runtime_builder is None:
                 return {"error": "这个 sidecar 没接工作区能力（装配层未注入 runtime_builder）"}
@@ -683,24 +746,65 @@ class SidecarServer:
             except (ValueError, OSError) as exc:
                 # 唯一错误通道：装配层负责把库异常翻译成人话（见契约注释）。
                 return {"error": str(exc)}
-        self._registry = registry
-        self._policy = policy
-        self._workspace_info = dict(info)
-        if self._conn is not None:
-            # runner 是 per-connection 的（approver 绑 socket）：连接还在，
-            # 直接就地重建；没连接说明是直调（测试），留给 handle_connection。
-            self._runner = GovernedToolRunner(
-                policy=self._policy, approver=self._make_approver(self._conn),
-                registry=self._registry, audit=AuditTrail())
-        self._log("workspace switched: "
-                  + str(self._workspace_info.get("root")
-                        or self._workspace_info.get("kind", "?")))
-        return {"status": "ok", "workspace": self._workspace_info}
+            new_root = str(info.get("root") or params.get("path") or "")
+
+        # 写进 cwd 前先确认目录真的存在。cwd 会被 resume 用 strict=True 校验，
+        # 存一个不存在的路径进去 = 这个会话**下次打不开**——而且要到那时候才
+        # 报错，离现场太远。fail-closed 在这里的含义是：现在就说。
+        if new_root:
+            try:
+                Path(new_root).expanduser().resolve(strict=True)
+            except (OSError, ValueError) as exc:
+                return {"error": f"这个目录用不了：{exc}"}
+
+        # 新造好的运行时顺手进缓存：别的会话再选同一个目录就直接复用。
+        if new_root:
+            self._runtime_cache[new_root] = (registry, policy, dict(info))
+
+        # 写进这个会话的记录（cwd 是 Record 字段，能进 Store、能序列化）。
+        runtime.record.cwd = new_root
+        self._manager.store.save(runtime.record)
+
+        # 重建运行时：close + **立刻 resume**——resume 走的 factory 会用新 cwd
+        # 造 runner。为什么立刻 resume 而不是"等下次发消息自动 resume"：
+        # ① 连改两次目录时（dir → default），第二次会找不到 live runtime 而失败；
+        # ② 改完就能接着发消息，不用等前端点一下。
+        self._manager.close_session(sid)
+        reloaded = False
+        try:
+            self._manager.resume_session(sid)
+            reloaded = True
+        except (SessionLifecycleError, SessionNotFoundError, OSError, ValueError) as exc:
+            # 重建失败不回滚 cwd（记录已经写进去了），但要如实说"没活过来"。
+            self._log(f"workspace reload failed for {sid}: {exc}")
+
+        self._log(f"workspace switched (session {sid}): {new_root or info.get('kind', '?')}")
+        return {"status": "ok", "workspace": dict(info), "reloaded": reloaded}
 
     def _handle_workspace_get(self, params: dict) -> dict:
-        """读当前工作区（UI 渲染用）。默认态也如实回答（kind=default）。"""
+        """读**这个会话**的工作目录（UI 渲染用）。
 
-        return {"workspace": dict(self._workspace_info)}
+        会话不在运行也能读——它记在 record 里（`store.load` 取回）。
+        没有任何线索时退回启动态描述（保持老行为，UI 不会看到空值）。
+        """
+
+        sid = str(params.get("sessionId") or "").strip()
+        record = None
+        runtime = self._manager.get_session(sid) if sid else None
+        if runtime is not None:
+            record = runtime.record
+        elif sid:
+            try:
+                record = self._manager.store.load(sid)
+            except (SessionNotFoundError, SessionLifecycleError, OSError, ValueError):
+                record = None
+
+        if record is None or not record.cwd:
+            return {"workspace": dict(self._initial_workspace_info)}
+        cached = self._runtime_cache.get(record.cwd)
+        if cached is not None:
+            return {"workspace": dict(cached[2])}
+        return {"workspace": {"kind": "dir", "root": record.cwd}}
 
     def _handle_session_messages(self, params: dict) -> dict:
         """读一个会话的完整消息历史（历史重放/审计的只读通道）。

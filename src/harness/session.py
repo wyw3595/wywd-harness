@@ -246,10 +246,19 @@ class SessionProcess:
         self,
         record: SessionRecord,
         record_sink: RecordSink,
-        turn_runner: TurnRunner,
+        turn_runner: Optional[TurnRunner] = None,
+        *,
+        turn_runner_factory: Optional[Callable[[SessionRecord], TurnRunner]] = None,
     ) -> None:
         self.record = copy.deepcopy(record)   # 这一代自己的副本
         self._record_sink = record_sink       # 变化回写 store 的钩子
+        # 两种装配方式（"一个会话一个目录"之后新加的）：
+        #   - turn_runner：所有会话共用同一个 runner（老装配，零感知）；
+        #   - turn_runner_factory：**按会话造**——工厂拿 record 去建属于它的
+        #     运行时（registry/policy 跟着 record.cwd 走）。
+        # 后者才是"会话级沙箱"落地的位置：runner 里绑的 registry 决定模型
+        # 能碰哪些目录，所以"两个会话各有一个 runner" = "两个会话互不越界"。
+        self._turn_runner_factory = turn_runner_factory
         self._turn_runner = turn_runner
         # ── 临时资源区（resume 后这些全是新的——"必须重建"的含义）──
         self._state_lock = threading.RLock()       # 保护 record 的读改写
@@ -341,6 +350,17 @@ class SessionProcess:
                 f"cannot start session {self.id} from {self.status}")
         # 教材这里 bind 端口 0 起 HTTP listener；我们的运行时资源
         # （锁和信号）构造期已就位，无需再分配，直接下一步。
+        #
+        # "一个会话一个目录"：runner 在这里按**本会话的 record** 造出来。
+        # 放 start 不放 __init__，因为它属于运行时资源（和锁、信号同一类）——
+        # resume 造的是新一代，runner 也该跟着重建。
+        # 优先按会话造（factory 拿 record 去建属于它的运行时——"一个会话一个目录"）；
+        # 没有 factory 才用那个所有会话共用的 runner（老装配零感知）。
+        if self._turn_runner_factory is not None:
+            self._turn_runner = self._turn_runner_factory(self.record)
+        if self._turn_runner is None:
+            raise SessionLifecycleError(
+                f"session {self.id}: 既没给 turn_runner 也没给 factory")
         self._transition(SessionState.IDLE)
 
     def run_turn(self, user_message: str) -> str:
@@ -415,11 +435,18 @@ class SessionManager:
 
     def __init__(
         self,
-        turn_runner: TurnRunner,
+        turn_runner: Optional[TurnRunner] = None,
         store: Optional[SessionStore] = None,
+        *,
+        turn_runner_factory: Optional[
+            Callable[[SessionRecord], TurnRunner]] = None,
     ) -> None:
         self.store = store or InMemorySessionStore()
         self._turn_runner = turn_runner
+        # "一个会话一个目录"：给了工厂就**按会话造 runner**（工厂拿 record 去建
+        # 属于它的运行时，registry/policy 跟着 record.cwd 走）；否则所有会话
+        # 共用那一个（老装配零感知）。
+        self._turn_runner_factory = turn_runner_factory
         # live 运行时登记表：sid → SessionProcess
         self._runtimes: dict[str, SessionProcess] = {}
         # 重启后计数器接着最大编号走（从 store 里摸出来）
@@ -473,7 +500,9 @@ class SessionManager:
         启动失败时 SessionProcess 已把 error + last_error 回写 store，
         这里把异常原样抬给调用方——记录不静默消失（create 语义的另一半）。
         """
-        runtime = SessionProcess(record, self.store.save, self._turn_runner)
+        runtime = SessionProcess(
+            record, self.store.save, self._turn_runner,
+            turn_runner_factory=self._turn_runner_factory)
         runtime.start()
         self._runtimes[record.id] = runtime
 

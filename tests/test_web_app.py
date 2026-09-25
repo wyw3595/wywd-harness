@@ -82,10 +82,10 @@ class FakeShell:
     def logs(self) -> str:
         return "[12:00:00] [sidecar] 罐头日志"
 
-    def workspace(self) -> dict:
+    def workspace(self, sid: str = "") -> dict:
         return {"workspace": {"kind": "default", "id": "default", "root": "."}}
 
-    def set_workspace(self, kind: str, path: str) -> dict:
+    def set_workspace(self, kind: str, path: str, sid: str = "") -> dict:
         self.ops.append(("set_workspace", kind + ":" + path))
         self.zip_existed = Path(path).is_file()
         if kind == "zip" and not self.zip_existed:
@@ -230,8 +230,13 @@ def _zip_b64(entries: dict) -> str:
 
 
 class WorkspaceApiTests(unittest.TestCase):
-    """工作区 API（s11）：open 转发 / upload 落盘即删 / 错误翻译成人话。
+    """工作区 API（s11 → 2026-09-23 会话级化）：open 转发 / upload 落盘即删 /
+    错误翻译成人话。
 
+    2026-09-23 起**目录属于会话而不是进程**（"一个会话一个目录"），所以
+    本类所有调用都带显式 sid——不带 sid 会在 web 层被硬拒（见
+    test_workspace_ops_require_sid），这是和 close/resume/forget 同一条
+    "多 tab 没有'当前会话'"的规矩。
     三个边界各有断言：路径空（不发车）、base64 坏（不发车）、壳报错
     （翻成 ok=False）——错在前端能看见的地方，别让它变成一个静默的
     "什么都没发生"。
@@ -242,31 +247,50 @@ class WorkspaceApiTests(unittest.TestCase):
         self.app = WebApp(shell=self.shell)
 
     def test_get_passthrough(self) -> None:
-        self.assertIn("workspace", self.app.workspace())
+        self.assertIn("workspace", self.app.workspace("sess_0001"))
+
+    def test_workspace_ops_require_sid(self) -> None:
+        """不带 sid 的工作区操作在 web 层硬拒，**不落到壳里**。
+
+        理由同 close/resume/forget 的空 sid 硬拦：多 tab 下没有"当前会话"，
+        空 sid 漏下去 = "换这个会话的目录"变成"换别的会话的目录"，改错
+        边界还不报错。
+        """
+
+        for kwargs in ({"action": "open", "path": "D:/proj"},
+                       {"action": "reset"},
+                       {"action": "browse"},
+                       {"action": "upload", "data": "AAAA"}):
+            with self.subTest(**kwargs):
+                result = self.app.set_workspace(sid="", **kwargs)
+                self.assertFalse(result["ok"])
+                self.assertIn("会话", result["detail"])
+                self.assertEqual(self.shell.ops, [])
 
     def test_open_forwards_dir_to_shell(self) -> None:
         """路径两头空白要被 strip 掉——手输路径最容易多带空格。"""
 
-        result = self.app.set_workspace("open", path="  D:/proj  ")
+        result = self.app.set_workspace("open", path="  D:/proj  ",
+                                        sid="sess_0001")
         self.assertTrue(result["ok"])
         self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/proj")])
         self.assertIn("D:/proj", result["detail"])
 
     def test_open_without_path_does_not_reach_shell(self) -> None:
-        result = self.app.set_workspace("open", path="   ")
+        result = self.app.set_workspace("open", path="   ", sid="sess_0001")
         self.assertFalse(result["ok"])
         self.assertEqual(self.shell.ops, [])
 
     def test_unknown_action(self) -> None:
-        result = self.app.set_workspace("fly")
+        result = self.app.set_workspace("fly", sid="sess_0001")
         self.assertFalse(result["ok"])
         self.assertIn("未知的工作区操作", result["detail"])
 
     def test_shell_error_becomes_ok_false(self) -> None:
-        def bad(kind: str, path: str) -> dict:
+        def bad(kind: str, path: str, sid: str = "") -> dict:
             return {"error": "不是可用的目录：X:/nope"}
         self.shell.set_workspace = bad
-        result = self.app.set_workspace("open", path="X:/nope")
+        result = self.app.set_workspace("open", path="X:/nope", sid="sess_0001")
         self.assertFalse(result["ok"])
         self.assertIn("不是可用的目录", result["detail"])
 
@@ -275,7 +299,8 @@ class WorkspaceApiTests(unittest.TestCase):
         但 RPC 返回后必须已经删掉（上传包不留痕）。"""
 
         result = self.app.set_workspace(
-            "upload", filename="proj.zip", data=_zip_b64({"a.txt": "hi"}))
+            "upload", filename="proj.zip", data=_zip_b64({"a.txt": "hi"}),
+            sid="sess_0001")
 
         self.assertTrue(result["ok"])
         self.assertTrue(self.shell.zip_existed)
@@ -285,13 +310,14 @@ class WorkspaceApiTests(unittest.TestCase):
 
     def test_upload_rejects_bad_base64(self) -> None:
         result = self.app.set_workspace("upload", filename="p.zip",
-                                        data="这不是 base64!!!")
+                                        data="这不是 base64!!!", sid="sess_0001")
         self.assertFalse(result["ok"])
         self.assertIn("base64", result["detail"])
         self.assertEqual(self.shell.ops, [])   # 没到壳那一步
 
     def test_upload_rejects_empty_payload(self) -> None:
-        result = self.app.set_workspace("upload", filename="p.zip", data="")
+        result = self.app.set_workspace("upload", filename="p.zip", data="",
+                                        sid="sess_0001")
         self.assertFalse(result["ok"])
         self.assertEqual(self.shell.ops, [])
 
@@ -299,7 +325,7 @@ class WorkspaceApiTests(unittest.TestCase):
         """复位发的是 kind=default + 空路径：前端本来就不知道项目根在哪，
         也不该假装知道——"默认"由后端定义。"""
 
-        result = self.app.set_workspace("reset")
+        result = self.app.set_workspace("reset", sid="sess_0001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(self.shell.ops, [("set_workspace", "default:")])
@@ -307,11 +333,11 @@ class WorkspaceApiTests(unittest.TestCase):
     def test_reset_detail_does_not_dangle(self) -> None:
         """默认工作区可能不报 root（只有 kind）——别拼出"工作区已切到 "。"""
 
-        def bare(kind: str, path: str) -> dict:
+        def bare(kind: str, path: str, sid: str = "") -> dict:
             return {"status": "ok", "workspace": {"kind": "default"}}
         self.shell.set_workspace = bare
 
-        result = self.app.set_workspace("reset")
+        result = self.app.set_workspace("reset", sid="sess_0001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["detail"], "已回到默认工作区")
@@ -319,12 +345,14 @@ class WorkspaceApiTests(unittest.TestCase):
     def test_switch_without_root_still_has_detail(self) -> None:
         """非 default 但没 root：给通用那句，不留半句。"""
 
-        def bare(kind: str, path: str) -> dict:
+        def bare(kind: str, path: str, sid: str = "") -> dict:
             return {"status": "ok", "workspace": {"kind": "dir"}}
         self.shell.set_workspace = bare
 
-        self.assertEqual(self.app.set_workspace("open", path="D:/p")["detail"],
-                         "工作区已切换")
+        self.assertEqual(
+            self.app.set_workspace("open", path="D:/p",
+                                   sid="sess_0001")["detail"],
+            "工作区已切换")
 
     # ── browse：后端弹系统选框（不用手输路径）─────────────────
 
@@ -333,7 +361,7 @@ class WorkspaceApiTests(unittest.TestCase):
 
         with mock.patch("scripts.native_dialog.pick_directory",
                         return_value="D:/picked") as pick:
-            result = self.app.set_workspace("browse")
+            result = self.app.set_workspace("browse", sid="sess_0001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/picked")])
@@ -348,22 +376,22 @@ class WorkspaceApiTests(unittest.TestCase):
         """
 
         with tempfile.TemporaryDirectory() as real:
-            self.shell.workspace = lambda: {
+            self.shell.workspace = lambda sid="": {
                 "workspace": {"kind": "dir", "root": real}}
             with mock.patch("scripts.native_dialog.pick_directory",
                             return_value="D:/picked") as pick:
-                self.app.set_workspace("browse")
+                self.app.set_workspace("browse", sid="sess_0001")
 
         self.assertEqual(pick.call_args.kwargs.get("initial"), real)
 
     def test_browse_with_vanished_workspace_starts_from_home(self) -> None:
         """当前工作区已经不在了（比如删掉了）：别把死路径当起点传给系统框。"""
 
-        self.shell.workspace = lambda: {
+        self.shell.workspace = lambda sid="": {
             "workspace": {"kind": "dir", "root": "D:/definitely-not-here"}}
         with mock.patch("scripts.native_dialog.pick_directory",
                         return_value="D:/picked") as pick:
-            self.app.set_workspace("browse")
+            self.app.set_workspace("browse", sid="sess_0001")
 
         self.assertEqual(pick.call_args.kwargs.get("initial"), "")
 
@@ -371,7 +399,7 @@ class WorkspaceApiTests(unittest.TestCase):
         """取消不是错误：不该弹红字，也不该碰壳（什么都没发生）。"""
 
         with mock.patch("scripts.native_dialog.pick_directory", return_value=None):
-            result = self.app.set_workspace("browse")
+            result = self.app.set_workspace("browse", sid="sess_0001")
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["cancelled"])       # 前端靠它决定"别弹红字"
@@ -382,7 +410,7 @@ class WorkspaceApiTests(unittest.TestCase):
 
         with mock.patch("scripts.native_dialog.pick_directory",
                         side_effect=native_dialog.DialogUnavailable("没有图形环境")):
-            result = self.app.set_workspace("browse")
+            result = self.app.set_workspace("browse", sid="sess_0001")
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["fallback"], "manual")
@@ -394,7 +422,7 @@ class WorkspaceApiTests(unittest.TestCase):
 
         with mock.patch("scripts.native_dialog.pick_directory",
                         side_effect=TimeoutError("等太久了")):
-            result = self.app.set_workspace("browse")
+            result = self.app.set_workspace("browse", sid="sess_0001")
 
         self.assertFalse(result["ok"])
         self.assertNotIn("fallback", result)
@@ -766,7 +794,8 @@ class WorkspaceHttpTests(unittest.TestCase):
 
     def test_post_open_reaches_shell(self) -> None:
         status, payload = self._post(
-            "/api/workspace", {"action": "open", "path": "D:/proj"})
+            "/api/workspace",
+            {"action": "open", "path": "D:/proj", "sid": "sess_0001"})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/proj")])
@@ -786,7 +815,8 @@ class WorkspaceHttpTests(unittest.TestCase):
         """
 
         with mock.patch("scripts.native_dialog.pick_directory") as pick:
-            status, payload = self._post("/api/workspace", {"action": "browse"})
+            status, payload = self._post(
+                "/api/workspace", {"action": "browse", "sid": "sess_0001"})
 
         self.assertEqual(status, 403)
         self.assertFalse(payload["ok"])
@@ -797,7 +827,8 @@ class WorkspaceHttpTests(unittest.TestCase):
         with mock.patch("scripts.native_dialog.pick_directory",
                         return_value="D:/picked"):
             status, payload = self._post(
-                "/api/workspace", {"action": "browse"}, ui_header=True)
+                "/api/workspace", {"action": "browse", "sid": "sess_0001"},
+                ui_header=True)
 
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
@@ -807,7 +838,7 @@ class WorkspaceHttpTests(unittest.TestCase):
         """只有 browse 需要那个头——别的动作别顺手一起拦掉（会白挂）。"""
 
         status, payload = self._post(
-            "/api/workspace", {"action": "reset"})
+            "/api/workspace", {"action": "reset", "sid": "sess_0001"})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
 
@@ -911,14 +942,15 @@ class ShellReviveTests(unittest.TestCase):
         self.assertFalse(app.revive_shell())
         self.assertIs(app.shell, shell)
 
-    def test_revive_restores_the_workspace(self) -> None:
-        """换代后必须把工作区设回去（2026-09-17 事故的直接修复）。
+    def test_revive_does_not_restore_workspace_at_web_layer(self) -> None:
+        """换代**不再**在 web 层恢复工作区（2026-09-23 会话级化后的新契约）。
 
-        现场：用户打开了某个上传目录，sidecar 因环境原因死掉 → 自愈换了新壳
-        → 新壳的 initial_workspace 是**启动态 = 项目根** → 工具静默换根。
-        表现就是上一句能 `fs_list` 出 `docs/`、下一句 `fs_read` 说"系统找不到
-        指定的路径"，而前端没刷新工作区还显示着旧路径——看上去像"工具在返回
-        假数据"。工作区是边界，边界不能悄悄变。
+        旧契约（2026-09-17 事故的修复）：工作区是**进程级**状态，sidecar
+        换代后必须设回去，否则工具静默换根。会话级化之后这条不再需要——
+        目录跟着**会话记录**走（cwd 进 record），sidecar 在 resume 时按它
+        重建运行时，web 层恢复机制退役（_restore_workspace 只剩空壳）。
+        这里钉的是新契约：换代不碰新壳的工作区，恢复职责完全在 sidecar
+        那一侧（test_sidecar 的会话级工作区测试负责）。
         """
 
         made: list = []
@@ -931,21 +963,20 @@ class ShellReviveTests(unittest.TestCase):
         first = factory()
         app = self._app(first, factory)
 
-        app.set_workspace("open", "D:/some/java-project")
+        app.set_workspace("open", "D:/some/java-project", sid="sess_0001")
         self.assertEqual(app._workspace_root, "D:/some/java-project")
 
         first.stop()                      # sidecar 死了
         self.assertTrue(app.revive_shell())
 
         self.assertIs(app.shell, made[-1])          # 确实换了新壳
-        self.assertIn(("set_workspace", "dir:D:/some/java-project"),
-                      app.shell.ops)                # 且新壳被设回了原目录
+        self.assertEqual(app.shell.ops, [])         # 且 web 层不再替它设工作区
 
     def test_reset_clears_the_workspace_memory(self) -> None:
-        """用户主动复位（回默认工作区）之后，换代不该再设回去。
+        """用户主动复位（回默认工作区）之后，_workspace_root 记忆要清掉。
 
-        复位是明确的意图表达。把"记住的目录"在这种时候也带过去，等于
-        用户点了复位却复位不掉。
+        复位是明确的意图表达。哪怕将来某层再引入"恢复"逻辑，也不该把
+        用户刚复位掉的目录又带回去。
         """
 
         made: list = []
@@ -958,8 +989,8 @@ class ShellReviveTests(unittest.TestCase):
         first = factory()
         app = self._app(first, factory)
 
-        app.set_workspace("open", "D:/some/java-project")
-        app.set_workspace("reset")
+        app.set_workspace("open", "D:/some/java-project", sid="sess_0001")
+        app.set_workspace("reset", sid="sess_0001")
         self.assertEqual(app._workspace_root, "")
 
         first.stop()
@@ -967,32 +998,6 @@ class ShellReviveTests(unittest.TestCase):
 
         self.assertNotIn(("set_workspace", "dir:D:/some/java-project"),
                          app.shell.ops)
-
-    def test_restore_failure_does_not_break_the_revive(self) -> None:
-        """恢复失败不能拖垮自愈，但也不能静默——记忆要清掉，免得每次换代
-        都拿一个死路径去试。
-        """
-
-        class UngratefulShell(FakeRevivableShell):
-            def set_workspace(self, kind: str, path: str) -> dict:
-                self.ops.append(("set_workspace", kind + ":" + path))
-                return {"error": "目录不在了"}
-
-        made: list = []
-
-        def factory() -> UngratefulShell:
-            shell = UngratefulShell(alive=False)
-            made.append(shell)
-            return shell
-
-        first = factory()
-        app = self._app(first, factory)
-
-        app.set_workspace("open", "D:/some/java-project")
-        first.stop()
-
-        self.assertTrue(app.revive_shell())          # 自愈照常成功
-        self.assertEqual(app._workspace_root, "")    # 但记忆清掉了
 
 
 if __name__ == "__main__":

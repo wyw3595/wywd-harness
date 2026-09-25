@@ -229,6 +229,42 @@ def resolve_permission(
 # 4. 装配默认规则:默认拒绝 + bash 分级 + 路径作用域 + 免审批白名单
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# 3.5 只读命令白名单（2026-09-23，对齐 Claude Code 的权限 Tier 1）
+# ----------------------------------------------------------------------
+#
+# **为什么需要**：审批是**阻塞**的，且占着唯一的 RPC 通道（scripts/shell.py
+# 的 _rpc_lock）——"什么命令都问"既拖慢 agent，又会在没人应答时把整个前端
+# 堵住（实测：一次 bash 审批 = 前端最长卡 5 分钟）。而实际用得最多的是
+# `git status` / `ls` / 跑测试这类**只读**命令，它们不该每次都要人点头。
+#
+# Claude Code 的源码分析里那句判据值得抄下来：
+#   没有中间层的话，每个陌生命令都会撞到"问用户"，而**权限疲劳是真实的
+#   安全风险——被问得太频繁的用户会不读就点批准**。
+#
+# ⚠️ 安全前提（**三条必须同时成立**才放行，缺一条就是漏洞）：
+#   1. 命令里**不含任何 shell 元字符**。这是最关键的一条：没有它，
+#      `ls; rm -rf /` 会因为"以 ls 开头"被放行——那是个致命漏洞。
+#   2. 首个子命令命中白名单，且白名单项后面必须是**空白或结尾**
+#      （否则 `listing` 会被 `ls` 前缀匹配上）。
+#   3. 只收"**只能看、不能改**"的命令：任何会写盘、装包、改仓库状态的
+#      都不进这张表（`git push` / `npm install` / `rm` 一律不在）。
+READ_ONLY_COMMAND_PREFIXES = (
+    # git 的只读子命令
+    "git status", "git diff", "git log", "git show", "git branch",
+    "git remote", "git ls-files", "git rev-parse",
+    # 看文件 / 找东西
+    "ls", "dir", "pwd", "cat", "head", "tail", "wc", "find", "grep", "echo",
+    # 跑测试（写只有 __pycache__ / .pytest_cache，属于"验证"而非"改项目"）
+    "python -m unittest", "python -m pytest", "pytest",
+    # 看版本 / 看依赖清单
+    "python --version", "node --version", "git --version", "pip list",
+)
+
+# 出现任何一个就不走白名单。~ 也拦：`cat ~/.ssh/id_rsa` 是典型的越界读。
+_SHELL_METACHARS = frozenset(";|&><`$(){}\n\r~")
+
+
 def build_default_policy(
     scope: WorkspaceScope | None = None,
     safe_tools: Sequence[str] = (),
@@ -242,10 +278,11 @@ def build_default_policy(
       2. path.outside_workspace    -> DENY(先于读写规则!)
       3. path.forbidden_zone       -> DENY(界内禁区,同越界一样不可覆盖)
       4. path.read_allow           -> ALLOW(只读工具 + 界内,显式放行)
-      5. path.write_ask            -> ASK(写工具 + 界内:改状态必须问人)
-      6. bash.requires_approval    -> ASK
-      7. tool.allow_safe(可选)     -> ALLOW(免审批白名单,见 safe_tools)
-      8. default.deny              -> 由 decide 兜底,无需显式规则
+      5. path.write_allow          -> ALLOW(写工具 + 界内:2026-09-23 起放行,越界/禁区仍 DENY)
+      6. bash.read_only_allow      -> ALLOW(只读命令免审批,见 READ_ONLY_COMMAND_PREFIXES)
+      7. bash.requires_approval    -> ASK
+      8. tool.allow_safe(可选)     -> ALLOW(免审批白名单,见 safe_tools)
+      9. default.deny              -> 由 decide 兜底,无需显式规则
 
     read_tools / write_tools 由装配层(toolbox.py)声明本项目的读写工具
     集合,permissions 只提供通用框架——新增写工具不改这里,改装配层
@@ -305,6 +342,22 @@ def build_default_policy(
         # 交给后面的规则（is_bash 也不认它，最终落到 default.deny）。
         head = command.strip().split()
         return bool(head) and head[0] in DANGEROUS
+
+    def is_read_only_bash(request: ToolRequest) -> bool:
+        """这条 bash 命令是不是"常见的只读命令"（够格免审批）。
+
+        保守优先：**拿不准就返回 False**，让它落回 `bash.requires_approval`
+        去问人。误判成"要问"只是多一次点击；误判成"免问"可能是一条 rm。
+        """
+
+        command = command_text(request)
+        if any(char in command for char in _SHELL_METACHARS):
+            return False
+        stripped = command.strip()
+        for prefix in READ_ONLY_COMMAND_PREFIXES:
+            if stripped == prefix or stripped.startswith(prefix + " "):
+                return True
+        return False
 
     def is_outside(request: ToolRequest) -> bool:
         """越界:路径工具 + 参数里的 path 解析后跑出工作区。"""
@@ -388,8 +441,30 @@ def build_default_policy(
             lambda r: "只读文件操作且在工作区内,免审批放行",
         ),
         PermissionRule(
-            "path.write_ask", PermissionAction.ASK, is_write_inside,
-            lambda r: f"写入 {path_text(r)!r} 会修改工作区,需人工审批",
+            # 2026-09-23：**界内的写操作不再问人**（用户决定）。
+            #
+            # 为什么敢放：沙箱边界已经由前面两条 DENY 守住了——
+            # `path.outside_workspace`（越界）和 `path.forbidden_zone`（界内禁区）
+            # 都在它之前，所以放行的只是"工作区内的普通文件"。而"改工作区里的
+            # 文件"本来就是 agent 该干的活。
+            #
+            # 为什么该放：审批**阻塞唯一的 RPC 通道**（shell.py 的 _rpc_lock），
+            # 一个"给项目加个后端"的任务要写 5 个文件 → 问 5 次 + 每次没人点
+            # 就堵 60 秒。更要命的是**权限疲劳**：被问太多次的人会不读就点，
+            # 那比不问更危险（Claude Code 源码分析的结论）。
+            #
+            # 仍然守住的（一条都没松）：
+            #   - 越界 / 禁区        → DENY（不可审批覆盖）
+            #   - bash 硬拒前缀      → DENY（sudo / rm / reboot…）
+            #   - bash 非只读命令    → ASK（bash 没有路径约束，不能按文件放行）
+            "path.write_allow", PermissionAction.ALLOW, is_write_inside,
+            lambda r: f"写入 {path_text(r)!r}（工作区内），放行",
+        ),
+        PermissionRule(
+            # 只读命令先放行（2026-09-23）：它必须排在 requires_approval **之前**，
+            # 否则所有 bash 都会先撞上 ASK。硬拒规则在更前面——顺序即安全语义。
+            "bash.read_only_allow", PermissionAction.ALLOW, is_read_only_bash,
+            lambda r: f"只读命令 {command_text(r)!r} 免审批放行",
         ),
         PermissionRule(
             "bash.requires_approval", PermissionAction.ASK, is_bash,

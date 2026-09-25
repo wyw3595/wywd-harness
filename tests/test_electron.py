@@ -93,7 +93,12 @@ class ElectronMainTests(unittest.TestCase):
     """主进程路由：ping / 会话簿 / 历史延续 / ASK 审批两条路 / 事件直播。"""
 
     def _make_tmp_write_registry(self, tmp: str, tracked: dict) -> ToolRegistry:
-        """造一个"会触发 write_ask 的写工具"注册表，handler 写 tmp 目录。"""
+        """造一个"能触发 ASK"的注册表：写工具 + 假 bash。
+
+        2026-09-23 界内写放行（path.write_allow）后，fs_write 不再触发
+        审批；审批通路要一个**仍然会问人**的工具——bash（非只读命令）就是，
+        它没有路径约束，永远落 bash.requires_approval。
+        """
 
         registry = ToolRegistry()
 
@@ -105,6 +110,15 @@ class ElectronMainTests(unittest.TestCase):
         registry.register(Tool(
             name="fs_write", description="写入文件",
             handler=handler,
+        ))
+
+        def run_command(command: str) -> str:
+            tracked["calls"] += 1
+            return "ran"
+
+        registry.register(Tool(
+            name="bash", description="跑命令",
+            handler=run_command,
         ))
         return registry
 
@@ -184,20 +198,20 @@ class ElectronMainTests(unittest.TestCase):
             main = ElectronMain(
                 model=ScriptedModel([
                     ModelReply(kind="tool_calls", tool_calls=[
-                        ToolCall("c1", "fs_write", {"path": "notes.txt", "text": "你好"}),
+                        ToolCall("c1", "bash", {"command": "touch notes.txt"}),
                     ]),
-                    ModelReply(kind="final", text="写好了"),
+                    ModelReply(kind="final", text="跑完了"),
                 ]),
                 registry=registry,
                 policy=policy,
                 send=sent.append,
                 recv=self._recv_echo_ticket(sent, approved=True),
             )
-            result = main.route({"type": "agent/message", "data": "写文件"})
+            result = main.route({"type": "agent/message", "data": "跑命令"})
             self.assertIsInstance(sent[0], dict)
             self.assertEqual(sent[0]["type"], "approval/request")
             self.assertEqual(tracked["calls"], 1)  # 批准后真的执行了
-            self.assertEqual(result["data"], "写好了")
+            self.assertEqual(result["data"], "跑完了")
 
     def test_ask_reject_blocks_with_permission_blocked(self) -> None:
         """ASK 拒绝：handler 不碰，历史里的工具消息回灌 permission_blocked。"""
@@ -212,16 +226,16 @@ class ElectronMainTests(unittest.TestCase):
             main = ElectronMain(
                 model=ScriptedModel([
                     ModelReply(kind="tool_calls", tool_calls=[
-                        ToolCall("c1", "fs_write", {"path": "notes.txt", "text": "你好"}),
+                        ToolCall("c1", "bash", {"command": "touch notes.txt"}),
                     ]),
-                    ModelReply(kind="final", text="好吧，不写了"),
+                    ModelReply(kind="final", text="好吧，不跑了"),
                 ]),
                 registry=registry,
                 policy=policy,
                 send=sent.append,
                 recv=self._recv_echo_ticket(sent, approved=False),
             )
-            result = main.route({"type": "agent/message", "data": "写文件"})
+            result = main.route({"type": "agent/message", "data": "跑命令"})
             self.assertEqual(tracked["calls"], 0)  # 拒绝：不碰 handler
             # 回灌发生在历史里的 tool 消息，不是最终回答里——
             # 模型应"看到"permission_blocked + 规则号，才懂为什么被拦。
@@ -229,7 +243,7 @@ class ElectronMainTests(unittest.TestCase):
                 m.get("content", "") for m in main._history if m["role"] == "tool"
             )
             self.assertIn("permission_blocked", tool_contents)
-            self.assertIn("path.write_ask", tool_contents)
+            self.assertIn("bash.requires_approval", tool_contents)
 
     def test_ask_rejected_when_main_shutting_down(self) -> None:
         """审批途中 main 被关停（recv 返回 None）→ 一律拒绝（fail-closed）。"""

@@ -486,60 +486,122 @@ class SidecarServerTests(unittest.TestCase):
                              policy=build_default_policy(),
                              runtime_builder=self._workspace_builder(seen))
 
-    def test_workspace_set_swaps_registry_policy_runner(self) -> None:
-        """三层连带更新：registry 换了、policy 换了、runner 也重建了。
+    # ── 工作区（s11 上传目录 → 2026-09-23 改**会话级**）──────────────
+    #
+    # 契约变化：目录属于**会话**（Record.cwd），不再属于进程。
+    # 所以 workspace/set|get 都要带 sessionId，而且**不换** sidecar 级那套
+    # registry/policy——换的是"这个会话下次重建运行时用哪个目录"。
 
-        漏 registry = 模型还在旧沙箱里干活；漏 policy = 决策层与执行层
-        各认一个根；漏 runner = 前两层改了但跑起来还是老边界（最隐蔽）。
+    def _new_session(self, conn) -> str:
+        return self._request(conn, "session/create", {})["result"]["sessionId"]
+
+    def test_workspace_set_is_per_session(self) -> None:
+        """**一个会话一个目录**：给 A 换目录，B 不受影响。
+
+        旧模型是"换掉本进程的 registry"——那样两个会话没法各待一个目录。
+        这里断言的正是新模型：cwd 落在**各自的记录**里，进程级那套不被动。
         """
 
         seen: list = []
         server = self._workspace_server(seen)
         conn, _ = self._spawn(server)
-        old_runner = server._runner
 
-        resp = self._request(conn, "workspace/set",
-                             {"kind": "dir", "path": "D:/proj"})
+        sid_a = self._new_session(conn)
+        sid_b = self._new_session(conn)
+        before_b = server._manager.store.load(sid_b).cwd
 
-        self.assertEqual(resp["result"]["status"], "ok")
-        self.assertEqual(resp["result"]["workspace"]["id"], "ws_9")
-        self.assertEqual(seen, [{"kind": "dir", "path": "D:/proj"}])
-        self.assertIn("probe", server._registry.names())      # 注册表换新
-        self.assertIsNot(server._runner, old_runner)          # runner 重建
-        self.assertIs(server._runner._registry, server._registry)
-        self.assertIs(server._runner._policy, server._policy)
+        # 用真实存在的目录（cwd 会被 resolve(strict=True) 校验）
+        with tempfile.TemporaryDirectory() as target:
+            resp = self._request(conn, "workspace/set",
+                                 {"sessionId": sid_a, "kind": "dir",
+                                  "path": target})["result"]
+
+            self.assertEqual(resp["status"], "ok")
+            self.assertEqual(resp["workspace"]["id"], "ws_9")
+            # 建会话时也会问工厂一次（拿它的 cwd 造运行时），所以看**最后一条**
+            self.assertEqual(seen[-1]["path"], target)
+            self.assertEqual(seen[-1]["kind"], "dir")
+            # A 的目录变了
+            self.assertEqual(server._manager.store.load(sid_a).cwd, target)
+            # B 一点没动
+            self.assertEqual(server._manager.store.load(sid_b).cwd, before_b)
+        # 进程级那套没被换（老模型才会动它）
+        self.assertNotIn("probe", server._registry.names())
         conn.close()
 
-    def test_workspace_get_reports_default_then_switched(self) -> None:
+    def test_workspace_dirs_do_not_leak_between_sessions(self) -> None:
+        """两个会话各设一个目录 → 各自运行时用**各自的** registry/沙箱。
+
+        这是"真隔离"的核心：两个 cwd 对应两份 registry，而且互不覆盖。
+        """
+
         seen: list = []
         server = self._workspace_server(seen)
         conn, _ = self._spawn(server)
 
-        default = self._request(conn, "workspace/get")["result"]["workspace"]
-        self.assertEqual(default["kind"], "default")
+        sid_a = self._new_session(conn)
+        sid_b = self._new_session(conn)
+        self._request(conn, "workspace/set",
+                      {"sessionId": sid_a, "kind": "dir", "path": "D:/a"})
+        self._request(conn, "workspace/set",
+                      {"sessionId": sid_b, "kind": "dir", "path": "D:/b"})
 
-        self._request(conn, "workspace/set", {"kind": "zip", "path": "p.zip"})
-        after = self._request(conn, "workspace/get")["result"]["workspace"]
-        self.assertEqual(after["kind"], "zip")
-        self.assertEqual(after["root"], "p.zip")
+        registry_a, policy_a, info_a = server._runtime_for("D:/a")
+        registry_b, policy_b, info_b = server._runtime_for("D:/b")
+
+        self.assertIsNot(registry_a, registry_b)          # 两份注册表
+        self.assertIsNot(policy_a, policy_b)              # 两份策略
+        self.assertEqual(info_a["root"], "D:/a")
+        self.assertEqual(info_b["root"], "D:/b")
+        # 同一个目录再取，拿到的是缓存里那份（不重复构建）
+        again_a, _, _ = server._runtime_for("D:/a")
+        self.assertIs(again_a, registry_a)
+        conn.close()
+
+    def test_workspace_get_is_per_session(self) -> None:
+        seen: list = []
+        server = self._workspace_server(seen)
+        conn, _ = self._spawn(server)
+        sid = self._new_session(conn)
+
+        default = self._request(conn, "workspace/get",
+                                {"sessionId": sid})["result"]["workspace"]
+        self.assertIn("root", default)          # 新会话总有话可说
+
+        with tempfile.TemporaryDirectory() as target:
+            self._request(conn, "workspace/set",
+                          {"sessionId": sid, "kind": "dir", "path": target})
+            after = self._request(conn, "workspace/get",
+                                  {"sessionId": sid})["result"]["workspace"]
+            self.assertEqual(after["kind"], "dir")
+            self.assertEqual(after["root"], target)
         conn.close()
 
     def test_workspace_set_translates_builder_error(self) -> None:
         """装配层的 ValueError 翻成人话进 {"error"}——RPC 唯一错误通道。"""
 
         def builder(params: dict):
-            raise ValueError("压缩包已损坏或不是 zip：p.zip")
+            # 只在 zip 上炸——**建会话时**厂会用 dir 问一次（拿会话的 cwd），
+            # 那次得让它过，否则连会都建不起来，测的就不是"set 时报错"了。
+            if params.get("kind") == "zip":
+                raise ValueError("压缩包已损坏或不是 zip：p.zip")
+            return (ToolRegistry(), build_default_policy(),
+                    {"kind": "dir", "root": params.get("path")})
 
         server = SidecarServer(model=None, registry=ToolRegistry(),
                                policy=build_default_policy(),
                                runtime_builder=builder)
         conn, _ = self._spawn(server)
+        sid = self._new_session(conn)
+
         result = self._request(conn, "workspace/set",
-                               {"kind": "zip", "path": "p.zip"})["result"]
+                               {"sessionId": sid, "kind": "zip",
+                                "path": "p.zip"})["result"]
+
         self.assertIn("error", result)
         self.assertIn("压缩包", result["error"])
-        # 失败不动现状：还是原来那套 registry（fail-closed 的老规矩）
-        self.assertEqual(server._registry.names(), [])
+        # 失败不动现状：会话的 cwd 还是原来那个（fail-closed 的老规矩）
+        self.assertNotEqual(server._manager.store.load(sid).cwd, "p.zip")
         conn.close()
 
     def test_workspace_set_without_builder_says_so(self) -> None:
@@ -548,46 +610,82 @@ class SidecarServerTests(unittest.TestCase):
         server = SidecarServer(model=None, registry=ToolRegistry(),
                                policy=build_default_policy())
         conn, _ = self._spawn(server)
+        sid = self._new_session(conn)
+
         result = self._request(conn, "workspace/set",
-                               {"kind": "dir", "path": "D:/proj"})["result"]
+                               {"sessionId": sid, "kind": "dir",
+                                "path": "D:/proj"})["result"]
+
         self.assertIn("没接工作区能力", result["error"])
         conn.close()
 
-    def test_status_carries_workspace(self) -> None:
+    def test_workspace_set_needs_a_live_session(self) -> None:
+        """不给 sessionId / 会话不存在 → 明确回绝（不假装换了）。"""
+
         seen: list = []
         server = self._workspace_server(seen)
         conn, _ = self._spawn(server)
-        self._request(conn, "workspace/set", {"kind": "dir", "path": "D:/p"})
-        status = self._request(conn, "sidecar/status")["result"]
-        self.assertEqual(status["workspace"]["root"], "D:/p")
+
+        result = self._request(conn, "workspace/set",
+                               {"kind": "dir", "path": "D:/proj"})["result"]
+
+        self.assertIn("error", result)
+        self.assertIn("不在运行", result["error"])
+        self.assertEqual(seen, [])          # 工厂压根没被叫
         conn.close()
 
-    def test_workspace_set_default_restores_startup_runtime(self) -> None:
-        """复位：回启动态，且**不经过工厂**（工厂只会解析工作区规格）。
+    def test_status_carries_startup_workspace(self) -> None:
+        """sidecar/status 里的 workspace 是**启动态**（进程级）。
+
+        工作区改成会话级之后，进程层面只剩"我出生在哪个目录"这一个事实——
+        某个会话现在在哪儿，得问 workspace/get?sessionId=。
+        """
+
+        seen: list = []
+        server = SidecarServer(
+            model=None, registry=ToolRegistry(), policy=build_default_policy(),
+            runtime_builder=self._workspace_builder(seen),
+            initial_workspace={"kind": "default", "root": "D:/born-here"})
+        conn, _ = self._spawn(server)
+
+        self._request(conn, "sidecar/status")
+        status = self._request(conn, "sidecar/status")["result"]
+        self.assertEqual(status["workspace"]["root"], "D:/born-here")
+        conn.close()
+
+    def test_workspace_set_default_resets_that_session(self) -> None:
+        """kind=default 是**这个会话**复位：cwd 回启动态，且不经过工厂。
 
         为什么强调不经过工厂：复位不需要坐标。让工厂去解析一个"默认路径"
         等于把"默认是什么"外包给装配层，而它本来就只是把启动态交出来的人。
         """
 
         seen: list = []
-        server = self._workspace_server(seen)
-        initial_registry = server._registry
-        initial_policy = server._policy
-        conn, _ = self._spawn(server)
-        old_runner = server._runner
+        # 用**真实存在的**临时目录：cwd 会被 resume 用 resolve(strict=True) 校验，
+        # 假路径会让会话下次打不开（这正是"目录必须存在"这条约束的意义）。
+        with tempfile.TemporaryDirectory() as default_root, \
+                tempfile.TemporaryDirectory() as other:
+            server = SidecarServer(
+                model=None, registry=ToolRegistry(),
+                policy=build_default_policy(),
+                runtime_builder=self._workspace_builder(seen),
+                initial_workspace={"kind": "default", "root": default_root})
+            conn, _ = self._spawn(server)
+            sid = self._new_session(conn)
 
-        self._request(conn, "workspace/set", {"kind": "dir", "path": "D:/p"})
-        self.assertIn("probe", server._registry.names())
+            self._request(conn, "workspace/set",
+                          {"sessionId": sid, "kind": "dir", "path": other})
+            self.assertEqual(server._manager.store.load(sid).cwd, other)
+            after_switch = len(seen)
 
-        result = self._request(conn, "workspace/set", {"kind": "default"})["result"]
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["workspace"]["kind"], "default")
-        self.assertEqual(len(seen), 1)                       # 工厂没被再叫一次
-        self.assertIs(server._registry, initial_registry)    # registry 回原样
-        self.assertIs(server._policy, initial_policy)
-        self.assertIsNot(server._runner, old_runner)         # runner 重建（换了回来）
-        self.assertIs(server._runner._registry, initial_registry)
-        conn.close()
+            result = self._request(conn, "workspace/set",
+                                   {"sessionId": sid, "kind": "default"})["result"]
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["workspace"]["root"], default_root)
+            self.assertEqual(len(seen), after_switch)   # 复位没再叫工厂
+            self.assertEqual(server._manager.store.load(sid).cwd, default_root)
+            conn.close()
 
     def test_workspace_set_default_works_without_builder(self) -> None:
         """没工厂也能复位——"回启动态"从来不需要工作区能力。"""
@@ -595,35 +693,14 @@ class SidecarServerTests(unittest.TestCase):
         server = SidecarServer(model=None, registry=ToolRegistry(),
                                policy=build_default_policy())
         conn, _ = self._spawn(server)
-        result = self._request(conn, "workspace/set", {"kind": "default"})["result"]
+        sid = self._new_session(conn)
+
+        result = self._request(conn, "workspace/set",
+                               {"sessionId": sid, "kind": "default"})["result"]
+
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["workspace"], {"kind": "default"})
+        self.assertEqual(result["workspace"]["kind"], "default")
         conn.close()
-
-    def test_initial_workspace_info_is_reported_and_restored(self) -> None:
-        """装配层报的启动态（含 root）如实对外，且复位后回到它。
-
-        root 是给 UI 看的：sidecar 手上只有 registry，认不出路径，
-        不问装配层就没法回答"现在在哪个目录里干活"。
-        """
-
-        seen: list = []
-        server = SidecarServer(
-            model=None, registry=ToolRegistry(), policy=build_default_policy(),
-            runtime_builder=self._workspace_builder(seen),
-            initial_workspace={"kind": "default", "root": "D:/proj-root"})
-        conn, _ = self._spawn(server)
-
-        default = self._request(conn, "workspace/get")["result"]["workspace"]
-        self.assertEqual(default["root"], "D:/proj-root")
-
-        self._request(conn, "workspace/set", {"kind": "dir", "path": "D:/p"})
-        back = self._request(conn, "workspace/set",
-                             {"kind": "default"})["result"]["workspace"]
-        self.assertEqual(back["root"], "D:/proj-root")
-        conn.close()
-
-
     # ── 空闲回收（s12）：后台线程与状态自述 ──────────────────
 
     def test_idle_timeout_defaults_to_off(self) -> None:
@@ -700,6 +777,16 @@ class MainProcessClientTests(unittest.TestCase):
             return "ok"
 
         registry.register(Tool(name="fs_write", description="写", handler=handler))
+
+        # 2026-09-23 界内写放行（path.write_allow）后，fs_write 不再触发
+        # 审批。审批通路要一个**仍然会问人**的工具：bash 没有路径约束，
+        # 非只读命令永远落 bash.requires_approval（顺序即安全语义）。
+        def run_command(command: str) -> str:
+            tracked["calls"] += 1
+            return "ran"
+
+        registry.register(Tool(name="bash", description="跑命令",
+                               handler=run_command))
         server = SidecarServer(
             model=ScriptedModel([ModelReply(kind="final", text="ok")]),
             registry=registry,
@@ -740,14 +827,14 @@ class MainProcessClientTests(unittest.TestCase):
             sid = client.call("session/create")["result"]["sessionId"]
             server._model = ScriptedModel([
                 ModelReply(kind="tool_calls", tool_calls=[
-                    ToolCall("c1", "fs_write", {"path": "n.txt", "text": "hi"}),
+                    ToolCall("c1", "bash", {"command": "touch made-by-agent.txt"}),
                 ]),
-                ModelReply(kind="final", text="写好了"),
+                ModelReply(kind="final", text="跑完了"),
             ])
-            resp = client.call("agent/send", {"sessionId": sid, "message": "写文件"})
+            resp = client.call("agent/send", {"sessionId": sid, "message": "跑命令"})
             self.assertEqual(tracked["calls"], 1)
-            self.assertEqual(prompts[0][0], "path.write_ask")  # 审批真的弹了
-            self.assertIn("写好了", resp["result"]["output"])
+            self.assertEqual(prompts[0][0], "bash.requires_approval")  # 审批真的弹了
+            self.assertIn("跑完了", resp["result"]["output"])
             client.call("sidecar/shutdown")
             client.close(); thread.join(timeout=2)
 
@@ -762,11 +849,11 @@ class MainProcessClientTests(unittest.TestCase):
             sid = client.call("session/create")["result"]["sessionId"]
             server._model = ScriptedModel([
                 ModelReply(kind="tool_calls", tool_calls=[
-                    ToolCall("c1", "fs_write", {"path": "n.txt", "text": "hi"}),
+                    ToolCall("c1", "bash", {"command": "touch made-by-agent.txt"}),
                 ]),
-                ModelReply(kind="final", text="好吧不写了"),
+                ModelReply(kind="final", text="好吧不跑了"),
             ])
-            resp = client.call("agent/send", {"sessionId": sid, "message": "写文件"})
+            resp = client.call("agent/send", {"sessionId": sid, "message": "跑命令"})
             self.assertEqual(tracked["calls"], 0)  # 拒绝：不碰 handler
             # s07-b：transcript 从 store 存档读（server.sessions 裸字典已退役）
             tool_msgs = " ".join(
@@ -774,8 +861,8 @@ class MainProcessClientTests(unittest.TestCase):
                 if m["role"] == "tool"
             )
             self.assertIn("permission_blocked", tool_msgs)
-            self.assertIn("path.write_ask", tool_msgs)
-            self.assertEqual(resp["result"]["output"], "好吧不写了")
+            self.assertIn("bash.requires_approval", tool_msgs)
+            self.assertEqual(resp["result"]["output"], "好吧不跑了")
             client.call("sidecar/shutdown")
             client.close(); thread.join(timeout=2)
 

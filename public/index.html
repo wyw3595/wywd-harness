@@ -369,6 +369,10 @@
   #live-feed>summary::before{content:"\25B8";font-size:10px;
     display:inline-block;margin-right:6px}
   #live-feed[open]>summary::before{content:"\25BE"}
+  /* 命令说明（2026-09-24）：模型写给**人**看的一句中文——"这条命令干嘛的"。
+     用户读不懂 shell，所以给它比命令本身更醒目的位置（命令上面、斜体）。 */
+  .lf-explain{color:var(--tx2);font-size:11.5px;font-style:normal;
+    padding:2px 0 1px 0;display:block}
   #live-feed .lf-line{padding:2px 0}
   #live-feed .lf-think-tag{color:var(--tx2);font-style:normal;
     font-weight:600;font-size:11px}

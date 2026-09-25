@@ -331,12 +331,14 @@ def build_instant_tools(root_: Path) -> list[Tool]:
     # （fail-closed，安全但用不了）。
     if bash_enabled():
         def bash(command: str, timeout: int = 60,
-                 background: bool = False) -> str:
+                 background: bool = False, explain: str = "") -> str:
             # 与 fs_* 同一套规矩：root_ 被闭包吃掉，不进签名=不进 schema。
             # 沙箱根在这里只是"工作目录"，挡不住命令自己 cd 出去——真正的
             # 闸门是权限层那条 ASK（每次执行都要人点头）。
             # background=True 分流到后台出口（2026-09-24 改造③）：长驻进程
             # 走这里，立即返回 task_id，dev server 不再把 turn 拖死。
+            # explain 是**给人看的说明**，不参与执行——它跟着 arguments 走
+            # 到前端（工具调用行下面），不进命令、也不回灌上下文。
             if background:
                 return run_bash_background(command, sandbox_root=root_)
             return run_bash(command, timeout, sandbox_root=root_)
@@ -357,7 +359,11 @@ def build_instant_tools(root_: Path) -> list[Tool]:
             "bash_output 读输出并探活（如 curl -s http://localhost:3000/api/health"
             " 看到 200 才算起好），用 bash_stop 停止。短命令（跑测试、看 git "
             "状态、装依赖）直接同步跑即可。每次执行都需要用户审批；"
-            "sudo/rm/reboot/shutdown/dd 开头的命令会被直接拒绝且不可审批覆盖。",
+            "sudo/rm/reboot/shutdown/dd 开头的命令会被直接拒绝且不可审批覆盖。\n"
+            "explain（强烈建议填）：用**一句中文**说明这条命令要做什么，例如"
+            "「把后端打成 jar 包（跳过测试）」「清空 activity 表让种子数据重跑」。"
+            "它是**给人看的**——用户读不懂 shell，这条说明会显示在界面上；"
+            "不参与执行，也别写成给自己的备忘。",
             handler=bash,
         ))
         tools.append(Tool(
@@ -690,6 +696,11 @@ SYSTEM_PROMPT_TEMPLATE = """你是运行在 wywd-harness 里的 Agent：能读�
   除非用户明确要求。它们讲的是"项目怎么演进的"，不是任务材料：很贵，而且不推进任务。
 - **一次搜一个东西。** fs_find 的 pattern 是**单条**正则；要找一个以上的符号就分几次搜，
   或者先 fs_glob 看有哪些文件、再定点读。
+- **思考过程用中文写**（2026-09-24 加的软引导）。你的推理链（reasoning）会落盘并
+  展示给**人**看，中文更好读。注意这是**软要求不是硬约束**：平台并不保证 reasoning
+  的语言跟随提示词，所以做不到也没关系；专业术语、命令、代码标识符、路径一律
+  **保留原文**，不要硬翻（`SERVER__PORT`、`spring-boot-starter-data-jpa` 翻成中文
+  反而更难核对）。回答正文的语言照常跟随用户。
 
 # 工具怎么用
 工具分两类：

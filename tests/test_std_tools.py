@@ -380,7 +380,11 @@ class ToolboxAssemblyTests(unittest.TestCase):
         from scripts.toolbox import build_system_prompt
 
         prompt = build_system_prompt()
-        for leak in ("中文", "English", "Chinese"):
+        # 2026-09-24 边界收紧为"**回答语言**不许硬编码"：推理链是展示给人看的
+        # （前端思考行），提示词里那段"思考过程用中文写"的软引导是刻意的、
+        # 且明确写了"回答正文的语言照常跟随用户"——所以裸词"中文"不再算漏。
+        # 这里钉的是真正归用户记忆管的偏好：回答/回复语言指令。
+        for leak in ("回复用中文", "用中文回复", "回答用中文", "English", "Chinese"):
             self.assertNotIn(leak, prompt, f"系统提示里不该出现语言偏好：{leak}")
 
     def test_tool_search_description_stays_clean(self) -> None:
@@ -422,12 +426,13 @@ class ToolboxAssemblyTests(unittest.TestCase):
         names = [schema["function"]["name"] for schema in registry.model_schemas()]
         self.assertIn("fs_edit", names)
 
-    def test_edit_tool_is_gated_by_ask_not_whitelisted(self) -> None:
-        """新增写工具的接线两头都要钉住。
+    def test_edit_tool_is_workspace_allowed_not_whitelisted(self) -> None:
+        """新增写工具的接线两头都要钉住（2026-09-23 政策后更新）。
 
         漏进 WRITE_TOOLS -> 掉进 default.deny（fail-closed，表现为"工具
-        坏了"）；误进 SAFE_TOOLS -> 免审批直接放行，改状态不问人，那是真
-        的安全漏洞。两个方向各一条断言，少一条就漏一个方向。
+        坏了"）；误进 SAFE_TOOLS -> 免审批直接放行，改状态不问人。界内写
+        现在由 `path.write_allow` 放行（越界/禁区 DENY 在它之前守住边界），
+        所以这条钉的是：fs_edit 走的是**路径边界规则**，不是无条件白名单。
         """
 
         from scripts.toolbox import SAFE_TOOLS, WRITE_TOOLS, build_policy
@@ -443,8 +448,8 @@ class ToolboxAssemblyTests(unittest.TestCase):
                 arguments={"path": "README.md"},
             )
         )
-        self.assertIs(decision.action, PermissionAction.ASK)
-        self.assertEqual(decision.rule_id, "path.write_ask")
+        self.assertIs(decision.action, PermissionAction.ALLOW)
+        self.assertEqual(decision.rule_id, "path.write_allow")
 
 
 class BashToolTests(unittest.TestCase):
@@ -737,10 +742,11 @@ class BashToolTests(unittest.TestCase):
             build_registry_for(DEFAULT_WORKSPACE).get("bash")
         )["function"]["parameters"]
 
-        # background 是 2026-09-24 改造③的合法新增（长驻进程出口）；这条
-        # 测试真正要守的是**沙箱根不外泄**——新增参数可以，多出 root 不行。
+        # background 是 2026-09-24 改造③的合法新增（长驻进程出口）；
+        # explain 同日新增（给人看的命令说明，随 arguments 到前端）。
+        # 这条测试真正要守的是**沙箱根不外泄**——新增参数可以，多出 root 不行。
         self.assertEqual(set(params["properties"]),
-                         {"command", "timeout", "background"})
+                         {"command", "timeout", "background", "explain"})
         self.assertNotIn("sandbox_root", json.dumps(params))
         self.assertEqual(params["required"], ["command"])
 

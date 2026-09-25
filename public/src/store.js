@@ -470,7 +470,13 @@ function handleEvent(ev) {
     let args = "";
     try { args = JSON.stringify(ev.arguments); } catch (err) { args = ""; }
     if (args && args.length > 120) args = args.slice(0, 120) + "…";
-    pushLive("call", args, ev.name || "tool");
+    // 命令说明（2026-09-24）：bash 的 arguments 里可能有 explain——那是模型
+    // 写给**人**看的一句话（"这条命令干嘛的"）。用户读不懂 shell，所以把它
+    // 单独存下来，让直播行能在命令上面先显示这句说明。
+    const argObj = (ev.arguments && typeof ev.arguments === "object")
+      ? ev.arguments : null;
+    const explain = argObj ? String(argObj.explain || "") : "";
+    pushLive("call", args, ev.name || "tool", { explain });
   } else if (ev.event === "tool_end") {
     let out = String(ev.content == null ? "" : ev.content);
     // 审批已经出结果了（被拒 / 超时）→ **把还挂着的卡片收掉**。

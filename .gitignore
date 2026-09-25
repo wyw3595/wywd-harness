@@ -57,3 +57,8 @@ workspaces/
 # 交付物。注意别和上面的 .memory/ 搞混——那个是 harness 自己的记忆，
 # 这个是敲代码的 agent 用的，项目代码里没有任何引用。
 .workbuddy/
+
+# 临时运行日志（冒烟输出 / 进程清单）：本地排查用完即弃，不进仓库
+/_procs.txt
+/smoke_result.log
+/web_app_smoke.log

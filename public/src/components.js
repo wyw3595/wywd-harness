@@ -217,7 +217,14 @@ function thinkBlock(reasoning) {
 function bubble(m) {
   const role = m.role || "?";
   let text = (m.content || "").trim();
+  // explain（2026-09-24）：模型在 bash 的 arguments 里写的"这条命令干嘛的"，
+  // 是给人看的一句话。用户读不懂 shell，所以每条工具调用都把它带出来显示。
+  let explain = "";
   if (!text && m.tool_calls && m.tool_calls.length) {
+    explain = m.tool_calls
+      .map((t) => ((t.arguments || {}).explain) || "")
+      .filter(Boolean)
+      .join(" / ");
     text = "🤖 调用工具：" + m.tool_calls.map((t) => t.name || "?").join(", ");
   }
   if (!text) return [{ cls: "system", body: "（空消息）" }];
@@ -231,7 +238,7 @@ function bubble(m) {
     if (m.reasoning && String(m.reasoning).trim()) {
       cards.push(thinkBlock(m.reasoning));
     }
-    cards.push({ cls: "assistant", body: text, md: true });
+    cards.push({ cls: "assistant", body: text, md: true, explain });
     return cards;
   }
   // 系统提示折起来。它是 transcript 的第一条（历史=真相，不能藏），但每段
@@ -415,6 +422,7 @@ export const ChatArea = {
                       <pre class="fold-body">{{ card.body }}</pre>
                     </details>
                     <div v-else class="msg" :class="card.cls">
+                      <div v-if="card.explain" class="lf-explain">💬 {{ card.explain }}</div>
                       <span v-if="card.label" class="t-name">{{ card.label }}</span>{{ card.body }}
                     </div>
                   </template>
@@ -477,7 +485,10 @@ export const ChatArea = {
                   <div class="think-body">{{ line.text }}</div>
                 </details>
                 <div v-else class="lf-line" :class="'lf-' + line.kind">
-                <template v-if="line.kind === 'call'">调用 <span class="t-name">{{ line.name }}</span> {{ line.text }}</template>
+                <template v-if="line.kind === 'call'">
+                  <div v-if="line.explain" class="lf-explain">💬 {{ line.explain }}</div>
+                  调用 <span class="t-name">{{ line.name }}</span> {{ line.text }}
+                </template>
                 <template v-else-if="line.kind === 'out'"><span class="lf-arrow">↳</span> {{ line.text }}</template>
                 <template v-else-if="line.kind === 'round'">── {{ line.text }} ──</template>
                 <template v-else-if="line.kind === 'model'">{{ line.text }}</template>

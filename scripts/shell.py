@@ -388,29 +388,35 @@ class SidecarShell:
 
     # ── 工作区（s11：上传目录）──────────────────────────────
 
-    def set_workspace(self, kind: str, path: str) -> dict:
-        """让 sidecar 换工作区：kind="dir" 引用本机目录 / "zip" 解压上传 /
-        "default" 复位回启动态（此时 path 忽略，可传空串）。
+    def set_workspace(self, kind: str, path: str, sid: str = "") -> dict:
+        """让 sidecar 换**这个会话**的工作目录：kind="dir" 引用本机目录 /
+        "zip" 解压上传 / "default" 复位回启动态（此时 path 忽略，可传空串）。
 
         返回 {"status": "ok", "workspace": {...}} 或 {"error": 人话}。
-        换的是**边界**（registry + policy + runner 三层连带，sidecar 那边
-        一次做完），已建会话的历史不动——所以调用方（UI）该提示用户
-        "建议新建会话再聊"：旧历史里的路径在新沙箱里可能不存在。
+
+        **sid 是必给的**（"一个会话一个目录"）：目录属于会话而不是进程，
+        所以换的是"这个会话下次重建运行时用哪个目录"（sidecar 那边会把
+        cwd 写进记录，然后 close+resume 造一份新的 registry/policy/runner）。
+        已建会话的历史不动——旧历史里的路径在新沙箱里可能不存在。
         """
 
         with self._rpc_lock:
             resp = self._client.call("workspace/set",
-                                     {"kind": kind, "path": path})
+                                     {"kind": kind, "path": path,
+                                      "sessionId": sid})
             if "result" in resp:
                 return resp["result"]
             error = resp.get("error") or {}
             return {"error": error.get("message", "sidecar 内部错误")}
 
-    def workspace(self) -> dict:
-        """读当前工作区（UI 渲染"模型在哪个目录里干活"）。"""
+    def workspace(self, sid: str = "") -> dict:
+        """读**这个会话**的工作目录（UI 渲染"模型在哪个目录里干活"）。
+
+        会话不在运行时也能问——目录记在它的记录里（sidecar 会从 store 取）。
+        """
 
         with self._rpc_lock:
-            return self._client.call("workspace/get")["result"]
+            return self._client.call("workspace/get", {"sessionId": sid})["result"]
 
     def clear(self) -> str:
         """清记忆（s07-b 升级）：完整编舞 close → forget → create。
