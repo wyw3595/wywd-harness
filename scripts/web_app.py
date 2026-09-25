@@ -23,13 +23,34 @@
      on_event 回调（sidecar 事件）+ user_prompt 回调（审批请求）都往
      同一条流里塞；GET /api/events/stream 用 SSE 长连往外推（早先是
      前端每 500ms 轮询，现在服务端有事件才写）。审批不用 asyncio
-     Future——user_prompt 线程 Event.wait(300)，HTTP 线程 POST 回执
+     Future——user_prompt 线程 Event.wait(60)，HTTP 线程 POST 回执
      set()。"loop 已死 / 上下文过期"这两个失败模式从根上不存在。
   3. 发消息带显式 sid：Single 壳下不能靠"当前会话指针"（多 tab 互相
      抢），shell.send_to(sid, msg)，见 shell.py 的 send_to。
 
+运输层（2026-09-25 换 FastAPI）：上面这套领域层（WebApp / EventRing /
+ApprovalBoard / sse_frame）一行没动——它们从写下的第一天起就不碰
+HTTP，这是当初"领域逻辑与 HTTP 分开测"的直接回报。换掉的只是运输层：
+
+  - http.server 手写 Handler → FastAPI 路由 + uvicorn。同步领域层照旧
+    用同步 `def` 端点（FastAPI 自动丢线程池），**不要**改成 async def：
+    领域层全是阻塞调用（_rpc_lock、socket recv），async def 会卡死事件循环。
+  - SSE：StreamingResponse 包住原来的 event_stream 生成器，协议不变。
+  - 守门员：纯 ASGI 中间件（_GuardMiddleware + _guard_rejection 纯函数）
+    ——Host 校验（杀 DNS rebinding）、X-Wywd-Ui 全量 POST 校验（杀 CSRF，
+    从"只查 browse"扩到所有 /api POST）、可选 WYWD_API_TOKEN、
+    Content-Length 上限早退（413）。决定逻辑是纯函数，测试直调不碰 HTTP。
+  - 兜底异常处理：任何穿透到 HTTP 层的异常回 JSON 500 人话，不再出现
+    "连接被空响应关掉、浏览器只见 Failed to fetch"。
+  - HOST/PORT 可用 WYWD_HOST / WYWD_PORT 覆盖（原先硬编码）。
+
+  已知的没修（诚实边界）：全局 _rpc_lock 的"一轮 turn 堵住所有 RPC"是
+  sidecar 单通道协议决定的，换运输层不解决；治理它要动 RPC 客户端
+  （读线程 + Future）与 sidecar（turn 后台化），是下一步的事。
+
 运行：python scripts/web_app.py → 浏览器开 http://127.0.0.1:8765
 （离线可用：不设 DEEPSEEK_API_KEY 时 choose_model 给 FakeModel）。
+⚠ workers 必须是 1：WebApp / sidecar 是进程内单例。
 """
 
 import base64
@@ -40,13 +61,14 @@ import string
 import sys
 import tempfile
 import threading
-import time
 import uuid
 from collections import deque
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import parse_qs, urlparse
+
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 # 项目根进 sys.path：保证 src.* / scripts.* 可导入（照 shell.py 的模式）
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
@@ -61,10 +83,34 @@ from src.harness.session import (              # noqa: E402
     SessionNotFoundError,
 )
 
-HOST = "127.0.0.1"
-PORT = 8765
-PUBLIC_DIR = Path(_PROJECT_ROOT) / "public"
+
+def _resolve_host() -> str:
+    """监听地址。默认 127.0.0.1——整个安全模型建立在"只服务本机"上
+    （配合 _guard_rejection 的 Host 校验），要改先想清楚那两道闸。"""
+
+    return (os.environ.get("WYWD_HOST") or "").strip() or "127.0.0.1"
+
+
+def _resolve_port() -> int:
+    default = 8765
+    raw = (os.environ.get("WYWD_PORT") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[web_app] WYWD_PORT 不是数字（{raw!r}），用默认 {default}")
+        return default
+    if not 0 < value < 65536:
+        print(f"[web_app] WYWD_PORT 越界（{value}），用默认 {default}")
+        return default
+    return value
+
+
+HOST = _resolve_host()
+PORT = _resolve_port()
 SESSIONS_ROOT = Path(_PROJECT_ROOT) / ".sessions"
+PUBLIC_DIR = Path(_PROJECT_ROOT) / "public"
 # 审批超时秒数：沉默 = 拒绝（fail-closed，与 chainlit 版语义一致）。
 #
 # **2026-09-23：300 → 60。** 审批是**阻塞式**的，而且占着唯一的 RPC 通道
@@ -107,16 +153,6 @@ MAX_BODY_BYTES = 48 * 1024 * 1024
 # 那个"，删错了还不报错，是最难查的那种坏法。
 _SID_REQUIRED_ACTIONS = {"close": "关闭会话", "resume": "复活会话",
                          "forget": "遗忘会话"}
-
-_MIME = {
-    ".html": "text/html; charset=utf-8",
-    ".js": "application/javascript; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
-    ".png": "image/png",
-    ".svg": "image/svg+xml",
-    ".ico": "image/x-icon",
-}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -569,8 +605,9 @@ class WebApp:
 
         不带 path = 起点态：返回盘符（Windows）或根目录，让用户先挑个盘。
 
-        **安全口径**：响应只回目录名、不回文件内容；本服务只听 127.0.0.1，
-        且同源策略挡住了跨站读响应（X-Wywd-Ui 头那套留给**会改状态**的 POST）。
+        **安全口径**：响应只回目录名、不回文件内容；Host 校验（守卫中间件）
+        挡住了 DNS rebinding 式的跨站读——"只听 127.0.0.1"本身不再是安全
+        叙述的全部，Host 头才是那道闸。
         """
 
         target = (path or "").strip()
@@ -732,8 +769,107 @@ class WebApp:
 
 
 # ═══════════════════════════════════════════════════════════════
-# HTTP 层 — 路由 /api/* 到 WebApp，其余从 public/ 服务静态文件
+# 守门员 — 纯 ASGI 中间件 + 纯函数决定（决定逻辑可脱离 HTTP 单测）
 # ═══════════════════════════════════════════════════════════════
+
+_LOCAL_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+class _ScopeHeaders:
+    """ASGI scope 头的只读视图：.get(name) 大小写不敏感。
+
+    守卫决定函数要的只是"按名取头"，自己造一个视图而不是 import
+    starlette 的 Headers——决定函数因此不绑任何框架类型。
+    """
+
+    def __init__(self, scope: dict) -> None:
+        self._raw = {k.decode("latin-1").lower(): v.decode("latin-1")
+                     for k, v in scope.get("headers") or []}
+
+    def get(self, name: str) -> str:
+        return self._raw.get(name.lower(), "")
+
+
+def _host_hostname(host_header: str) -> str:
+    """Host 头 → 纯主机名：去端口；IPv6 的 [::1]:8765 去方括号。"""
+
+    host = (host_header or "").strip()
+    if host.startswith("["):
+        return host[1:host.index("]")] if "]" in host else host
+    return host.rsplit(":", 1)[0]
+
+
+def _guard_rejection(method: str, path: str, headers: Any) -> Optional[tuple[int, dict]]:
+    """每个请求过一遍的守门员。返回 None = 放行；(状态码, 响应体) = 拒。
+
+    纯函数（只读 method/path/headers/环境变量，零副作用），所以三道闸
+    全部能脱离 HTTP 单测。**都发生在碰到任何业务逻辑之前**。
+
+      1. Host 校验（杀 DNS rebinding）。本服务的一切安全叙述都建立在
+         "只有本机能访问"上，但"只听 127.0.0.1"防不了浏览器这一侧：恶意
+         网页把自己的域名 rebind 到 127.0.0.1，请求对浏览器就是**同源**的
+         （读响应、带凭证全畅通）。唯一的拦法是服务端验 Host 头——rebind
+         攻击的 Host 是攻击者的域名，不是 127.0.0.1。
+      2. X-Wywd-Ui（杀 CSRF）。跨站"简单请求"（text/plain 表单）发不出
+         自定义头、也**读不到**响应，但副作用照样发生。所以所有 /api POST
+         都要这个头（2026-09-25 从"只查 browse"扩到全量——发消息、审批
+         回执、删会话，一个都不该被恶意页触发）。自定义头必须先过 CORS
+         预检，而本服务不答预检，简单请求带不上它。
+      3. WYWD_API_TOKEN（可选）。给 curl / 脚本 / 局域网场景用的令牌：
+         设了就要求 POST 带 x-wywd-token。不开 = 维持纯本机体验。
+      4. Content-Length 上限（杀内存打爆）。客户端声称的长度超限就直接
+         413，**不读 body**——先读再判等于把内存交给客户端控制。中间件
+         根本不调 receive，这条"早退"由结构保证，不靠自觉。
+    """
+
+    if _host_hostname(headers.get("host") or "") not in _LOCAL_HOSTNAMES:
+        return 403, {"error": "拒绝：Host 不是本机回环地址"}
+    if method == "POST" and path.startswith("/api/"):
+        if (headers.get("x-wywd-ui") or "").strip() != "1":
+            return 403, {"ok": False, "detail": "拒绝：缺少界面标识头"}
+        token = (os.environ.get("WYWD_API_TOKEN") or "").strip()
+        if token and (headers.get("x-wywd-token") or "") != token:
+            return 401, {"ok": False, "detail": "拒绝：令牌不匹配"}
+        claimed = headers.get("content-length")
+        if claimed:
+            try:
+                length = int(claimed)
+            except ValueError:
+                return 400, {"error": "Content-Length 不是数字"}
+            if length > MAX_BODY_BYTES:
+                return 413, {"error": f"请求体过大（上限 {MAX_BODY_BYTES} 字节）"}
+    return None
+
+
+class _GuardMiddleware:
+    """纯 ASGI 守门员。
+
+    为什么不用 BaseHTTPMiddleware（@app.middleware 那层糖）：它给每个
+    响应套一道中转队列，SSE 长连最忌讳多一层缓冲；纯 ASGI 直通。
+    413 的"早退"在这里也天然成立——拒绝路径根本不会去 receive body。
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            rejection = _guard_rejection(scope["method"], scope["path"],
+                                         _ScopeHeaders(scope))
+            if rejection is not None:
+                code, payload = rejection
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                headers = [(b"content-type", b"application/json; charset=utf-8")]
+                if code == 413:
+                    # 声称超限的 body 还在连接里：让连接跟着关掉，残留字节
+                    # 不许被当成下一条请求的帧头。
+                    headers.append((b"connection", b"close"))
+                await send({"type": "http.response.start", "status": code,
+                            "headers": headers})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
 
 def _fs_roots() -> list[str]:
     r"""起点态给用户挑的"顶层入口"：Windows 是各盘符，其他平台是 /。
@@ -753,233 +889,220 @@ def _fs_roots() -> list[str]:
     return roots
 
 
-def _static_path(rel: str) -> Optional[Path]:
-    """把 URL 相对路径解析到 public/ 下的真实文件；目录穿越 / 不存在回 None。
+# ═══════════════════════════════════════════════════════════════
+# FastAPI 装配 — 路由 /api/* 到 WebApp，其余从 public/ 服务静态文件
+# ═══════════════════════════════════════════════════════════════
 
-    rel 是净化后的相对路径（已去 query/hash，以 / 开头）。目录 → 目录内
-    index.html（/ 和裸路径都落到首页）。
+class _NoStoreStaticFiles(StaticFiles):
+    """开发期禁缓存：改了前端文件必须立刻生效，否则"后端已经修好了、
+    你还看到旧界面"的白折腾。本地开发服务，禁缓存的代价是零。"""
+
+    def file_response(self, *args: Any, **kwargs: Any):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+async def _lifespan(app: FastAPI):
+    """装配 / 收尾（旧 main() 的 try/finally 搬到这里）。
+
+    web 是 create_app 注入的（测试 / 冒烟脚本）：生命周期归注入方管，
+    这里只保证收尾时叫醒 SSE 线程；web 为空（生产）：这里造、这里启、
+    这里收——start 失败抛出让 uvicorn 起不来，别留半个服务。
     """
 
-    rel = rel.lstrip("/")
-    if rel == "" or rel.endswith("/"):
-        rel = rel + "index.html"   # 裸路径 / 目录 → 目录内 index.html
-    abs_root = PUBLIC_DIR.resolve()
-    target = (abs_root / rel).resolve()
-    if not target.is_relative_to(abs_root):
-        return None          # 目录穿越：拒绝
-    if target.is_dir():
-        target = target / "index.html"
-    if not target.is_file():
-        return None
-    return target
+    web = getattr(app.state, "web", None)
+    if web is None:
+        web = WebApp()
+        app.state.web = web
+        print("[web_app] sidecar 启动中…")
+        pong = web.start()
+        print(f"[web_app] sidecar/ping → {pong.get('status')}")
+        print("[web_app] 会话懒建：启动不建会话，首次发消息 / 点 ＋ 才建")
+        try:
+            yield
+        finally:
+            web.stop()
+            print("[web_app] 已退出")
+    else:
+        try:
+            yield
+        finally:
+            web.ring.wake_all()   # 别让 SSE 线程把 15 秒心跳睡完才走
 
 
-class _Handler(BaseHTTPRequestHandler):
-    """极简 JSON API + 静态文件。app 是 main() 里装配好的 WebApp 单例。"""
+def create_app(web: Optional[WebApp] = None) -> FastAPI:
+    """装配 FastAPI 应用。web 缺省 = 生产（lifespan 里造+启+收）；
+    注入 web = 测试/冒烟（不碰生命周期）。
 
-    app: Optional[WebApp] = None
+    **端点全部是同步 `def`**：领域层全是阻塞调用（_rpc_lock、socket
+    recv），FastAPI 会把同步端点丢进线程池——这正是旧 ThreadingHTTPServer
+    的并发形态。别把它们改成 async def：那会把事件循环卡死。
+    """
 
-    def log_message(self, *args: Any) -> None:
-        pass  # 静默：前端 5s 轮询别刷日志
+    app = FastAPI(lifespan=_lifespan, docs_url=None, redoc_url=None,
+                  openapi_url=None)   # 不暴露 /docs：本服务不对公网开放
+    app.state.web = web
+    app.add_middleware(_GuardMiddleware)
 
-    # ── 输出工具 ────────────────────────────────────────────
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+        """兜底：任何穿透到 HTTP 层的异常都回 JSON 人话。
 
-    def _send_json(self, code: int, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _serve_file(self, path: Path) -> None:
-        data = path.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", _MIME.get(path.suffix.lower(),
-                                                   "application/octet-stream"))
-        # 开发期禁缓存（s11 加）：改了前端文件必须立刻生效，否则会陷入
-        # "后端已经修好了、你还看到旧界面"的白折腾。这是本地开发服务，
-        # 没有带宽顾虑，禁缓存的代价是零。
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    # ── SSE 长连 ────────────────────────────────────────────
-
-    def _stream_events(self, app: WebApp, query: dict) -> None:
-        """把事件环推给浏览器（替掉前端每 500ms 一次的轮询）。
-
-        协议要点：
-          - 不写 Content-Length。响应体长度未知，靠连接关闭收尾
-            （HTTP/1.0 语义，BaseHTTPRequestHandler 的默认协议版本），
-            浏览器边收边读，不会等长度。
-          - 续传游标优先取 Last-Event-ID 头：浏览器断线重连时自己带上
-            来的上一帧 id——所以前端一行游标代码都不用写。首次连接没有
-            这个头，才看 ?after=：给数字就从头补，给 "latest" 就顶到当下
-            （事件环常驻，不顶的话 F5 会把环里 500 条旧事件整批重放）。
-          - 每次 write 后立刻 flush：SSE 的时效性全靠它，攒在缓冲区里
-            的"实时"事件等于没推。
+        旧版没这层：sidecar 半路死掉、RPC 抛 ConnectionClosed，连接被
+        空响应关掉，浏览器只看到 "Failed to fetch"——用户以为整个后端
+        没起。回 500 + 人话至少让"坏了"可见。
         """
 
-        raw = self.headers.get("Last-Event-ID") or (query.get("after") or ["0"])[0]
+        return JSONResponse({"error": f"服务内部错误：{exc!r}"}, status_code=500)
+
+    async def _json_body(request: Request) -> dict:
+        """宽容 JSON 解析（旧 _read_json 的语义）：坏体/非对象一律 {}。
+
+        解析失败不回 422 而是给空 dict，让"未知操作"这类**领域错误**去接
+        ——错误形状是前端已经接住的 ok/detail 人话，不该因换运输层变化。
+        """
+
+        raw = await request.body()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def get_web(request: Request) -> WebApp:
+        web = request.app.state.web
+        # sidecar 死了就地换一个（原 do_GET / do_POST 开头那一步，收进依赖
+        # = 一次声明、所有 /api 端点生效，不再每个 handler 手写一遍）。
+        web.revive_shell()
+        return web
+
+    # ── GET ─────────────────────────────────────────────────
+
+    @app.get("/api/sessions")
+    def get_sessions(web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.sessions())
+
+    @app.get("/api/sessions/{sid}/messages")
+    def get_messages(sid: str, web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.messages(sid))
+
+    @app.get("/api/status")
+    def get_status(web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.status())
+
+    @app.get("/api/logs")
+    def get_logs(web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.logs())
+
+    @app.get("/api/events")
+    def get_events(after: str = "",
+                   web: WebApp = Depends(get_web)) -> JSONResponse:
+        try:
+            cursor = int(after)
+        except (TypeError, ValueError):
+            cursor = 0
+        return JSONResponse(web.events(cursor))
+
+    @app.get("/api/events/stream")
+    def stream_events(request: Request, after: str = "",
+                      web: WebApp = Depends(get_web)) -> StreamingResponse:
+        """SSE 长连：协议与旧实现一字未变（帧格式 / Last-Event-ID 续传 /
+        after=latest / 心跳），只是外层从手写循环换成 StreamingResponse。
+
+        续传游标优先取 Last-Event-ID 头：浏览器断线重连时自己带上来的
+        上一帧 id——前端一行游标代码都不用写。首次连接没有这个头，才看
+        ?after=：给数字就从头补，给 "latest" 就顶到当下。
+        """
+
+        raw = request.headers.get("last-event-id") or after
         if raw == "latest":
-            last_id = app.ring.latest()
+            last_id = web.ring.latest()
         else:
             try:
                 last_id = int(raw)
             except (TypeError, ValueError):
                 last_id = 0
+        return StreamingResponse(
+            web.event_stream(last_id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                # 反向代理缓冲会毁掉 SSE；本地用不上，写上省得接 nginx 时踩
+                "X-Accel-Buffering": "no",
+            },
+        )
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        # 反向代理缓冲会毁掉 SSE；本地开发用不上，写上省得以后接 nginx 时踩
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
+    @app.get("/api/workspace")
+    def get_workspace(sid: str = "",
+                      web: WebApp = Depends(get_web)) -> JSONResponse:
+        # sid 走查询串：工作区是**会话级**的，读谁的要说明白
+        return JSONResponse(web.workspace(sid))
 
-        try:
-            for chunk in app.event_stream(last_id):
-                self.wfile.write(chunk.encode("utf-8"))
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            # 关页 / 刷新 / 换网络：连接没了就是没了。这不是错误，是常态，
-            # 静默收摊即可（浏览器下次开页会自己重连并带上 Last-Event-ID）。
-            pass
+    @app.get("/api/fs/list")
+    def get_fs_list(path: str = "",
+                    web: WebApp = Depends(get_web)) -> JSONResponse:
+        # 工作区选择器的数据源：列一个目录的子目录（纯读，无副作用）
+        return JSONResponse(web.list_fs(path))
 
-    # ── GET ─────────────────────────────────────────────────
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        query = parse_qs(parsed.query)
-        app = self.app
-        if app is None:
-            self._send_json(500, {"error": "web_app 未初始化"})
-            return
-        app.revive_shell()      # sidecar 死了就地换一个（见 WebApp.revive_shell）
-        if path == "/api/sessions":
-            self._send_json(200, app.sessions())
-        elif path.startswith("/api/sessions/") and path.endswith("/messages"):
-            sid = path[len("/api/sessions/"):-len("/messages")]
-            self._send_json(200, app.messages(sid))
-        elif path == "/api/status":
-            self._send_json(200, app.status())
-        elif path == "/api/logs":
-            self._send_json(200, app.logs())
-        elif path == "/api/events/stream":
-            self._stream_events(app, query)
-        elif path == "/api/events":
-            try:
-                after = int((query.get("after") or ["0"])[0])
-            except ValueError:
-                after = 0
-            self._send_json(200, app.events(after))
-        elif path == "/api/workspace":
-            # sid 走查询串：工作区是**会话级**的，读谁的要说明白
-            self._send_json(200, app.workspace((query.get("sid") or [""])[0]))
-        elif path == "/api/fs/list":
-            # 工作区选择器的数据源：列一个目录的子目录（纯读，无副作用）
-            self._send_json(200, app.list_fs((query.get("path") or [""])[0]))
-        elif path.startswith("/api/"):
-            self._send_json(404, {"error": "not found"})
-        else:
-            target = _static_path(parsed.path)
-            if target is None:
-                self.send_response(404)
-                self.end_headers()
-            else:
-                self._serve_file(target)
+    @app.get("/api/{rest:path}")
+    def api_get_not_found(rest: str) -> JSONResponse:
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     # ── POST ────────────────────────────────────────────────
+    # X-Wywd-Ui 校验不在端点里——守卫中间件对**所有** /api POST 生效
+    # （见 _guard_rejection 第 2 道闸）。
 
-    def _read_json(self) -> Optional[dict]:
-        """读请求体（JSON）。超限返回 None——调用方回 413，别把大包读进内存。
+    @app.post("/api/sessions")
+    def post_sessions(payload: dict = Depends(_json_body),
+                      web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.action(payload.get("action", ""),
+                                       payload.get("sid", "")))
 
-        Content-Length 是客户端声称的（可以撒谎），但它足够用来做**早退**：
-        声称超限就直接拒，不读；声称不超限则最多读这么多字节，后面的
-        字节留在连接里由 close_connection 一起丢掉（HTTP/1.1 下必须关连接，
-        否则残留字节会被当成下一个请求的帧头）。
+    @app.post("/api/sessions/{sid}/messages")
+    def post_message(sid: str, payload: dict = Depends(_json_body),
+                     web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.send(sid, payload.get("message", "")))
 
-        这道闸是随工作区上传（s11）加的：上传一个 zip 会走 base64 塞进 JSON，
-        不设上限的话一个伪造的大 Content-Length 就能把内存打满。
-        """
+    @app.post("/api/approvals/{ticket}")
+    def post_approval(ticket: str, payload: dict = Depends(_json_body),
+                      web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.approve(ticket, payload.get("approved")))
 
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if length > MAX_BODY_BYTES:
-            return None
-        raw = self.rfile.read(length) if length else b""
-        if not raw:
-            return {}
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (ValueError, json.JSONDecodeError):
-            return {}
+    @app.post("/api/workspace")
+    def post_workspace(payload: dict = Depends(_json_body),
+                       web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.set_workspace(
+            payload.get("action", ""), payload.get("path", ""),
+            payload.get("filename", ""), payload.get("data", ""),
+            payload.get("sid", "")))
 
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        app = self.app
-        if app is None:
-            self._send_json(500, {"error": "web_app 未初始化"})
-            return
-        app.revive_shell()      # sidecar 死了就地换一个（见 WebApp.revive_shell）
-        body = self._read_json()
-        if body is None:
-            # 超限：拒绝并关连接（不让残留字节污染下一条请求的解析）
-            self.close_connection = True
-            self._send_json(413, {
-                "error": f"请求体过大（上限 {MAX_BODY_BYTES} 字节）"})
-            return
-        if path == "/api/sessions":
-            self._send_json(200, app.action(body.get("action", ""),
-                                            body.get("sid", "")))
-        elif path.startswith("/api/sessions/") and path.endswith("/messages"):
-            sid = path[len("/api/sessions/"):-len("/messages")]
-            self._send_json(200, app.send(sid, body.get("message", "")))
-        elif path.startswith("/api/approvals/"):
-            ticket = path[len("/api/approvals/"):]
-            self._send_json(200, app.approve(ticket, body.get("approved")))
-        elif path == "/api/workspace":
-            action = body.get("action", "")
-            # browse 会在**用户桌面上弹一个系统对话框**——这是本地服务不该让
-            # 任意网页触发的动作。跨站表单发不出自定义头（要发就得先过 CORS
-            # 预检，而本服务不答预检），所以要求一个自定义头就挡住了。
-            # 前端固定带上它（见 public/src/api.js 的 workspaceAction）。
-            if action == "browse" and self.headers.get("X-Wywd-Ui") != "1":
-                self._send_json(403, {"ok": False,
-                                      "detail": "拒绝：缺少界面标识头"})
-                return
-            self._send_json(200, app.set_workspace(
-                action, body.get("path", ""),
-                body.get("filename", ""), body.get("data", ""),
-                body.get("sid", "")))
-        else:
-            self._send_json(404, {"error": "not found"})
+    @app.post("/api/{rest:path}")
+    def api_post_not_found(rest: str) -> JSONResponse:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    # 静态文件挂在最后：/api/* 的具体路由与 catch-all 都排在它前面，
+    # 路由按注册顺序匹配。目录穿越防护 StaticFiles 自带（realpath + 亲缘）。
+    app.mount("/", _NoStoreStaticFiles(directory=PUBLIC_DIR, html=True),
+              name="static")
+    return app
 
 
 # ═══════════════════════════════════════════════════════════════
-# main — 装配 + 起服务（Windows spawn 守则：重活全在 __main__ 里）
+# main — 起服务（Windows spawn 守则：重活全在 __main__ 里）
 # ═══════════════════════════════════════════════════════════════
 
 def main() -> None:
-    app = WebApp()
-    _Handler.app = app
-    server = ThreadingHTTPServer((HOST, PORT), _Handler)
-    print(f"[web_app] sidecar 启动中…")
-    try:
-        pong = app.start()
-        print(f"[web_app] sidecar/ping → {pong.get('status')}")
-        print("[web_app] 会话懒建：启动不建会话，首次发消息 / 点 ＋ 才建")
-        print(f"[web_app] 服务已就绪：http://{HOST}:{PORT}（Ctrl+C 退出）")
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[web_app] 正在收尾…")
-    finally:
-        server.server_close()
-        app.stop()
-        print("[web_app] 已退出")
+    # workers 必须是 1：WebApp / sidecar 是进程内单例，多 worker = 多个
+    # sidecar 抢同一份 .sessions/（本文件不提供 workers 入口，uvicorn
+    # 命令行上也不要开）。uvicorn 延迟导入：测试只 import 本模块拿
+    # create_app / 守卫纯函数，不需要装 uvicorn。
+    import uvicorn
+
+    print(f"[web_app] 服务即将启动：http://{HOST}:{PORT}（Ctrl+C 退出）")
+    uvicorn.run(create_app(), host=HOST, port=PORT, log_level="warning")
 
 
 if __name__ == "__main__":

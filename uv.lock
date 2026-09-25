@@ -2920,11 +2920,14 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "chainlit" },
+    { name = "fastapi" },
     { name = "requests" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -2932,9 +2935,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "chainlit", specifier = ">=1.0,<3" },
+    { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27,<1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "requests", specifier = ">=2.31,<3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "uvicorn", specifier = ">=0.30,<1" },
 ]
 provides-extras = ["dev"]
 

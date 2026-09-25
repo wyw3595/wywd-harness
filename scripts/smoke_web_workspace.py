@@ -31,6 +31,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -39,7 +40,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.web_app import HOST, WebApp, _Handler, _Server  # noqa: E402
+import uvicorn                                                   # noqa: E402
+from scripts.web_app import HOST, WebApp, create_app  # noqa: E402
 
 # 换个端口：不和正在跑的 web_app 抢 8765（本脚本是自验，不打扰开发中的那个）
 PORT = 8791
@@ -55,7 +57,9 @@ def post_json(path: str, payload: dict) -> dict:
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 # 2026-09-25 守卫升级：X-Wywd-Ui 对**所有** /api POST 生效
+                 "X-Wywd-Ui": "1"},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=60) as resp:
@@ -75,10 +79,13 @@ def count_upload_temp() -> int:
 
 def run_checks(app: WebApp) -> None:
     base = Path(tempfile.mkdtemp())
+    # 2026-09-23 工作区是**会话级**的（"一个会话一个目录"）：所有 workspace
+    # 操作都必须带显式 sid——本脚本自己建一个、收尾遗忘，不留残留会话。
+    sid = post_json("/api/sessions", {"action": "create"})["sessionId"]
+    ws_get = f"/api/workspace?sid={sid}"
     try:
-        # ── 1. 初始工作区（默认态也要报得出根，否则面板是空的）──
-        initial = get_json("/api/workspace")["workspace"]
-        assert initial.get("kind") == "default", initial
+        # ── 1. 初始工作区（会话级化后 = 该会话的 cwd，报得出根即可）──
+        initial = get_json(ws_get)["workspace"]
         assert initial.get("root"), initial
         print("[1] 初始工作区 →", initial.get("kind"), initial.get("root"))
 
@@ -93,6 +100,7 @@ def run_checks(app: WebApp) -> None:
         before_temp = count_upload_temp()
         uploaded = post_json("/api/workspace", {
             "action": "upload", "filename": "repo.zip", "data": payload,
+            "sid": sid,
         })
         assert uploaded.get("ok"), uploaded
         root = Path(uploaded["workspace"]["root"])
@@ -107,7 +115,7 @@ def run_checks(app: WebApp) -> None:
         print(f"[2] 上传临时文件不残留 ✓（temp 里 wywd-upload-* 计数 {before_temp} → {after_temp}）")
 
         # ── 3. 切换后读回来一致 ───────────────────────────────
-        current = get_json("/api/workspace")["workspace"]
+        current = get_json(ws_get)["workspace"]
         assert Path(current["root"]) == root.resolve(), current
         print("[3] GET 与 POST 一致 ✓", current["root"])
 
@@ -116,28 +124,30 @@ def run_checks(app: WebApp) -> None:
         local.mkdir()
         (local / "note.md").write_text("# 本机目录", encoding="utf-8")
         opened = post_json("/api/workspace", {
-            "action": "open", "path": str(local)})
+            "action": "open", "path": str(local), "sid": sid})
         assert opened.get("ok"), opened
         assert Path(opened["workspace"]["root"]) == local.resolve(), opened
         print("[4] open 本机目录 ✓", opened["workspace"]["root"])
 
         # ── 5. 复位：回启动态（不传路径）─────────────────────
-        before_reset = get_json("/api/workspace")["workspace"]
+        before_reset = get_json(ws_get)["workspace"]
         assert before_reset["kind"] != "default", before_reset
-        reseted = post_json("/api/workspace", {"action": "reset"})
+        reseted = post_json("/api/workspace", {"action": "reset", "sid": sid})
         assert reseted.get("ok"), reseted
         after_reset = reseted["workspace"]
-        assert after_reset["kind"] == "default", after_reset
         assert after_reset.get("root"), "复位后要报得出默认根（UI 靠它显示路径）"
+        # 会话级化后"默认"= 会话创建时的 cwd（kind 是 dir，不再有 default 标签）
+        assert Path(after_reset["root"]) == Path(initial["root"]).resolve(), \
+            (after_reset, initial)
         print("[5] reset →", reseted["detail"])
 
         # 复位到默认后，工具真的读不动刚上传的那个目录了（边界回来了）
-        fresh = get_json("/api/workspace")["workspace"]
+        fresh = get_json(ws_get)["workspace"]
         assert fresh == after_reset, (fresh, after_reset)
         print("[5] 复位后 GET 一致 ✓", fresh["root"])
 
         # ── 6. 坏输入：报人话 + 工作区不变（不留半态）─────────
-        anchor = Path(get_json("/api/workspace")["workspace"]["root"])
+        anchor = Path(get_json(ws_get)["workspace"]["root"])
         bad_cases = [
             ("坏 base64", {"action": "upload", "filename": "x.zip", "data": "这不是base64!!"}),
             ("空包", {"action": "upload", "filename": "x.zip", "data": ""}),
@@ -146,9 +156,10 @@ def run_checks(app: WebApp) -> None:
             ("未知动作", {"action": "explode"}),
         ]
         for label, body in bad_cases:
+            body = {**body, "sid": sid}
             res = post_json("/api/workspace", body)
             assert not res.get("ok"), (label, res)
-            now = Path(get_json("/api/workspace")["workspace"]["root"])
+            now = Path(get_json(ws_get)["workspace"]["root"])
             assert now == anchor, (label, now)
             print(f"[6] {label} →", res.get("detail"))
 
@@ -156,6 +167,8 @@ def run_checks(app: WebApp) -> None:
         shutil.rmtree(root.parent, ignore_errors=True)
         print("[7] 清掉上传出来的工作区 ✓")
     finally:
+        post_json("/api/sessions", {"action": "close", "sid": sid})
+        post_json("/api/sessions", {"action": "forget", "sid": sid})
         shutil.rmtree(base, ignore_errors=True)
 
 
@@ -163,18 +176,21 @@ def main() -> None:
     multiprocessing.freeze_support()
 
     app = WebApp()
-    _Handler.app = app
-    server = _Server((HOST, PORT), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    config = uvicorn.Config(create_app(app), host=HOST, port=PORT,
+                            log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
     try:
         pong = app.start()
         print("[0] sidecar/ping →", pong.get("status"))
         thread.start()
+        while not server.started:
+            time.sleep(0.05)
 
         run_checks(app)
     finally:
-        server.shutdown()
-        server.server_close()
+        server.should_exit = True
+        thread.join(timeout=5)
         app.stop()
         print("[8] 服务与 sidecar 已收尾")
 

@@ -19,7 +19,10 @@ async function get(path) {
 async function post(path, body, headers = {}, signal = undefined) {
   const res = await fetch(path, {
     method: "POST",
-    headers: { ...JSON_HEADERS, ...headers },
+    // X-Wywd-Ui 对**所有** /api POST 生效（2026-09-25）：跨站"简单请求"
+    // 发不出自定义头（要发就得先过 CORS 预检，而本服务不答预检），所以
+    // 这一个头就是 CSRF 闸——后端守卫中间件全量校验，缺头 403。
+    headers: { ...JSON_HEADERS, "X-Wywd-Ui": "1", ...headers },
     body: JSON.stringify(body),
     signal,
   });
@@ -83,23 +86,21 @@ export function fetchWorkspace(sid = "") {
 
 /** 工作区操作。action ∈ browse | open | upload | reset。
 
-    `X-Wywd-Ui` 不是装饰：browse 会在**用户桌面上弹一个系统对话框**，
-    本地服务不该让任意网页触发它。跨站表单发不出自定义头（要发就得先过
-    CORS 预检，而本服务不答预检），所以这一个头就把它挡在门外了。
-    后端只对 browse 校验这个头（见 web_app 的 do_POST）。
+    X-Wywd-Ui 现在由 post() 统一带（所有 /api POST 都过 CSRF 闸），
+    这里不用再单独塞；browse 会在用户桌面上弹系统对话框，是这道闸
+    最早的保护对象。
 */
 export function workspaceAction(action, opts = {}, sid = "") {
-  return post("/api/workspace", { action, ...opts, sid },
-              { "X-Wywd-Ui": "1" });
+  return post("/api/workspace", { action, ...opts, sid });
 }
 
 // ── 文件系统浏览（工作区选择器的数据源）─────────────────
 
 /** 列一个目录的子目录。path 为空 = 起点态（后端回盘符 / 根目录）。
 
-    只回**目录名**，不回文件内容 —— 纯读、且本服务只听 127.0.0.1，
-    同源策略挡住了跨站读响应，所以这个端点不需要 X-Wywd-Ui 那道闸
-    （那道闸留给会改状态的 POST）。
+    只回**目录名**，不回文件内容 —— 纯读 GET；跨站读响应被同源策略挡住
+    （本服务不回任何 CORS 头），DNS rebinding 由后端的 Host 校验挡住，
+    所以 GET 不需要 X-Wywd-Ui（那道闸留给会改状态的 POST）。
 */
 export function fetchFsList(path = "") {
   const q = path ? "?path=" + encodeURIComponent(path) : "";

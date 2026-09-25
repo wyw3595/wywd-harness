@@ -10,18 +10,17 @@ import base64
 import copy
 import io
 import json
+import os
 import re
-import socket
 import tempfile
 import threading
 import time
 import unittest
-import urllib.error
-import urllib.request
 import zipfile
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
+
+from fastapi.testclient import TestClient
 
 from scripts import native_dialog
 from scripts.web_app import (
@@ -30,8 +29,8 @@ from scripts.web_app import (
     ApprovalBoard,
     EventRing,
     WebApp,
-    _Handler,
-    _static_path,
+    _guard_rejection,
+    create_app,
     sse_frame,
 )
 from src.harness.jsonl_store import JsonlSessionStore
@@ -723,16 +722,28 @@ class ApprovalBoardTests(unittest.TestCase):
 
 
 class StaticServingTests(unittest.TestCase):
+    """静态服务：目录 → index.html、穿越拒绝、前端资源链完整。
+
+    旧版直调 _static_path 纯函数；换 StaticFiles 后穿越防护是框架自带的
+    （realpath + 亲缘检查），测试改为走 TestClient 从外面钉行为。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.client = TestClient(
+            create_app(WebApp(shell=FakeShell([]))),
+            base_url="http://127.0.0.1:8765")
+
     def test_index_html_exists_and_servable(self) -> None:
-        target = _static_path("/")
-        self.assertIsNotNone(target)
-        self.assertEqual(target.name, "index.html")
-        self.assertTrue(target.exists())
-        self.assertIsNotNone(_static_path("/index.html"))
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("<html", resp.text.lower())
+        self.assertEqual(self.client.get("/index.html").status_code, 200)
 
     def test_directory_traversal_rejected(self) -> None:
-        self.assertIsNone(_static_path("/../.git/config"))
-        self.assertIsNone(_static_path("/..%2f..%2fsecret"))
+        for path in ("/../.git/config", "/..%2f..%2fsecret"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 404)
 
     def test_frontend_assets_all_resolve(self) -> None:
         """index.html 里引用的每个静态资源都必须能被静态服务解析。
@@ -749,48 +760,112 @@ class StaticServingTests(unittest.TestCase):
         refs = re.findall(r'"(/[^"\s]+\.(?:js|css))"', html)
         self.assertTrue(refs, "index.html 里没找到 /…js 引用，测试本身失效了")
         for ref in refs:
-            target = _static_path(ref)
-            self.assertIsNotNone(target, f"{ref} 解析不到 public/ 下的文件")
-            self.assertTrue(target.exists(), f"{ref} 指向的文件不存在")
+            resp = self.client.get(ref)
+            self.assertEqual(resp.status_code, 200,
+                             f"{ref} 解析不到 public/ 下的文件或服务失败")
+
+
+class GuardDecisionTests(unittest.TestCase):
+    """守卫纯函数的决定矩阵（2026-09-25 随 FastAPI 迁移新增）。
+
+    守卫 = 纯 ASGI 中间件 + _guard_rejection 纯函数：决定逻辑脱离 HTTP
+    直调。"413 必须发生在读 body 之前"由**结构**保证（决定函数只拿得到
+    头，根本摸不到 body），不再需要旧版真发半截请求的 raw-socket 测试。
+    """
+
+    def _headers(self, **overrides: str) -> dict:
+        base = {"host": "127.0.0.1:8765", "content-length": "10"}
+        base.update(overrides)
+        return base
+
+    def test_oversize_content_length_is_rejected_unread(self) -> None:
+        """声称超限 → 当场 413。决定只看头，body 一个字节都不会被读。"""
+
+        code, payload = _guard_rejection(
+            "POST", "/api/workspace",
+            self._headers(**{"x-wywd-ui": "1",
+                             "content-length": str(MAX_BODY_BYTES + 1)}))
+        self.assertEqual(code, 413)
+        self.assertIn("过大", payload["error"])
+
+    def test_bad_content_length_is_a_clean_400(self) -> None:
+        """Content-Length 撒谎成非数字：旧版这里 int() 直接炸穿 handler
+        （连接被空响应关掉），现在是干净的 400。"""
+
+        code, _payload = _guard_rejection(
+            "POST", "/api/sessions",
+            self._headers(**{"x-wywd-ui": "1", "content-length": "abc"}))
+        self.assertEqual(code, 400)
+
+    def test_non_loopback_host_is_rejected(self) -> None:
+        """DNS rebinding 的第一道闸：Host 不是回环地址一律拒（GET 也查）。"""
+
+        for host in ("evil.example.com:80", "10.0.0.5", ""):
+            with self.subTest(host=host):
+                code, _payload = _guard_rejection(
+                    "GET", "/api/sessions", self._headers(host=host))
+                self.assertEqual(code, 403)
+
+    def test_loopback_host_variants_pass(self) -> None:
+        for host in ("127.0.0.1:8765", "localhost:8765", "[::1]:8765",
+                     "127.0.0.1"):
+            with self.subTest(host=host):
+                self.assertIsNone(_guard_rejection(
+                    "GET", "/api/sessions", self._headers(host=host)))
+
+    def test_api_posts_require_ui_header(self) -> None:
+        """CSRF 闸对**所有** /api POST 生效（2026-09-25 从只查 browse 扩全量）。"""
+
+        for path in ("/api/sessions", "/api/sessions/s1/messages",
+                     "/api/approvals/t1", "/api/workspace"):
+            with self.subTest(path=path):
+                code, payload = _guard_rejection("POST", path, self._headers())
+                self.assertEqual(code, 403)
+                self.assertIn("界面标识头", payload["detail"])
+                # 带上（前后空白容忍）就放行
+                self.assertIsNone(_guard_rejection(
+                    "POST", path, self._headers(**{"x-wywd-ui": " 1 "})))
+
+    def test_gets_do_not_need_ui_header(self) -> None:
+        self.assertIsNone(_guard_rejection(
+            "GET", "/api/sessions", self._headers()))
+
+    def test_token_when_configured(self) -> None:
+        """WYWD_API_TOKEN 设了才生效：不匹配 401、匹配放行；没设 = 纯本机
+        体验不变（不带 token 也能用）。"""
+
+        with mock.patch.dict(os.environ, {"WYWD_API_TOKEN": "secret"}):
+            headers = self._headers(**{"x-wywd-ui": "1"})
+            code, _payload = _guard_rejection("POST", "/api/sessions", headers)
+            self.assertEqual(code, 401)
+            headers["x-wywd-token"] = "secret"
+            self.assertIsNone(_guard_rejection("POST", "/api/sessions", headers))
+        self.assertIsNone(_guard_rejection(
+            "POST", "/api/sessions", self._headers(**{"x-wywd-ui": "1"})))
 
 
 class WorkspaceHttpTests(unittest.TestCase):
-    """HTTP 层：/api/workspace 的路由 + 请求体上限是真拦在前面的。
+    """HTTP 层整链（TestClient 直连 ASGI）：守卫决定 → 路由 → 领域层。
 
-    请求体上限是安全边界（**先读再判 = 把内存交给客户端控制**），
-    它的价值就在"读到 body 之前早退"——不真发一次请求测不到这一点。
+    旧版用真 ThreadingHTTPServer 起端口；换 FastAPI 后走 TestClient——
+    中间件 / 路由 / 静态全都过，只是没有 socket。base_url 决定 Host 头，
+    必须是回环地址才过得去守卫的 Host 校验。
     """
 
     def setUp(self) -> None:
         self.shell = FakeShell([])
         self.app = WebApp(shell=self.shell)
-        handler = type("_TestHandler", (_Handler,), {"app": self.app})
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self.port = self.server.server_address[1]
-        self.thread = threading.Thread(
-            target=self.server.serve_forever, daemon=True)
-        self.thread.start()
+        self.client = TestClient(create_app(self.app),
+                                 base_url="http://127.0.0.1:8765")
 
     def tearDown(self) -> None:
         self.app.ring.close()
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=3)
 
     def _post(self, path: str, payload: dict,
-              ui_header: bool = False) -> tuple[int, dict]:
-        headers = {"Content-Type": "application/json"}
-        if ui_header:
-            headers["X-Wywd-Ui"] = "1"
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}{path}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                return response.status, json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:      # 4xx 走这条路
-            return exc.code, json.loads(exc.read().decode("utf-8"))
+              ui_header: bool = True) -> tuple[int, dict]:
+        headers = {"X-Wywd-Ui": "1"} if ui_header else {}
+        response = self.client.post(path, json=payload, headers=headers)
+        return response.status_code, response.json()
 
     def test_post_open_reaches_shell(self) -> None:
         status, payload = self._post(
@@ -801,22 +876,23 @@ class WorkspaceHttpTests(unittest.TestCase):
         self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/proj")])
 
     def test_get_workspace(self) -> None:
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.port}/api/workspace", timeout=5) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        self.assertIn("workspace", payload)
+        resp = self.client.get("/api/workspace")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("workspace", resp.json())
 
     def test_browse_without_ui_header_is_rejected(self) -> None:
-        """browse 会在用户桌面上弹系统对话框——不能让任意网页触发它。
+        """缺 X-Wywd-Ui 的 /api POST 必须在**到达业务逻辑前**被拒。
 
-        跨站表单发不出自定义头（要发就得先过 CORS 预检，本服务不答预检），
-        所以"必须有 X-Wywd-Ui"就足够挡住。缺头时必须在**到达业务逻辑前**被拒，
-        否则恶意页面照样能把框弹出来（哪怕读不到响应）。
+        2026-09-25 起这道闸对**所有** /api POST 生效（旧版只查 browse）：
+        跨站"简单请求"发不出自定义头，副作用（发消息 / 审批回执 / 删会话）
+        因此全部够不着。browse 是最早加它的原因（弹系统框最直观），留着
+        当代表——mock 弹框函数，验证守卫拦下后它根本没被调用。
         """
 
         with mock.patch("scripts.native_dialog.pick_directory") as pick:
             status, payload = self._post(
-                "/api/workspace", {"action": "browse", "sid": "sess_0001"})
+                "/api/workspace", {"action": "browse", "sid": "sess_0001"},
+                ui_header=False)
 
         self.assertEqual(status, 403)
         self.assertFalse(payload["ok"])
@@ -827,56 +903,19 @@ class WorkspaceHttpTests(unittest.TestCase):
         with mock.patch("scripts.native_dialog.pick_directory",
                         return_value="D:/picked"):
             status, payload = self._post(
-                "/api/workspace", {"action": "browse", "sid": "sess_0001"},
-                ui_header=True)
+                "/api/workspace", {"action": "browse", "sid": "sess_0001"})
 
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/picked")])
 
-    def test_other_actions_do_not_need_ui_header(self) -> None:
-        """只有 browse 需要那个头——别的动作别顺手一起拦掉（会白挂）。"""
-
-        status, payload = self._post(
-            "/api/workspace", {"action": "reset", "sid": "sess_0001"})
-        self.assertEqual(status, 200)
-        self.assertTrue(payload["ok"])
-
     def test_static_files_are_not_cached(self) -> None:
         """开发期禁缓存：改了前端文件必须立刻生效，否则"后端修好了、
-        你还看到旧界面"，白折腾一轮。
+        你还看到旧界面"，白折腾一轮。"""
 
-        合流（2026-09-15）修：原来取的是 /app.js——那是 s11 那条线的
-        vanilla 前端。master 换成 Vue 3 之后 app.js 已被删除，改成
-        public/src/ 下的模块文件。断言的行为本身没变（Cache-Control
-        = no-store），只是取样文件跟着前端换了。
-        """
-
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.port}/src/main.js", timeout=5) as resp:
-            self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
-
-    def test_oversize_body_is_rejected_without_reading_it(self) -> None:
-        """只发头部（声称超限）、不发 body——服务端必须当场 413。
-
-        这条测的正是"早退"：若实现是"先读后判"，它会卡在这里等 body，
-        客户端等不到响应（超时），测试就会红。
-        """
-
-        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
-        try:
-            sock.sendall((
-                "POST /api/workspace HTTP/1.1\r\n"
-                "Host: 127.0.0.1\r\n"
-                "Content-Type: application/json\r\n"
-                f"Content-Length: {MAX_BODY_BYTES + 1}\r\n\r\n"
-            ).encode("ascii"))
-            head = sock.recv(65536).decode("utf-8", errors="replace")
-        finally:
-            sock.close()
-
-        self.assertIn("413", head.split("\r\n")[0])
-        self.assertEqual(self.shell.ops, [])       # 没碰到壳
+        resp = self.client.get("/src/main.js")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
 
 
 class FakeRevivableShell(FakeShell):

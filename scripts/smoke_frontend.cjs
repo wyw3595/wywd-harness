@@ -464,7 +464,8 @@ function connect(url) {
   await check("清理：close → forget 测试会话", `(async () => {
     const cur = document.getElementById('chat-sid').textContent;
     const post = (body) => fetch('/api/sessions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json',
+                                 'X-Wywd-Ui': '1' },  // 2026-09-25 守卫：所有 /api POST 必带
       body: JSON.stringify(body) }).then((r) => r.json());
     const close = await post({ action: 'close', sid: cur });
     const forget = await post({ action: 'forget', sid: cur });
@@ -475,7 +476,8 @@ function connect(url) {
   console.log("== 6. 报错可见性（后端拒绝这一轮时用户看得见）==");
   await check("给已关闭的会话发消息 → 结局卡出现并可读", `(async () => {
     const post = (body) => fetch('/api/sessions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json',
+                                 'X-Wywd-Ui': '1' },  // 2026-09-25 守卫：所有 /api POST 必带
       body: JSON.stringify(body) }).then((r) => r.json());
 
     document.getElementById('btn-create').click();
@@ -502,7 +504,8 @@ function connect(url) {
   await check("清理：close → forget 这个会话", `(async () => {
     const sid = document.getElementById('chat-sid').textContent;
     const post = (body) => fetch('/api/sessions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json',
+                                 'X-Wywd-Ui': '1' },  // 2026-09-25 守卫：所有 /api POST 必带
       body: JSON.stringify(body) }).then((r) => r.json());
     await post({ action: 'close', sid: sid });
     const forget = await post({ action: 'forget', sid: sid });

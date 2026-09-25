@@ -21,20 +21,31 @@ version = "0.1.0"
 description = "从零实现一个生产级 Python LLM / Agent Harness 的学习项目"
 readme = "README.md"
 requires-python = ">=3.11"
-# 运行时依赖就两个：requests 是 RealModel 的网络层，chainlit 是网页入口。
+# 运行时依赖：requests 是 RealModel 的网络层；fastapi + uvicorn 是
+# web_app 的运输层（2026-09-25 从 http.server 迁来，uvicorn 只在 main()
+# 里延迟 import，跑测试不需要它）；chainlit 是历史网页入口（chainlit_app
+# 已删，留待下次清理一并退役）。
 # 宽松下限 + 硬上限：锁定"能跑的已知区间"，又不挡小版本升级。
 dependencies = [
     "requests>=2.31,<3",
     "chainlit>=1.0,<3",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
-# 开发工具不污染运行时依赖。pytest 只作参考（本项目刻意用 unittest），
-# ruff 是 lint 的现代默认（Python 3.13 只支持新版，所以锁 >=0.5）。
+# 开发工具不污染运行时依赖。httpx 是 starlette TestClient 的依赖
+# （test_web_app 的 HTTP 层测试用）；pytest 只作参考（本项目刻意用
+# unittest），ruff 是 lint 的现代默认（Python 3.13 只支持新版，所以锁 >=0.5）。
 dev = [
+    "httpx>=0.27,<1",
     "pytest>=8",
     "ruff>=0.5",
 ]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [tool.setuptools.packages.find]
 # src 布局的标准写法：只在 src/ 下找包，避免把 scripts、tests 误当发布内容。

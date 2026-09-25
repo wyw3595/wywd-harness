@@ -21,6 +21,7 @@ import json
 import multiprocessing
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -28,7 +29,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.web_app import HOST, WebApp, _Handler, _Server  # noqa: E402
+import uvicorn                                                   # noqa: E402
+from scripts.web_app import HOST, WebApp, create_app  # noqa: E402
 
 # 换端口：不打扰正在跑的 8765（那是你在用的那个）
 PORT = 8792
@@ -44,7 +46,9 @@ def post_json(path: str, payload: dict) -> dict:
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 # 2026-09-25 守卫升级：X-Wywd-Ui 对**所有** /api POST 生效
+                 "X-Wywd-Ui": "1"},
         method="POST",
     )
     try:
@@ -130,21 +134,24 @@ def main() -> None:
     multiprocessing.freeze_support()
 
     app = WebApp()
-    _Handler.app = app
-    server = _Server((HOST, PORT), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    config = uvicorn.Config(create_app(app), host=HOST, port=PORT,
+                            log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
     try:
         pong = app.start()
         print("[0] sidecar/ping →", pong.get("status"))
         startup_sid = app.shell.session_id
         print("[0] 本进程自己的当前会话 →", startup_sid)
         thread.start()
+        while not server.started:
+            time.sleep(0.05)
 
         # 服务启动时它自建了一个会话，也算"本脚本造的"，收尾一起清掉
         run_checks([startup_sid])
     finally:
-        server.shutdown()
-        server.server_close()
+        server.should_exit = True
+        thread.join(timeout=5)
         app.stop()
         print("[收尾] 服务与 sidecar 已退出")
 
