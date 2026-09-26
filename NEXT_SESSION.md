@@ -2308,3 +2308,106 @@ Established connection to github.com (20.205.243.166 port 443)   ← 连接是�
 - 一律后台跑 + 重定向，卡住就停掉——**commit 早就在本地了，重试是安全的**。
 
 
+
+---
+
+# 2026-09-25 / 26 补记：权限分级落地 + FastAPI 迁移 + 并发第 1 步
+
+## 一、上次中断的工作收尾（4f7834c）
+
+上次会话在"23 条测试红"的状态下中断（权限免审批分级 + 会话级沙箱 +
+bash explain/后台出口）。本次把 26 条陈旧测试修绿后提交。**修测试的原则
+不是"让红变绿"，而是分辨三类情况分别对待**：
+
+- **蓄意变更 → 测试跟上**：界内写从 ASK 改 ALLOW（write_allow）、bash
+  加 explain 参数、工具清单加 bash_output/bash_stop、系统提示加"思考用
+  中文"软引导——测试改成钉**新**行为（fs_edit 断言 path.write_allow、
+  schema 集合加 explain）；
+- **测试的前提消失 → 删或改写**：审批通路测试原来靠"界内写触发 ASK"，
+  写放行后改用**假 bash 工具**触发（bash 非只读命令永远 ASK）；revive
+  恢复工作区的测试前提（进程级工作区）随会话级化消失，改钉"换代零操作"；
+- **系统性提示词断言放宽要留边界**：test_does_not_hardcode_user_preferences
+  原来禁裸词"中文"，新的思考语言引导与它冲突——收紧为只禁"回答语言"
+  指令（回复用中文/用中文回复），推理链展示语言是另一回事。
+
+经验：**上一条提交的结尾写着"23 条测试红留在工作区"就是给下一窗口的
+交接锚点**，接手时先跑全量、按失败清单分类，再动手。
+
+## 二、FastAPI 迁移（0132a04）
+
+上轮评审定的四类安全/健壮性缺口全在运输层，这次一次收掉：
+
+- **领域层一行没动**（WebApp/EventRing/ApprovalBoard/sse_frame 从写下
+  第一天就不碰 HTTP——当初"领域逻辑与 HTTP 分开测"的直接回报）。测试
+  631 条里只有 HTTP 层部分跟着换。
+- **端点全部同步 def**：领域层全是阻塞调用，FastAPI 把同步端点丢线程池
+  （复刻旧 ThreadingHTTPServer 的并发形态）。**别改 async def**——会把
+  事件循环卡死。
+- **守卫 = 纯函数 `_guard_rejection` + 纯 ASGI 中间件**：Host 校验（杀
+  DNS rebinding）、X-Wywd-Ui 全量 POST（杀 CSRF，原版只查 browse）、可选
+  WYWD_API_TOKEN、Content-Length 早退 413。决策纯函数所以能脱离 HTTP
+  单测（GuardDecisionTests 直调，旧版做不了的"半截请求"场景白得）；
+  不用 BaseHTTPMiddleware（给 SSE 套中转队列）。413"先判后读"由结构
+  保证：拒绝路径根本不 receive。
+- **契约不变原则**：_read_json 的宽容语义收进 _json_body 依赖（坏体给
+  {} 走领域人话，不让前端感知 422）；/api 404 保持 {"error": "not found"}。
+- **TestClient 的坑**：base_url 决定 Host 头，必须回环地址否则守卫全 403。
+- 新环境变量：WYWD_HOST / WYWD_PORT / WYWD_API_TOKEN。
+
+## 三、并发第 1 步：RPC 客户端读线程 + Future（da401ae）
+
+"一轮 turn 堵所有 RPC"的两半：客户端 _rpc_lock 串行化（本步已解决）+
+服务端单循环顺序处理（第 2 步）。
+
+- MainProcessClient 重构：**读线程**（唯一 recv，响应按 id 配对进
+  Future 字典，通知丢队列）+ **通知分派线程**（单消费者 FIFO，审批
+  阻塞只堵自己；approver 抛异常 fail-closed 拒绝）+ call()（写锁 +
+  future.result(timeout)，任意线程可并发，超时的 future 摘除、晚到
+  响应按未知 id 丢弃）。
+- **死锁四违约现况**：①③④结构性消失；②user_prompt 里重入 call 仍
+  是禁手——读线程活着所以不再必然死锁，但重入 call 若再触发审批，
+  审批通知排在分派队列里、分派线程正卡在这个 user_prompt 里 = 单消费
+  者队列自套死锁。
+- SidecarShell._rpc_lock 与 15 处 with 全删；stop() 的"非阻塞抢锁判断
+  在途"改为 **shutdown 带 2 秒超时**（在途 turn 时 shutdown 排不进来，
+  超时放弃礼貌走 EOF）。
+- 测试打法：**_ScriptedPeer（剧本化 socketpair 对端）**——真 server 是
+  顺序处理造不出乱序响应，多路复用的核心行为（乱序各回各家 / 无 call
+  时事件照收 / 审批无 call 时照样回票 / close 唤醒挂起 / 超时不串台）
+  需要能精确控制"回什么、什么时候回、什么顺序"的对端。**审批无 call
+  在飞也能应答是第 2 步的前提**（turn 后台化时客户端没有阻塞中的 call）。
+- 语义变化：事件消费与 call 返回从同步变异步（前端走 SSE 本就不依赖
+  时机）；相关测试从"call 返回即事件已消费"改成限时等到。
+
+## 四、清理（f60ef84）+ 文档
+
+- _restore_workspace/_remember_workspace/_workspace_root 死代码删除
+  （会话级工作区后职责整体移交 sidecar）。
+- chainlit 依赖退役（uv remove + 删 chainlit.md）。shell.py/web_app.py
+  里的 chainlit 字样是设计史，保留。
+- README 重写（原版还停在 chainlit/46 条测试时代）；NEXT_SESSION 本节。
+
+## 五、环境坑（本次踩到的）
+
+**uv add/remove 会把 .venv 重同步回"默认依赖集"，dev extra 被剪掉**——
+`uv remove chainlit` 后 httpx 消失，test_web_app 导入即炸
+（starlette.testclient 要 httpx 系）。对策写进了 pyproject 注释：
+调整依赖后 `uv sync --extra dev`。
+
+另外：`httpx2` 这个包目前只有 <0.1 和 >1 的版本，别按 starlette 的
+deprecation 提示去装它——httpx 本体就能跑（那条 warning 是噪声）。
+
+## 六、下一步
+
+1. **第 2 步：服务端 turn 后台化**（真正的解锁）——agent/send 改成
+   提交给执行器线程、立刻回 {"status":"started"}；turn_end 事件带结局；
+   审批等待挪进 turn 线程（sidecar 主循环加 pending_approvals 注册表，
+   approval/response 到达时完成 future）。同一会话串行靠现成的
+   SessionProcess turn 锁。执行器 max_workers 2~4。
+2. **第 3 步：契约适配**——POST messages 返回 202 提交即返回（测试留
+   同步模式）；前端 posting 改由 SSE turn_start/turn_end 驱动；**事件
+   载荷带 sessionId**（不分会串台）；notice 改从事件来（修"结局不落盘
+   F5 就丢"）。
+3. 偶发 flake：一次全量出现过 failures=1 未抓到名字，连跑三次未再现，
+   下次碰到先记名字。
+4. push：本地领先远端 8+ 提交，等用户发话。

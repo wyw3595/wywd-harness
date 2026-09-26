@@ -1,80 +1,132 @@
 # wywd-harness
 
 从零实现一个生产级 Python LLM / Agent Harness 的学习项目。
-内核自建：模型协议、Agent Loop、工具系统、真实模型接入、沙箱安全、会话记忆、轨迹可视化、成本可观测。
+内核自建：模型协议、Agent Loop、工具系统、权限治理、真实模型接入、会话管理、
+上下文压缩、多级记忆、技能系统、成本可观测；运输层走 FastAPI + 自研 Vue 前端。
 
 ## 当前能力
 
-- **模型协议**：结构化 `Model` 协议 —— `generate(messages) -> ModelReply`（`kind="final" | "tool_calls"`），没有任何字符串暗号；一轮可携带多个 `ToolCall`。
-- **离线双模型**：`FakeModel` 固定回复；`ScriptedModel` 按剧本回 `ModelReply` 并记录每轮收到的消息快照。
-- **Agent Loop**：`run_agent(task, model, registry, max_steps, history, on_event)` —— 有界循环、工具结果/错误按 `tool_call_id` 回灌、多工具互不拖累、跨问题会话记忆（Harness 无状态，记忆归应用层）。
-- **状态契约**：`RunResult.status` 是可预期的结局 —— `completed` / `max_steps` / `failed`（失败是一等公民，不靠异常）。
-- **工具系统**：`ToolRegistry` 注册/查找/调度；`tool_to_schema` 用 `inspect` 反射自动生成 JSON Schema；docstring 参数描述自动入 schema。
-- **真实模型**：`RealModel` 走 OpenAI 兼容 HTTP 调 DeepSeek —— 密钥环境变量、连接池复用、指数退避重试、403/401 类永久错误快速失败、wire 解析哨兵（畸形响应一律 ValueError）。
-- **沙箱文件工具**：只读 + 沙箱根 + 大小限额 + 禁区（`.env`/`.git`），违规走错误回灌不崩溃。
-- **可观测三件套**：事件钩子（`round_start`/`model_reply`/`tool_start`/`tool_end` 实时直播）、HTML 轨迹页（防 XSS）、token 用量记账。
-- **成本刹车**：`trim_history` 历史窗口截断，且不拆散 assistant(tool_calls)/tool 的配对。
+- **模型协议**：结构化 `Model` 协议 —— `generate(messages) -> ModelReply`
+  （`kind="final" | "tool_calls"`），无字符串暗号；`ModelRouter` 三档路由
+  （lite 粗筛 / default 执行 / craft 主对话），Router 自己实现 Model 协议所以零改动插入。
+- **真实模型**：`RealModel` 走 OpenAI 兼容 HTTP（DeepSeek）——连接池、指数退避重试、
+  4xx 永久错误快速失败、wire 翻译只在这一个文件。
+- **Agent Loop**：`run_agent` 有界多轮循环；工具结果/错误按 `tool_call_id` 回灌、
+  多工具互不拖累；`RunResult.status` 把 `completed / max_steps / failed` 做成可预期结局。
+- **工具系统**：`ToolRegistry` + `inspect` 反射自动生成 JSON Schema；沙箱文件工具
+  （只读根 + 限额 + `.env`/`.git` 禁区）；bash 工具（进程树击杀、后台任务出口、
+  explain 给人看的命令说明）；延迟工具（schema 不常驻，ToolSearch 发现再加载）。
+- **权限治理**：有序规则 first-match-wins + 默认拒绝；`ALLOW / ASK / DENY` 三种
+  治理语义，DENY 不可被审批覆盖；界内写放行 + 只读 bash 白名单（治理审批疲劳）；
+  approver 是注入的回调（终端 y/n / 网页卡片 / 测试假实现同一接口）。
+- **权限免审批分级**：`path.write_allow`（界内写）、`bash.read_only_allow`
+  （只读命令白名单，无 shell 元字符 + 整词命中 + 只读三前提）。
+- **会话管理**：逻辑会话（SessionRecord，可持久化）与运行时（SessionProcess，
+  turn 锁 / abort 信号，绝不序列化）分离；resume = 旧 id + generation+1 的新运行时；
+  **会话级沙箱**——目录跟会话记录走，"一个会话一个目录"。
+- **持久化**：JSONL 证据文件 append-only（transcript 是证据，MEMORY.md 是派生）；
+  工具大输出外化到磁盘，上下文只留指针。
+- **上下文压缩**：四层管线（截大输出 → 去重读 → 修剪 → 生成式摘要），每层记账；
+  已确认事实走无损旁路，永不交给摘要；压缩产物不落盘（模型看压缩视图，证据记原始历史）。
+- **记忆**：工作区记忆（从 daily 日志蒸馏，模型只能提名、门槛由 harness 控制）、
+  用户记忆（Profile + Preference，语义 key 去重）、session transcript 三层分账。
+- **技能系统**：SKILL.md 先列目录、触发词命中再展开全文；manifest 只能收窄权限。
+- **RPC 并发**：客户端"读线程 + Future 多路复用"——任意线程可并发 call，
+  事件/审批走独立分派线程（2026-09-26 起，全局 _rpc_lock 已退役）。
+- **Web 运输层**：FastAPI + uvicorn + SSE；守卫中间件（Host 校验 / X-Wywd-Ui 全量
+  POST / 可选 WYWD_API_TOKEN / 请求体上限早退）；sidecar 死了自动换新。
+- **前端**：Vue 3（vendor ESM，零构建）；SSE 直播 + 断线续传；审批卡；运维抽屉
+  （状态 / 成本表 / 日志）。
 
 ## 目录
 
 ```
-src/harness/
-  main.py          一次最小运行与 RunResult（状态契约的唯一出处）
-  models.py        模型协议、ModelReply/ToolCall、离线模型
-  agent.py         Agent Loop（循环、回灌、历史、事件钩子、跨轮记账）
-  tools.py         工具描述、注册表、tool_to_schema、docstring 解析
-  real_model.py    真实模型（DeepSeek，OpenAI 兼容 wire 翻译）
-  file_tools.py    沙箱文件工具（只读 + 沙箱 + 限额 + 禁区）
-  memory.py        trim_history 历史窗口截断
-  trace.py         轨迹可视化（纯函数渲染 + XSS 转义）
-scripts/
-  chat.py          交互式终端入口
-  chainlit_app.py  网页聊天入口（Chainlit）
-  toolbox.py       共享工具箱（终端/网页两个入口共用同一套工具与模型配置）
-  demo_trace.py    离线演示：跑一次工具往返 + 生成轨迹页
-  smoke_deepseek.py 真实调用冒烟脚本（不进单元测试，需密钥）
-tests/             46 条离线单元测试（unittest，毫秒级，不碰网络）
-pyproject.toml     依赖与打包声明（src 布局）
+src/harness/        内核（不认识任何 UI 和具体模型）
+  main.py             RunResult（状态契约的唯一出处）
+  models.py           Model 协议 / ModelReply / 离线模型
+  agent.py            Agent Loop（循环、回灌、事件钩子）
+  tools.py            工具描述、注册表、tool_to_schema
+  file_tools.py       沙箱文件工具
+  std_tools.py        calc / find_text / glob / tree / bash 等
+  permissions.py      权限决策层 + GovernedToolRunner + AuditTrail
+  real_model.py       真实模型（OpenAI 兼容 wire 翻译）
+  model_router.py     三档模型路由
+  memory.py           历史窗口截断
+  compact.py          四层上下文压缩 + 无损旁路
+  artifact.py         工具输出外化
+  session.py          SessionRecord / SessionProcess / SessionManager
+  jsonl_store.py      JSONL 证据持久化
+  sidecar.py          Sidecar 服务端 + RPC 客户端（读线程 + Future）
+  workspace.py        上传目录 / zip 工作区
+  workspace_memory.py 项目级记忆（蒸馏门槛 harness 控制）
+  user_memory.py      用户级记忆（Profile / Preference）
+  skills.py           技能索引与按需展开
+  electron.py         多进程 IPC 教学（桌面壳一课）
+  trace.py            HTML 轨迹可视化
+scripts/            壳层与入口
+  web_app.py          Web 后端（FastAPI 运输层 + 守卫 + SSE）
+  shell.py            SidecarShell（终端/网页共用的编排件）
+  chat.py             终端聊天入口
+  toolbox.py          装配层：工具/模型/记忆/策略的组装
+  native_dialog.py    系统目录选择框（降级机制）
+  smoke_*.py          冒烟脚本（真实链路自验，不进单测）
+public/             前端（Vue 3 ESM vendor，零构建）
+tests/              631 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始
 
-前置：Python 3.11+ 虚拟环境，`pip install requests`（网页入口另需 chainlit）。
+前置：Python 3.11+，用 uv 管依赖：
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v   # 46 条测试
-.\.venv\Scripts\python.exe -X utf8 -m src.harness.agent              # 离线 Agent 演示
-.\.venv\Scripts\python.exe -X utf8 -m scripts.demo_trace             # 轨迹页演示
+uv sync --extra dev                                   # 装依赖（dev extra 带 httpx）
+uv run python -X utf8 -m unittest discover -s tests   # 跑全量测试
 ```
 
-**真实对话**（需密钥，PowerShell 一次性设置）：
+⚠ `uv add/remove` 会把环境重同步回默认依赖集、剪掉 dev extra——调整依赖后
+记得 `uv sync --extra dev`，否则 test_web_app 导入即炸。
+
+**网页入口**（推荐）：
 
 ```powershell
-setx DEEPSEEK_API_KEY "sk-..."          # 永久设置（写注册表，新开窗口生效）
-.\.venv\Scripts\python.exe -X utf8 -m scripts.chat                   # 终端聊天
-.\.venv\Scripts\chainlit.exe run scripts\chainlit_app.py             # 网页聊天
+uv run python -X utf8 scripts/web_app.py     # → 浏览器开 http://127.0.0.1:8765
 ```
 
-环境变量可覆盖（进程级，任选其一）：
+**终端入口**：
 
 ```powershell
-$env:WYWD_API_BASE = "https://网关地址/v1/chat/completions"   # 换 OpenAI 兼容网关
-$env:WYWD_MODEL    = "moonshot-v1-8k"                        # 换模型档位
+uv run python -X utf8 -m scripts.chat
 ```
 
-## 测试
+**真实模型**（不设密钥时自动用离线 FakeModel，全链路可离线跑）：
 
-`tests/` 下共 7 个文件、46 条断言，全部离线、不碰网络、毫秒级。
-CI（GitHub Actions）在每个 push/PR 跑全量测试，版本矩阵 3.11 ~ 3.13。
-
+```powershell
+setx DEEPSEEK_API_KEY "sk-..."
 ```
-unittest discover -s tests -v
+
+环境变量：`WYWD_HOST` / `WYWD_PORT`（监听地址，默认 127.0.0.1:8765）、
+`WYWD_API_TOKEN`（设了则所有 /api POST 需带 x-wywd-token，给 curl/局域网用）、
+`WYWD_MODEL` / `WYWD_API_BASE`（换 OpenAI 兼容网关）、`WYWD_MAX_STEPS`（单轮步数，
+默认 60）、`WYWD_APPROVAL_TIMEOUT`（审批超时秒数，默认 60）、
+`WYWD_IDLE_REAP_SECONDS`（空闲回收，默认关）、`WYWD_DISABLE_BASH`（下架 bash）。
+
+## 测试与冒烟
+
+`tests/` 全部离线、毫秒级、不碰网络；CI 在每个 push/PR 跑 3.11~3.13 矩阵。
+真实链路的自验在 `scripts/smoke_*`（需密钥或图形环境，不进 CI）：
+
+```powershell
+uv run python -X utf8 -m unittest discover -s tests -v   # 全量单测
+uv run python -X utf8 scripts/smoke_web_workspace.py     # 上传→解压→读回 全链路
+uv run python -X utf8 scripts/smoke_session_ops.py       # 会话四操作全链路
+node scripts/smoke_frontend.cjs                          # 真 Chromium 前端冒烟（需服务在 8765）
 ```
 
 ## 设计说明
 
-一句话：**协议与实现分离**。`Model` 协议让离线 fake 与真实 DeepSeek 共用同一份循环代码；
-`RunResult.status` 让失败/截断/超步都是可预期的结果；`tool_call_id` 回灌让工具结果与调用严格配对；
-消息历史是纯逻辑方言，wire 翻译只发生在 `real_model.py` 一个文件里（摘掉 provider 就能换）。
+一句话：**协议与实现分离**。`Model` 协议让离线 fake 与真实 DeepSeek 共用同一份循环；
+`RunResult.status` 让失败/截断/超步都是可预期的结果；`tool_call_id` 回灌让工具结果
+与调用严格配对；wire 翻译只发生在 `real_model.py` 一个文件；权限的决策（纯函数）
+与执行（GovernedToolRunner）分开；RPC 客户端的读线程按 id 配对、通知走独立分派。
 
 学习轨迹与规划见 `NEXT_SESSION.md`；面试题积累见 `interview-questions.md`。
