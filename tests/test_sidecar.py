@@ -760,6 +760,40 @@ class SidecarServerTests(unittest.TestCase):
             self.assertFalse(server._reaper.is_alive())
 
 
+class _ScriptedPeer:
+    """socketpair 对端的剧本演员（2026-09-26 多路复用测试专用）。
+
+    真 SidecarServer 是单循环顺序处理：回响应的顺序 == 收到请求的顺序，
+    造不出"乱序响应"。多路复用的核心行为——响应各回各家、通知不挡结果、
+    close 唤醒挂起者——需要一个能精确控制"回什么、什么时候回、什么顺序回"
+    的对端。所以这些测试不连真 server：对端线程按剧本收发。
+    """
+
+    def __init__(self) -> None:
+        srv, cli = socket.socketpair()
+        self.conn = RPCConnection(srv)
+        self.client_sock = cli        # 交给 MainProcessClient.connect
+        self.requests: list[dict] = []
+        self.request_seen = threading.Event()   # 每读到一条请求就置位
+        self.thread: threading.Thread | None = None
+
+    def start(self, script: list) -> None:
+        def run() -> None:
+            try:
+                for step in script:
+                    step(self)
+            except OSError:
+                pass                  # 客户端 close → 对端断开，正常收场
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+
+    def recv_request(self) -> dict:
+        msg = self.conn.recv_message()
+        self.requests.append(msg)
+        self.request_seen.set()
+        return msg
+
+
 class MainProcessClientTests(unittest.TestCase):
     """壳侧客户端：call 配对 / 分派环消费审批与事件 / 断连诚实失败。"""
 
@@ -867,7 +901,12 @@ class MainProcessClientTests(unittest.TestCase):
             client.close(); thread.join(timeout=2)
 
     def test_dispatch_loop_consumes_event_notifications(self) -> None:
-        """event 通知被 on_event 消费，result 仍正确返回（不被 event 挡住）。"""
+        """event 通知被 on_event 消费，result 仍正确返回（不被 event 挡住）。
+
+        2026-09-26 语义更新：通知改走分派线程，事件到达与 call 返回是
+        **异步**的（旧版在单线程分派环里被顺序保证）。前端走 SSE 本来
+        就不依赖 call 返回时机，所以异步是纯收益；测试改成限时等到。
+        """
 
         events: list[dict] = []
         server, client, thread = self._run_server(
@@ -876,6 +915,10 @@ class MainProcessClientTests(unittest.TestCase):
         sid = client.call("session/create")["result"]["sessionId"]
         resp = client.call("agent/send", {"sessionId": sid, "message": "hi"})
         self.assertIn("result", resp)
+        deadline = time.time() + 2
+        while time.time() < deadline and not any(
+                e.get("event") == "round_start" for e in events):
+            time.sleep(0.01)
         self.assertTrue(any(e.get("event") == "round_start" for e in events))
         client.call("sidecar/shutdown")
         client.close(); thread.join(timeout=2)
@@ -889,6 +932,142 @@ class MainProcessClientTests(unittest.TestCase):
         thread.join(timeout=2)
         with self.assertRaises(ConnectionClosed):
             client.call("sidecar/ping")
+
+    # ── 多路复用（2026-09-26 重构）：用 _ScriptedPeer 钉核心行为 ──
+
+    def test_concurrent_calls_get_their_own_responses(self) -> None:
+        """两个线程并发 call，乱序到达的响应各回各家（旧版做不到）。
+
+        旧版单线程分派环下，第二个 call 的响应会被第一个 call 当成自己的
+        （或永远等不到）——这是死锁违约③的直接后果，也是壳必须拿
+        _rpc_lock 串行化的原因。新版按 id 配对，乱序无所谓。
+        """
+
+        peer = _ScriptedPeer()
+
+        def out_of_order(p: _ScriptedPeer) -> None:
+            r1 = p.recv_request()
+            r2 = p.recv_request()            # 两个请求都到齐
+            p.conn.send_message({"jsonrpc": "2.0", "result": "B先回",
+                                 "id": r2["id"]})
+            p.conn.send_message({"jsonrpc": "2.0", "result": "A后回",
+                                 "id": r1["id"]})
+
+        peer.start([out_of_order])
+        client = MainProcessClient(on_event=lambda data: None)
+        client.connect(peer.client_sock)
+
+        results: dict[str, str] = {}
+
+        def do(key: str, method: str) -> None:
+            results[key] = client.call(method)["result"]
+
+        t1 = threading.Thread(target=do, args=("a", "method/a"))
+        t2 = threading.Thread(target=do, args=("b", "method/b"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=2)
+        t2.join(timeout=2)
+        self.assertEqual(results, {"a": "A后回", "b": "B先回"})
+        client.close()
+
+    def test_event_flows_without_call_in_flight(self) -> None:
+        """没有 call 在飞，事件照样被消费（旧版：没人 recv = 事件堵在管道里）。"""
+
+        got: list[dict] = []
+        peer = _ScriptedPeer()
+        peer.start([lambda p: p.conn.send_message(
+            {"jsonrpc": "2.0", "method": "event",
+             "params": {"event": "tick"}, "id": None})])
+        client = MainProcessClient(on_event=got.append)
+        client.connect(peer.client_sock)
+
+        deadline = time.time() + 2
+        while not got and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([g.get("event") for g in got], ["tick"])
+        client.close()
+
+    def test_approval_answered_even_without_call_in_flight(self) -> None:
+        """审批请求在没有 call 在飞时照样被应答回票（旧版的结构性盲区）。
+
+        旧版审批的消费依赖"此刻有 call 阻塞在 recv"；新版读线程常驻，
+        通知随时被消费、回程票随时发得回去——这是第 2 步 turn 后台化的
+        前提（turn 在后台跑时，客户端根本没有"阻塞中的 call"）。
+        """
+
+        prompts: list[tuple[str, str]] = []
+        peer = _ScriptedPeer()
+
+        def challenge(p: _ScriptedPeer) -> None:
+            p.conn.send_message({"jsonrpc": "2.0", "method": "approval/request",
+                                 "params": {"request_id": "ticket-1",
+                                            "rule_id": "bash.requires_approval",
+                                            "reason": "跑命令"}, "id": None})
+            p.receipt = p.conn.recv_message()   # 等回程票
+
+        peer.start([challenge])
+        client = MainProcessClient(
+            user_prompt=lambda rid, why:
+                prompts.append((rid, why)) or False)
+        client.connect(peer.client_sock)
+
+        deadline = time.time() + 2
+        while time.time() < deadline and not hasattr(peer, "receipt"):
+            time.sleep(0.01)
+        self.assertEqual(prompts, [("bash.requires_approval", "跑命令")])
+        receipt = getattr(peer, "receipt", None)
+        self.assertIsNotNone(receipt, "对端没等到 approval/response")
+        self.assertEqual(receipt["params"]["request_id"], "ticket-1")
+        self.assertFalse(receipt["params"]["approved"])   # 假审批员回 False
+        client.close()
+
+    def test_close_fails_pending_calls(self) -> None:
+        """close 时挂着的 call 全部被唤醒并诚实失败——没人该陪收尾挂死。"""
+
+        peer = _ScriptedPeer()
+        peer.start([lambda p: p.recv_request()])   # 读走请求，永不回
+        client = MainProcessClient()
+        client.connect(peer.client_sock)
+
+        outcome: dict = {}
+
+        def caller() -> None:
+            try:
+                client.call("slow/thing")
+            except Exception as exc:               # noqa: BLE001——测试要抓一切
+                outcome["exc"] = exc
+
+        t = threading.Thread(target=caller, daemon=True)
+        t.start()
+        self.assertTrue(peer.request_seen.wait(2), "对端没读到请求")
+        time.sleep(0.05)                           # 让 call 真正挂上 future
+        client.close()
+        t.join(timeout=2)
+        self.assertIsInstance(outcome.get("exc"), ConnectionClosed)
+
+    def test_call_timeout_discards_late_response(self) -> None:
+        """超时抛 TimeoutError；晚到的响应被丢弃，不污染下一次 call。"""
+
+        peer = _ScriptedPeer()
+
+        def late_then_fast(p: _ScriptedPeer) -> None:
+            r1 = p.recv_request()
+            time.sleep(0.4)                        # 让第一个 call 超时
+            p.conn.send_message({"jsonrpc": "2.0", "result": "太晚了",
+                                 "id": r1["id"]})
+            r2 = p.recv_request()
+            p.conn.send_message({"jsonrpc": "2.0", "result": "及时",
+                                 "id": r2["id"]})
+
+        peer.start([late_then_fast])
+        client = MainProcessClient()
+        client.connect(peer.client_sock)
+        with self.assertRaises(TimeoutError):
+            client.call("slow/thing", timeout=0.1)
+        # 关键：晚到的 r1 响应绝不能被配给 r2（id 配对，不是"下一个响应"）
+        self.assertEqual(client.call("fast/thing", timeout=2)["result"], "及时")
+        client.close()
 
 
 class CompactionTranscriptTests(unittest.TestCase):

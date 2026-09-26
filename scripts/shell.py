@@ -26,7 +26,6 @@ import multiprocessing as mp
 import os
 import socket
 import sys
-import threading
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -192,8 +191,10 @@ def _sidecar_process(sock: socket.socket) -> None:
 class SidecarShell:
     """起一个 sidecar 子进程、建一个会话，把 RPC 包装成 UI 友好的方法。
 
-    线程约定：所有 RPC 调用过同一把 _rpc_lock——MainProcessClient 是
-    单线程的（s06 死锁违约③：双线程同 recv），壳作为唯一咽喉负责串行化。
+    线程约定（2026-09-26）：MainProcessClient 内部自带读线程 + Future
+    多路复用，任意线程可以直接 client.call()——壳不再持全局 _rpc_lock。
+    那把锁曾把所有调用串成单队，一轮长 turn 堵死整个前端的每一半责任
+    在它；它的退役是并发改造第 1 步（服务端 turn 后台化是另一半）。
     """
 
     def __init__(
@@ -214,8 +215,6 @@ class SidecarShell:
         self._client: Optional[MainProcessClient] = None
         self._proc: Any = None
         self._sid: Optional[str] = None
-        # 并发串行化（坑 2）：chainlit 不串行化消息，双连发会双线程进 call
-        self._rpc_lock = threading.Lock()
 
     # ── 生命周期 ─────────────────────────────────────────────
 
@@ -247,12 +246,11 @@ class SidecarShell:
             self._client = self._client_factory(
                 user_prompt=self._user_prompt, on_event=self._on_event)
             self._client.connect(cli)
-            with self._rpc_lock:
-                pong = self._client.call("sidecar/ping")["result"]
-                # 走 _create_session_remote 而不是手写 ["result"]["sessionId"]：
-                # 它已经把 error 响应翻译成 RuntimeError 人话，和 new_session
-                # 同一个出口（原来这里是唯一手写取字段的地方）。
-                self._sid = self._create_session_remote() if create_session else None
+            pong = self._client.call("sidecar/ping")["result"]
+            # 走 _create_session_remote 而不是手写 ["result"]["sessionId"]：
+            # 它已经把 error 响应翻译成 RuntimeError 人话，和 new_session
+            # 同一个出口（原来这里是唯一手写取字段的地方）。
+            self._sid = self._create_session_remote() if create_session else None
             return pong
         except Exception:
             # 启动失败：清半壳（子进程 + socket）再抛——不留僵尸不留空壳
@@ -266,26 +264,24 @@ class SidecarShell:
             raise
 
     def stop(self) -> None:
-        """干净收尾（幂等）：shutdown → close(EOF) → join(5s) → terminate。
+        """干净收尾（幂等）：礼貌 shutdown（带超时）→ close(EOF) → join → terminate。
 
-        有在途 call 时跳过礼貌 shutdown（acquire(blocking=False) 拿不到锁），
-        直接用 close() 的 EOF 打断它——在途线程的 recv 会抛 OSError →
-        ConnectionClosed，诚实失败而不是卡死。
+        shutdown 带 2 秒超时：sidecar 是单循环顺序处理，有在途 turn 时
+        shutdown 请求排在 turn 后面进不来——超时就放弃礼貌，用 close() 的
+        EOF 打断它（读线程/循环诚实失败），不陪跑整个 turn。旧版靠
+        _rpc_lock 的非阻塞抢锁判断"有没有在途 call"，锁退役后由超时接管。
         """
         if self._proc is None:
             return  # 幂等：没起过壳 / 已停过，直接返回
         proc, client = self._proc, self._client
         try:
             if client is not None:
-                if self._rpc_lock.acquire(blocking=False):  # 空闲才走礼貌协议
-                    try:
-                        try:
-                            client.call("sidecar/shutdown")
-                        except Exception:
-                            pass  # sidecar 已死也要继续收尾
-                    finally:
-                        self._rpc_lock.release()
-                client.close()  # EOF 兜底（必须）：让 sidecar 的 recv 返回 None
+                try:
+                    client.call("sidecar/shutdown", timeout=2)
+                except Exception:
+                    pass  # sidecar 已死 / shutdown 排不进来——都继续收尾
+                client.close()  # EOF 兜底（必须）：sidecar 的 recv 返回 None；
+                                # 客户端侧挂起的 call 全部被唤醒并诚实失败
         finally:
             proc.join(timeout=5)
             if proc.is_alive():
@@ -295,7 +291,7 @@ class SidecarShell:
             self._client = None
             self._sid = None
 
-    # ── RPC 包装（全部过 _rpc_lock）─────────────────────────
+    # ── RPC 包装（线程安全：client 自带读线程 + 写锁，可任意线程直呼）──
 
     @staticmethod
     def _result(resp: dict) -> dict:
@@ -324,9 +320,8 @@ class SidecarShell:
         _result 翻译成人话，不抛洞。
         """
 
-        with self._rpc_lock:
-            return self._result(self._client.call("agent/send",
-                {"sessionId": session_id, "message": message}))
+        return self._result(self._client.call("agent/send",
+            {"sessionId": session_id, "message": message}))
 
     def send(self, message: str) -> dict:
         """发给自己当前会话（懒建：还没有会话就现开一个）。
@@ -345,14 +340,12 @@ class SidecarShell:
     def status(self) -> dict:
         """sidecar 状态：会话数 / RingBuffer 用量 / handler 数。"""
 
-        with self._rpc_lock:
-            return self._result(self._client.call("sidecar/status"))
+        return self._result(self._client.call("sidecar/status"))
 
     def sessions(self) -> dict:
         """sidecar 里的会话列表。"""
 
-        with self._rpc_lock:
-            return self._result(self._client.call("session/list"))
+        return self._result(self._client.call("session/list"))
 
     def messages(self, sid: str = "") -> dict:
         """读一个会话的完整消息历史（历史重放/审计用；closed 也能读）。
@@ -361,9 +354,8 @@ class SidecarShell:
         """
 
         target = sid or self._sid or ""
-        with self._rpc_lock:
-            return self._result(self._client.call("session/messages",
-                {"sessionId": target}))
+        return self._result(self._client.call("session/messages",
+              {"sessionId": target}))
 
     def logs(self) -> str:
         """sidecar 最近日志（走 RPC——真多进程下主进程读不到子进程内存）。
@@ -372,8 +364,7 @@ class SidecarShell:
         比回空串诚实（空串会让人以为 sidecar 从没输出过东西）。
         """
 
-        with self._rpc_lock:
-            data = self._result(self._client.call("sidecar/logs"))
+        data = self._result(self._client.call("sidecar/logs"))
         if "error" in data:
             return f"[取不到 sidecar 日志] {data['error']}"
         return data.get("logs", "")
@@ -381,8 +372,7 @@ class SidecarShell:
     def tools(self) -> list:
         """sidecar 持有的工具清单（网页欢迎语可渲染，替代硬编码文案）。"""
 
-        with self._rpc_lock:
-            data = self._result(self._client.call("tool/list"))
+        data = self._result(self._client.call("tool/list"))
         # 取不到就给空清单：工具清单是展示性的，不该因为一次 RPC 抖动炸掉页面
         return data.get("tools", []) if "error" not in data else []
 
@@ -400,14 +390,13 @@ class SidecarShell:
         已建会话的历史不动——旧历史里的路径在新沙箱里可能不存在。
         """
 
-        with self._rpc_lock:
-            resp = self._client.call("workspace/set",
-                                     {"kind": kind, "path": path,
-                                      "sessionId": sid})
-            if "result" in resp:
-                return resp["result"]
-            error = resp.get("error") or {}
-            return {"error": error.get("message", "sidecar 内部错误")}
+        resp = self._client.call("workspace/set",
+                                 {"kind": kind, "path": path,
+                                  "sessionId": sid})
+        if "result" in resp:
+            return resp["result"]
+        error = resp.get("error") or {}
+        return {"error": error.get("message", "sidecar 内部错误")}
 
     def workspace(self, sid: str = "") -> dict:
         """读**这个会话**的工作目录（UI 渲染"模型在哪个目录里干活"）。
@@ -415,8 +404,7 @@ class SidecarShell:
         会话不在运行时也能问——目录记在它的记录里（sidecar 会从 store 取）。
         """
 
-        with self._rpc_lock:
-            return self._client.call("workspace/get", {"sessionId": sid})["result"]
+        return self._client.call("workspace/get", {"sessionId": sid})["result"]
 
     def clear(self) -> str:
         """清记忆（s07-b 升级）：完整编舞 close → forget → create。
@@ -424,11 +412,10 @@ class SidecarShell:
         四操作里三个在同一命令里跑一遍：close（释放运行时）→
         forget（删记录）→ create（新身份）。
         """
-        with self._rpc_lock:
-            if self._sid:
-                self._client.call("session/close", {"sessionId": self._sid})
-                self._client.call("session/forget", {"sessionId": self._sid})
-            sid = self._create_session_remote()
+        if self._sid:
+            self._client.call("session/close", {"sessionId": self._sid})
+            self._client.call("session/forget", {"sessionId": self._sid})
+        sid = self._create_session_remote()
         self._sid = sid
         return sid
 
@@ -439,15 +426,13 @@ class SidecarShell:
         靶子；之后的 send 会拿到 sidecar 的诚实报错（closed ≠ 消失）。
         """
         target = sid or self._sid
-        with self._rpc_lock:
-            return self._result(self._client.call("session/close",
-                  {"sessionId": target}))
+        return self._result(self._client.call("session/close",
+              {"sessionId": target}))
 
     def resume_session(self, sid: str) -> dict:
         """复活一个 closed 会话（generation+1 的新运行时，历史接着用）。"""
-        with self._rpc_lock:
-            result = self._result(self._client.call("session/resume",
-                  {"sessionId": sid}))
+        result = self._result(self._client.call("session/resume",
+              {"sessionId": sid}))
         if "error" not in result:
             self._sid = sid
         return result
@@ -455,9 +440,8 @@ class SidecarShell:
     def forget_session(self, sid: str = "") -> dict:
         """真删一个会话记录；live 的必须先 close（sidecar 会拒绝）。"""
         target = sid or self._sid
-        with self._rpc_lock:
-            return self._result(self._client.call("session/forget",
-                  {"sessionId": target}))
+        return self._result(self._client.call("session/forget",
+              {"sessionId": target}))
 
     def _create_session_remote(self) -> str:
         """让 sidecar 建个会话并取回 id。
@@ -484,8 +468,7 @@ class SidecarShell:
 
         if self._sid:
             return self._sid
-        with self._rpc_lock:
-            sid = self._create_session_remote()
+        sid = self._create_session_remote()
         self._sid = sid
         return sid
 
@@ -497,10 +480,9 @@ class SidecarShell:
         与 ensure_session() 的区别：这个**永远**开新的，那个只在没有时才开。
         """
 
-        with self._rpc_lock:
-            if self._sid:
-                self._client.call("session/close", {"sessionId": self._sid})
-            sid = self._create_session_remote()
+        if self._sid:
+            self._client.call("session/close", {"sessionId": self._sid})
+        sid = self._create_session_remote()
         self._sid = sid
         return sid
 

@@ -16,15 +16,17 @@
   1. JSON-RPC 协议：外层请求用 id 配对（request id=1 → response id=1）；
      审批/事件用 id:null 的"通知" + params.request_id 回程票——id 命名空间
      只属于外层请求-响应，领域级配对交给 request_id（与 s05 同构）。
-  2. 收信分派环（main 侧）：call 阻塞等响应期间，socket 里会混入 sidecar
-     发来的 approval/request（要审批）和 event（直播）。有 method 字段 =
-     请求/通知，就地消费（弹 y/n / 打印）后 continue；没有 method 且
-     id 匹配外层 = 我的响应，返回。
-  3. 单线程顺序嵌套：main 先卡（recv 等 id=1）→ sidecar 处理时 approver
-     嵌套 recv 等回执 → 两边至多一个嵌套 recv 存活，无死锁。
-     死锁只来自四种违约：①分派环把审批/事件当结果返回；②user_prompt
-     里重入 call()；③两个线程同时 recv（RPCConnection 非线程安全）；
-     ④main 不消费 event（event 排在 result 前面会挡住它）。全写进注释。
+  2. 客户端 = 读线程 + Future 多路复用（2026-09-26 重构）：读线程是唯一
+     recv 的线程——响应按 id 塞进 future 字典；通知（approval/event）进
+     单线程分派队列（FIFO 保序，审批阻塞只堵自己，不堵响应接收）。
+     call() = 发请求（写锁保护）+ future.result(timeout)——任意多线程
+     可并发 call，壳层那把全局 _rpc_lock 因此退役（"一轮 turn 堵死
+     前端"的客户端一半从此不存在）。
+  3. 死锁四违约的现况：①分派环吞结果 ③双线程同 recv ④event 无人消费
+     ——全部**结构性消失**（读线程只按 id 配对、唯一 recv、常驻收信）；
+     ②user_prompt 里重入 call() 仍是禁手：读线程活着所以不再必然死锁，
+     但重入的 call 若再触发审批，审批通知会排在分派队列里、而分派线程
+     正卡在这个 user_prompt 里——单消费者队列自己套自己 = 死锁回归。
 
 📚 Windows spawn 守则（同 s05）：
   - mp.Process target 必须模块级函数；装配在子进程内各自做；
@@ -50,10 +52,12 @@
 """
 
 import json
+import queue
 import socket
 import threading
 import time
 import uuid
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -430,8 +434,9 @@ class SidecarServer:
           - self._last_turn_status 是协议接缝的记账：TurnRunner 协议的
             返回值只有 (output, messages)，装不下 run_agent 的 status——
             但 agent/send 的 RPC 响应要诚实汇报 max_steps/failed。安全
-            前提：同一时刻至多一个 turn 在跑（handle_connection 单线程 +
-            壳的 _rpc_lock 串行化）；跨连接并发 turn 是已知边界（status
+            前提：同一时刻至多一个 turn 在跑（handle_connection 是单循环
+            顺序处理——客户端并发 call 也会在这里排队，turn 后台化之前
+            这是硬边界）；跨连接并发 turn 是已知边界（status
             可能串台，output 不受影响——它走返回值）。
         """
         def turn_runner(message: str, history: list[dict]):
@@ -870,10 +875,27 @@ def _terminal_prompt(rule_id: str, reason: str) -> bool:
 
 
 class MainProcessClient:
-    """主进程的 RPC 客户端：call 阻塞期间，分派环就地消费审批与事件。
+    """主进程的 RPC 客户端（2026-09-26 重构）：读线程 + Future 多路复用。
 
-    user_prompt / on_event 注入可测；默认终端 y/n + 打印。
-    单线程约定：同一时刻最多一个进行中的 call（写进死锁违约②/③）。
+    旧版（s06~s16）是"单线程 + 收信分派环"：call 阻塞在 recv，半路混进
+    来的审批/事件就地消费。致命约束是**同一时刻至多一个 call**（死锁违约
+    ③：双线程同 recv）——壳只能拿一把 _rpc_lock 把所有调用串成单队，
+    一轮长 turn 堵住整个前端。
+
+    新版把"读"和"等"拆开：
+      - 读线程（wywd-rpc-reader）：**唯一** recv 的线程。响应按 id 塞进
+        future 字典；通知（approval/event）丢进单线程分派队列。读线程
+        永不阻塞——任何时候都在收，④event 排在 result 前面挡住它的问题
+        从此不存在。
+      - 通知分派线程（wywd-rpc-notifier）：单消费者 FIFO。事件保序；
+        审批在这里调 user_prompt（可能阻塞到审批超时）——只堵自己，
+        读线程照常收响应，审批期间其余 RPC 不再挨饿。
+      - call()：发请求（_send_lock 保护写）+ future.result(timeout)。
+        任意多线程可并发；timeout 到点抛 TimeoutError，晚到的响应由
+        读线程按"未知 id"静默丢弃，不串台。
+
+    旧死锁四违约的现况（详见模块 docstring 机制③）：①③④结构性消失；
+    ②user_prompt 里重入 call() 仍是禁手——单消费者队列自套死锁。
     """
 
     def __init__(
@@ -885,39 +907,161 @@ class MainProcessClient:
         self._rpc_id = 0
         self._user_prompt = user_prompt or _terminal_prompt
         self._on_event = on_event
+        # 并发三件套：id 分配锁（防撞号）/ 写锁（帧不许被两线程撕开）/
+        # future 登记（读线程配对响应、call 等待、close 唤醒，三方共用）。
+        self._id_lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._futures_lock = threading.Lock()
+        self._futures: dict[int, Future] = {}
+        self._queue: "queue.Queue[Optional[dict]]" = queue.Queue()
+        self._reader: Optional[threading.Thread] = None
+        self._notifier: Optional[threading.Thread] = None
+        self._closed = False
 
     def connect(self, sock: socket.socket) -> None:
+        if self._conn is not None:
+            raise RuntimeError("MainProcessClient 已连接，不要重复 connect")
         self._conn = RPCConnection(sock)
+        # 分派线程先起：读线程一开工就可能往队列里丢通知。
+        self._notifier = threading.Thread(target=self._dispatch_loop,
+                                          name="wywd-rpc-notifier", daemon=True)
+        self._reader = threading.Thread(target=self._reader_loop,
+                                        name="wywd-rpc-reader", daemon=True)
+        self._notifier.start()
+        self._reader.start()
 
-    def call(self, method: str, params: Optional[dict] = None) -> dict:
-        """发一个 JSON-RPC 请求并等它 id 配对的响应（阻塞；分派环消费审批/事件）。"""
-        self._rpc_id += 1
-        req_id = self._rpc_id
+    def call(self, method: str, params: Optional[dict] = None,
+             timeout: Optional[float] = None) -> dict:
+        """发一个 JSON-RPC 请求并等它 id 配对的响应。
+
+        多线程安全（可并发 call）。timeout（秒）到点抛 TimeoutError：
+        future 从登记表摘除，晚到的响应被读线程按未知 id 丢弃——调用方
+        放弃了这次配对，就不能让迟到的结果再灌给谁。
+        """
+        if self._conn is None:
+            raise ConnectionClosed("客户端未连接（先 connect）")
+        if self._closed:
+            raise ConnectionClosed("sidecar 连接中断")
+        with self._id_lock:
+            self._rpc_id += 1
+            req_id = self._rpc_id
+        future: Future = Future()
+        with self._futures_lock:
+            self._futures[req_id] = future
         try:
-            self._conn.send_message({"jsonrpc":"2.0","method":method,
-                "params":params or {}, "id":req_id})
+            self._send({"jsonrpc": "2.0", "method": method,
+                        "params": params or {}, "id": req_id})
         except OSError:
             # 对端已关闭：sendall 也会抛（WinError 10038），一样诚实失败。
+            with self._futures_lock:
+                self._futures.pop(req_id, None)
             raise ConnectionClosed("sidecar 连接中断") from None
-        while True:
-            try: msg = self._conn.recv_message()
-            except OSError: raise ConnectionClosed("sidecar 连接中断") from None
-            if msg is None: raise ConnectionClosed("sidecar 进程已退出")
-            if "method" in msg:                  # 请求/通知：就地消费
-                if msg["method"]=="approval/request":
-                    p = msg.get("params") or {}
-                    ok = self._user_prompt(p.get("rule_id",""), p.get("reason",""))
-                    self._conn.send_message({"jsonrpc":"2.0",
-                        "method":"approval/response",
-                        "params":{"request_id":p.get("request_id"),"approved":ok},
-                        "id":None})
-                elif msg["method"]=="event" and self._on_event:
-                    self._on_event(msg.get("params") or {})
-                continue                         # 不是我的答案，继续等
-            if msg.get("id") == req_id:          # 无 method 且 id 匹配 → 我的响应
-                return msg
+        try:
+            return future.result(timeout)
+        except TimeoutError:
+            with self._futures_lock:
+                self._futures.pop(req_id, None)
+            raise
 
+    def _send(self, msg: dict) -> None:
+        """线程安全的写。call 的请求线程与审批回执的分派线程都会写 socket：
+        newline-delimited 的帧必须一气呵成，不许被两个线程撕成两半。"""
+
+        with self._send_lock:
+            self._conn.send_message(msg)
+
+    def _reader_loop(self) -> None:
+        """唯一 recv 的线程：响应按 id 配对给 future，通知丢进分派队列。
+
+        它阻塞 = 全体 call 挂死，所以最外层还有一道兜底：任何没料到的
+        异常都要把挂起的 call 全部唤醒（诚实失败），而不是悄悄死掉。
+        """
+        try:
+            while True:
+                try:
+                    msg = self._conn.recv_message()
+                except OSError:
+                    self._fail_pending(ConnectionClosed("sidecar 连接中断"))
+                    return
+                if msg is None:
+                    self._fail_pending(ConnectionClosed("sidecar 进程已退出"))
+                    return
+                if "method" in msg:
+                    # 通知：丢给分派线程。读线程绝不自己处理——处理可能
+                    # 阻塞（审批要等人点头），堵在这里 = 所有响应挨饿。
+                    self._queue.put(msg)
+                else:
+                    with self._futures_lock:
+                        future = self._futures.pop(msg.get("id"), None)
+                    if future is not None:
+                        future.set_result(msg)
+                    # 没有配对对象的响应（超时被弃 / close 后晚到）→ 静默丢弃
+        except Exception as exc:
+            self._fail_pending(ConnectionClosed(f"读线程异常退出：{exc!r}"))
+
+    def _dispatch_loop(self) -> None:
+        """通知的单消费者：FIFO 保事件顺序，审批阻塞不外溢。"""
+        while True:
+            msg = self._queue.get()
+            if msg is None:            # close() 的收尾哨兵
+                return
+            try:
+                self._handle_notification(msg)
+            except Exception as exc:
+                # 通知处理失败不影响 RPC 主流程：喊一声，继续下一个。
+                print(f"[rpc] 通知处理失败：{exc}")
+
+    def _handle_notification(self, msg: dict) -> None:
+        method = msg.get("method", "")
+        if method == "approval/request":
+            p = msg.get("params") or {}
+            try:
+                ok = bool(self._user_prompt(p.get("rule_id", ""),
+                                            p.get("reason", "")))
+            except Exception as exc:
+                # approver（UI 那侧）坏了 = 没人批准 → fail-closed 拒绝：
+                # sidecar 会回灌 permission_blocked，循环照常走。
+                print(f"[rpc] approver 抛异常，按拒绝处理：{exc}")
+                ok = False
+            self._send({"jsonrpc": "2.0", "method": "approval/response",
+                        "params": {"request_id": p.get("request_id"),
+                                   "approved": ok},
+                        "id": None})
+        elif method == "event" and self._on_event:
+            self._on_event(msg.get("params") or {})
+
+    def _fail_pending(self, exc: Exception) -> None:
+        """把所有挂着的 call 唤醒并如实失败——close/断连时没人该被挂死。
+
+        在 _futures_lock 下"取走全部 + 清空"，两个退出路径（close 与读
+        线程自己的收尾）谁先到谁清账，后到的拿到空表，天然幂等。
+        """
+        with self._futures_lock:
+            pending = list(self._futures.values())
+            self._futures.clear()
+        for future in pending:
+            try:
+                future.set_exception(exc)
+            except Exception:
+                pass   # 极端竞态下已 done——收尾逻辑不许再炸
 
     def close(self) -> None:
-        if self._conn:
-            self._conn.close()
+        """干净收尾（幂等）：关 socket → 叫醒分派线程 → 失败所有挂起 call。
+
+        先 fail_pending 再 join 读线程：等响应的人不该陪收尾排队。读线程
+        自己的退出路径也会 fail_pending——与这里是同一个幂等路径。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._conn is not None:
+            try:
+                self._conn.close()   # EOF：读线程 recv 返回 None / OSError
+            except OSError:
+                pass
+        self._queue.put(None)        # 分派线程的收尾哨兵
+        self._fail_pending(ConnectionClosed("sidecar 连接中断"))
+        if self._notifier is not None:
+            self._notifier.join(timeout=2)
+        if self._reader is not None:
+            self._reader.join(timeout=2)

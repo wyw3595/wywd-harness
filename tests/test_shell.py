@@ -29,7 +29,10 @@ class FakeClient:
     def connect(self, sock) -> None:
         sock.close()
 
-    def call(self, method: str, params: dict | None = None) -> dict:
+    def call(self, method: str, params: dict | None = None,
+             timeout: float | None = None) -> dict:
+        # timeout（2026-09-26）是 stop() 礼貌 shutdown 的参数：假 client
+        # 忽略它（立刻回），真 client 用它给 future.result 上闹钟。
         self._id += 1
         self.calls.append((method, params))
         # 真 sidecar 内部异常走 handle_connection 兜底，回的是 error 响应
@@ -48,6 +51,9 @@ class FakeClient:
                 "sessionId": (params or {}).get("sessionId"), "generation": 2}
         elif method == "session/forget":
             result = {"status": "ok"}
+        elif method == "agent/send":
+            result = {"output": f"echo:{(params or {}).get('message', '')}",
+                      "status": "completed"}
         else:
             result = {}
         return {"jsonrpc": "2.0", "result": result, "id": self._id}
@@ -153,11 +159,37 @@ class SidecarShellTests(unittest.TestCase):
         shell.stop()
         self.assertEqual(factory.proc.terminated, 1)
 
+    def test_stop_survives_shutdown_refusal(self) -> None:
+        """shutdown 排不进来（在途 turn）/ 连接已死：吞掉，EOF 兜底照常收尾。
+
+        2026-09-26 锁退役后的新语义：stop 不再看"有没有在途 call"——礼貌
+        shutdown 自带 2 秒超时，排不进来就超时/报错，finally 里 EOF 兜底
+        照旧把进程收干净。旧版 test_stop_skips_shutdown_when_call_in_flight
+        的前提（靠 _rpc_lock 判断在途）随锁一起退役。
+        """
+
+        class StuckClient(FakeClient):
+            def call(self, method, params=None, timeout=None):
+                if method == "sidecar/shutdown":
+                    raise TimeoutError("在途 turn 还没完，shutdown 排不进来")
+                return super().call(method, params)
+
+        client = StuckClient()
+        factory = FakeProcessFactory(alive=True)
+        shell = SidecarShell(
+            _client_factory=lambda **kw: client,
+            _process_factory=factory,
+        )
+        shell.start()
+        shell.stop()  # 不抛
+        self.assertTrue(client.closed)                 # EOF 兜底照常走
+        self.assertEqual(factory.proc.terminated, 1)   # 进程已被收掉
+
     def test_stop_tolerates_dead_sidecar(self) -> None:
         """client.call 抛 ConnectionClosed 时 stop 仍收尾不抛。"""
 
         class BoomClient(FakeClient):
-            def call(self, method, params=None):
+            def call(self, method, params=None, timeout=None):
                 if method == "sidecar/shutdown":
                     raise RuntimeError("connection closed")
                 return super().call(method, params)
@@ -172,21 +204,20 @@ class SidecarShellTests(unittest.TestCase):
         shell.stop()  # 不抛，仍收尾
         self.assertEqual(factory.proc.joined, 1)
 
-    def test_stop_skips_shutdown_when_call_in_flight(self) -> None:
-        """有在途 call（锁被占）时：跳过礼貌 shutdown，close() EOF 兜底。"""
+    def test_stop_is_idempotent_and_closes_client(self) -> None:
+        """正常路径：礼貌 shutdown 发出 + client 关闭；第二次 stop 是 no-op。"""
 
         shell, client, factory = self._make()
         shell.start()
-        # 测试线程占住锁，模拟"正在跑 agent/send"
-        shell._rpc_lock.acquire()
-        try:
-            shell.stop()
-        finally:
-            shell._rpc_lock.release()
-        methods = [m for m, _ in client.calls]
-        self.assertNotIn("sidecar/shutdown", methods)  # 跳过礼貌协议
-        self.assertTrue(client.closed)                 # EOF 兜底
-        self.assertEqual(factory.proc.terminated, 1)   # 进程已被收掉
+        shell.stop()
+        self.assertIn("sidecar/shutdown", [m for m, _ in client.calls])
+        self.assertTrue(client.closed)
+        # 假进程 join 后仍"活着"（只有 terminate 才改状态）→ 走 terminate 收尾
+        self.assertEqual(factory.proc.terminated, 1)
+        shell.stop()                       # 幂等：第二次是 no-op
+        self.assertEqual(factory.proc.terminated, 1)   # 没有再次收尾
+        shutdowns = [m for m, _ in client.calls if m == "sidecar/shutdown"]
+        self.assertEqual(len(shutdowns), 1)
 
     def test_clear_closes_forgets_then_creates(self) -> None:
         """s07-b：/clear 编舞从 destroy→create 升级为 close→forget→create。"""
@@ -303,40 +334,39 @@ class SidecarShellTests(unittest.TestCase):
             shell.new_session()
         self.assertIn("磁盘满了", str(ctx.exception))
 
-    def test_send_serialized_under_concurrency(self) -> None:
-        """双线程 send：锁保证同一时刻最多一个 call 在途（坑 2 的锁）。"""
+    def test_send_allows_concurrent_calls(self) -> None:
+        """双线程 send 各自拿到自己的结果（2026-09-26 新语义）。
+
+        旧版这里钉的是"锁保证串行"（坑 2 的锁）；锁退役后钉反过来那条：
+        **并发调用是允许的且安全的**——这是"一轮 turn 不再堵死其他 RPC"
+        在壳层的落点。串行化职责上移进了 MainProcessClient（读线程按 id
+        配对响应），壳层不再需要任何锁。
+        """
 
         shell, client, _ = self._make()
         shell.start()
-        client.calls.clear()
 
-        depth = {"max": 0, "now": 0}
-        depth_lock = threading.Lock()
+        outcomes: dict[str, dict] = {}
+
+        def worker(key: str, message: str) -> None:
+            outcomes[key] = shell.send_to("sess_x", message)
 
         orig_call = client.call
 
-        def counting_call(method, params=None):
-            with depth_lock:
-                depth["now"] += 1
-                depth["max"] = max(depth["max"], depth["now"])
-            time.sleep(0.01)  # 放大并发窗口
-            result = orig_call(method, params)
-            with depth_lock:
-                depth["now"] -= 1
-            return result
+        def slow_call(method, params=None, timeout=None):
+            time.sleep(0.02)   # 放大并发窗口（不串台的前提是 id 配对）
+            return orig_call(method, params)
 
-        client.call = counting_call
+        client.call = slow_call
 
-        def worker() -> None:
-            for _ in range(5):
-                shell.send("x")
-
-        threads = [threading.Thread(target=worker) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.assertEqual(depth["max"], 1)  # 锁生效：从不并发
+        t1 = threading.Thread(target=worker, args=("a", "甲"))
+        t2 = threading.Thread(target=worker, args=("b", "乙"))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        self.assertEqual(outcomes["a"]["output"], "echo:甲")
+        self.assertEqual(outcomes["b"]["output"], "echo:乙")
 
 
 if __name__ == "__main__":
