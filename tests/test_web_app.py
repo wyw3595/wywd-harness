@@ -982,14 +982,12 @@ class ShellReviveTests(unittest.TestCase):
         self.assertIs(app.shell, shell)
 
     def test_revive_does_not_restore_workspace_at_web_layer(self) -> None:
-        """换代**不再**在 web 层恢复工作区（2026-09-23 会话级化后的新契约）。
+        """换代**不在 web 层碰工作区**（2026-09-23 会话级化后的契约）。
 
-        旧契约（2026-09-17 事故的修复）：工作区是**进程级**状态，sidecar
-        换代后必须设回去，否则工具静默换根。会话级化之后这条不再需要——
-        目录跟着**会话记录**走（cwd 进 record），sidecar 在 resume 时按它
-        重建运行时，web 层恢复机制退役（_restore_workspace 只剩空壳）。
-        这里钉的是新契约：换代不碰新壳的工作区，恢复职责完全在 sidecar
-        那一侧（test_sidecar 的会话级工作区测试负责）。
+        曾经有一段"记根 + 换代设回"的实现，服务 2026-09-17"sidecar 换代
+        后工具静默换根"的事故；会话级化后目录跟着会话记录走（sidecar 在
+        resume 时按 cwd 重建运行时），web 层恢复机制连同测试一起退役
+        （2026-09-26 清理）。这条钉的是新契约：换代只换壳，工作区零操作。
         """
 
         made: list = []
@@ -1003,40 +1001,11 @@ class ShellReviveTests(unittest.TestCase):
         app = self._app(first, factory)
 
         app.set_workspace("open", "D:/some/java-project", sid="sess_0001")
-        self.assertEqual(app._workspace_root, "D:/some/java-project")
-
         first.stop()                      # sidecar 死了
         self.assertTrue(app.revive_shell())
 
         self.assertIs(app.shell, made[-1])          # 确实换了新壳
-        self.assertEqual(app.shell.ops, [])         # 且 web 层不再替它设工作区
-
-    def test_reset_clears_the_workspace_memory(self) -> None:
-        """用户主动复位（回默认工作区）之后，_workspace_root 记忆要清掉。
-
-        复位是明确的意图表达。哪怕将来某层再引入"恢复"逻辑，也不该把
-        用户刚复位掉的目录又带回去。
-        """
-
-        made: list = []
-
-        def factory() -> FakeRevivableShell:
-            shell = FakeRevivableShell(alive=False)
-            made.append(shell)
-            return shell
-
-        first = factory()
-        app = self._app(first, factory)
-
-        app.set_workspace("open", "D:/some/java-project", sid="sess_0001")
-        app.set_workspace("reset", sid="sess_0001")
-        self.assertEqual(app._workspace_root, "")
-
-        first.stop()
-        app.revive_shell()
-
-        self.assertNotIn(("set_workspace", "dir:D:/some/java-project"),
-                         app.shell.ops)
+        self.assertEqual(app.shell.ops, [])         # 且 web 层不碰新壳的工作区
 
 
 if __name__ == "__main__":
