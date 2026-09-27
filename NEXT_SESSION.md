@@ -2463,9 +2463,22 @@ old_string 里的错误缩进原样写进文件**（本次把 `finally:` 从 8 �
 不能只看"编辑成功"——上一窗口"改动与意图不符立即停"的纪律在 AI
 工具时代照样成立，只是"改错了"的表现形式变了。
 
-## 五、下一步（第 3 步：契约适配，本次已获用户确认动手）
+## 五、并发第 3 步：契约适配（505a5b5，同日续，已提交）
 
-POST messages 返回 202 提交即返回（测试留同步模式）；前端 posting
-改由 SSE turn_start/turn_end 驱动；notice 改从事件来（修"结局不落盘
-F5 就丢"）。事件载荷带 sessionId 服务端已就绪。
+POST messages 默认 **202** 提交即返回（WYWD_SYNC_SEND=1 留同步模式给
+HTTP 测试）；前端 posting 改由 SSE 的 turn_end 驱动（handleTurnEnd 收
+尾三件套：落旗 → 重拉历史 → 刷清单/成本表）；**中途事件盖 sessionId
+章**（round_start/tool_start 这些原来不带会话信息，多 tab 分流的前提）；
+notice 改从事件来——打开会话时按 sessionId 从事件环重建最近一轮结局
+（修"结局不落盘 F5 就丢"，环转出去是已知边界）。壳层补 submit_to +
+断连合成 failed turn_end（submit_to 没人等 entry，前端收尾全靠这条）。
+
+冒烟：curl 验 202 + 事件环全帧带 sessionId；浏览器真 UI 全链路（发
+消息 → 懒建 → 直播轨迹 → 历史落账 → 成本表刷新 → F5 恢复）。两个
+记录在案的事实：FakeModel 恒为 completed，restoreNotice 的非
+completed 分支靠代码审查覆盖；shell.new_session 本来就是"关旧开新"
+（冒烟时看到旧会话变 closed 不是 bug）。
+
+**并发改造三步全部完成**。剩余：push（本地领先远端 12+ 提交，等用户
+发话）；偶发 flake 条目仍有效（未再现）。
 
