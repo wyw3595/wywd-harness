@@ -2411,3 +2411,61 @@ deprecation 提示去装它——httpx 本体就能跑（那条 warning 是噪�
 3. 偶发 flake：一次全量出现过 failures=1 未抓到名字，连跑三次未再现，
    下次碰到先记名字。
 4. push：本地领先远端 8+ 提交，等用户发话。
+
+---
+
+# 2026-09-27 补记：并发第 2 步——服务端 turn 后台化（1358837）
+
+## 一、接手核实（"以上下文里自己跑出来的结果为准"）
+
+工作区 4 文件（sidecar/shell/两个测试）的 diff 与交接描述一致，全量
+**631 条一次全绿**——上窗口"测试卡死"的现场已经修掉了。审阅顺手修两处
+注释与新代码的矛盾：`_make_turn_runner` docstring 还在说
+`_last_turn_status` 记账 + "单循环是硬边界"（属性已换 `_turn_ctx`、
+边界已不存在）；`send_to` docstring 的"web_app（C 方案）用"被误改成
+残缺的"web 侧）用"。
+
+## 二、补三条测试（TurnBackgroundingTests），打法上的坑
+
+- **自定义工具必须经 runtime_builder 进会话级 registry**：会话的
+  registry 由"一个会话一个目录"的工厂现造，进程级 registry 管不到
+  会话里的 turn；policy 要 `build_default_policy(safe_tools=(...))`
+  放行（未知工具落 default.deny），否则测时序变成测审批。
+- **剧本条数要按"总工具调用次数"给**：N 个 turn 各做 1 次工具调用 =
+  N 条 tool_calls + 1 条 final。只给 1 条的话第二个 turn 直接拿到
+  final、根本不碰 Barrier，第一个 turn 独自等到超时——表现为"只等
+  到 1 个 turn_end"的 5 秒假阴（本次实测踩中）。
+- **直调 handler 时 turnId 默认空串**：不传的话"sidecar 原样回传
+  turnId"的断言是空对空的假断言——测试里显式传 `"turnId": "t-1"`
+  才钉得住契约。
+- ToolCall 的第一参数是 call_id（`ToolCall("c1", "slowpoke", {})`），
+  只给 name/arguments 直接 TypeError。
+
+## 三、冒烟（无 DEEPSEEK_API_KEY，FakeModel）
+
+send 返回 `{"output","status","usage"}` 契约不变；SSE 抓到完整事件流
+`turn_start`（**sessionId + 壳生成的 turnId** 都在）→ round_start →
+model_reply → `turn_end`（status/output/usage）——第 3 步"前端按
+sessionId 分流"的服务端前提已就绪。两个环境坑：
+
+- **Git Bash 的 `&` 后台进程能活过工具调用边界**：stdout 进缓冲后
+  日志文件看着是空的，像死了；再起一个就 10048 端口占用。起服务用
+  工具的正经后台模式，判活用 curl 打端点别看日志。
+- **Windows curl 命令行传 UTF-8 中文 body 会被码页毁掉**（服务端
+  `_json_body` 解析失败给 `{}`，走"空消息"人话分支）——body 写进
+  临时文件 `--data-binary @file` 才稳。
+
+## 四、工具教训（本次实测）
+
+**Edit 工具的 old_string 缩进打错时仍会"模糊匹配成功"，并把
+old_string 里的错误缩进原样写进文件**（本次把 `finally:` 从 8 空格
+写成 12 空格，语法错误）。对策：编辑后必须 git diff 或读回边界自查，
+不能只看"编辑成功"——上一窗口"改动与意图不符立即停"的纪律在 AI
+工具时代照样成立，只是"改错了"的表现形式变了。
+
+## 五、下一步（第 3 步：契约适配，本次已获用户确认动手）
+
+POST messages 返回 202 提交即返回（测试留同步模式）；前端 posting
+改由 SSE turn_start/turn_end 驱动；notice 改从事件来（修"结局不落盘
+F5 就丢"）。事件载荷带 sessionId 服务端已就绪。
+
