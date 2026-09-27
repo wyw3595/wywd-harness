@@ -603,6 +603,21 @@ class SidecarServerTests(unittest.TestCase):
             self.assertEqual(after["root"], target)
         conn.close()
 
+    def test_default_session_cwd_is_assembly_decided(self) -> None:
+        """新建会话不传 cwd 的落点由装配层决定（2026-09-27）。
+
+        web 装配传 .sandbox 沙箱——"新建会话默认在项目根里干活"退役；
+        构造器默认 "." 保持老装配（测试 / 终端）行为不变。
+        """
+
+        with tempfile.TemporaryDirectory() as sandbox:
+            server = SidecarServer(model=None, registry=ToolRegistry(),
+                                   policy=build_default_policy(),
+                                   default_session_cwd=sandbox)
+            sid = server._handle_session_create({})["sessionId"]
+            record = server._manager.store.load(sid)
+            self.assertEqual(record.cwd, str(Path(sandbox).resolve()))
+
     def test_workspace_set_translates_builder_error(self) -> None:
         """装配层的 ValueError 翻成人话进 {"error"}——RPC 唯一错误通道。"""
 

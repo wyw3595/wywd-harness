@@ -235,7 +235,7 @@ class SidecarShellTests(unittest.TestCase):
             client.calls[-3:],
             [("session/close", {"sessionId": "sess_2"}),
              ("session/forget", {"sessionId": "sess_2"}),
-             ("session/create", {"cwd": ".", "mode": "craft"})],
+             ("session/create", {"mode": "craft"})],
         )
         self.assertEqual(new_sid, "sess_5")
         self.assertEqual(shell.session_id, "sess_5")

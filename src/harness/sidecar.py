@@ -250,6 +250,7 @@ class SidecarServer:
         store: Optional[SessionStore] = None,
         runtime_builder: Optional[WorkspaceRuntimeBuilder] = None,
         initial_workspace: Optional[dict] = None,
+        default_session_cwd: str = ".",
         idle_timeout: float = 0.0,
         sweep_interval: float = 60.0,
         externalize: Optional[Callable[[str, str], str]] = None,
@@ -267,6 +268,10 @@ class SidecarServer:
         self._initial_policy = policy
         self._initial_workspace_info: dict = dict(initial_workspace
                                                  or {"kind": "default"})
+        # 新建会话不传 cwd 时的落点（2026-09-27）：装配层传什么就是什么
+        # （web 装配传 .sandbox 沙箱——"默认就在项目根里干活"退役）。
+        # 默认值 "." 保持老装配（测试 / 终端）行为不变。
+        self._default_session_cwd = default_session_cwd
         # s11：工作区工厂（None = 这个 sidecar 不支持换沙箱，老装配零感知）。
         # 默认 info 说明"我跑在启动时那套边界上"，UI 拿它显示"项目根"。
         self._runtime_builder = runtime_builder
@@ -764,9 +769,12 @@ class SidecarServer:
         起步历史写进两个副本——live runtime 的工作副本（run_turn 从它
         拿历史）和 store 存档（resume 从它拿历史）；只写一个 = 另一条路
         丢 system 提示（两个副本是 deepcopy 防串账的代价）。
+
+        不传 cwd 时的默认落点由装配层决定（self._default_session_cwd，
+        web 装配传 .sandbox 沙箱）——"新建会话默认在项目根里干活"退役。
         """
         sid = self._manager.create_session(
-            cwd=params.get("cwd", "."),
+            cwd=params.get("cwd", self._default_session_cwd),
             mode=params.get("mode", "craft"),
             title=params.get("title", "未命名会话"))
         runtime = self._manager.get_session(sid)

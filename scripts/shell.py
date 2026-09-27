@@ -47,12 +47,9 @@ if _PROJECT_ROOT not in _env_paths:
 
 from scripts.electron_shell import choose_model
 from scripts.toolbox import (
-    DEFAULT_WORKSPACE,
     build_history_seed,
     build_model_router,
-    build_policy,
     build_policy_for,
-    build_registry,
     build_registry_for,
     build_skill_index,
     build_user_memory,
@@ -165,14 +162,24 @@ def _sidecar_process(sock: socket.socket) -> None:
     # 不用再学一遍。注意它**不随工作区变**：artifact 是 sidecar 的运行
     # 产物（谁跑的就归谁），不是被处理目录里的文件。
     artifacts = ArtifactStore(Path(_PROJECT_ROOT) / ".sessions" / "artifacts")
+    # 默认沙箱（2026-09-27）：新会话不再默认项目根本体——agent 的文件
+    # 操作全部圈在 <项目根>/.sandbox 里，项目源码从"默认可见"变成"必须
+    # 显式授权（workspace/set）"。三处一起换，复位路径才不说两家话：
+    # 启动 registry/policy（workspace/set kind=default 的复位终点）、
+    # initial_workspace（UI 显示的"默认"）、default_session_cwd（新建
+    # 会话不传 cwd 时落哪儿）。老会话的 record.cwd 原样保留；终端 chat
+    # 的 build_registry() 老入口暂不跟随。
+    default_workspace = Workspace(
+        workspace_id="default", root=Path(_PROJECT_ROOT) / ".sandbox")
+    default_workspace.root.mkdir(parents=True, exist_ok=True)
     # s16 技能索引：**建一次、两处共用**——目录（进 seed）与正文（按需展开）
     # 必须是同一份视图，否则"列出来的"和"能加载的"可能对不上。
     # 代价：运行中新增/修改技能不会被察觉（要重启服务，或手动 reload()）。
     skills = build_skill_index()
     server = SidecarServer(
         model=build_model_router(),
-        registry=build_registry(),
-        policy=build_policy(),
+        registry=build_registry_for(default_workspace),
+        policy=build_policy_for(default_workspace),
         # s10：工具目录 + 工作区记忆（空记忆时与旧行为一致）。
         # s11：用户记忆（跨项目）。s16：技能**目录**（正文按需展开）。
         history_seed=lambda: build_history_seed(
@@ -181,7 +188,8 @@ def _sidecar_process(sock: socket.socket) -> None:
             skill_index=skills),
         store=JsonlSessionStore(root=Path(_PROJECT_ROOT) / ".sessions"),
         runtime_builder=_workspace_runtime,   # s11：上传目录 / 换沙箱
-        initial_workspace={"kind": "default", "root": str(DEFAULT_WORKSPACE.root)},
+        initial_workspace={"kind": "default", "root": str(default_workspace.root)},
+        default_session_cwd=str(default_workspace.root),  # 新会话默认落 .sandbox
         idle_timeout=_idle_reap_seconds(),    # s12：空闲回收（默认关）
         max_steps=max_steps,                  # 单轮步数上限（默认 30）
         externalize=artifacts.externalize,    # s13：超阈值工具输出外化
@@ -203,13 +211,17 @@ class SidecarShell:
         self,
         user_prompt: Optional[Callable[[str, str], bool]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
-        cwd: str = ".",
+        cwd: Optional[str] = None,
         *,
         _client_factory: Any = None,
         _process_factory: Any = None,
     ) -> None:
         self._user_prompt = user_prompt
         self._on_event = on_event            # 外部回调（web 的 ring / 终端 print）
+        # cwd=None（默认）= 新会话的落点由 sidecar 装配层决定（web 装配
+        # 传 .sandbox 沙箱）；显式传了就原样带给 sidecar——特殊入口需要
+        # 钉死落点时用。此前壳把"自己的 cwd"（项目根）硬塞给每个新会话，
+        # "默认就在项目根里干活"就是从这里来的。
         self._cwd = cwd
         # turn 结局等待表（并发第 2 步：agent/send 提交即返回）——
         # turnId（壳生成、随请求带给 sidecar 原样回传）→ {event, result}。
@@ -554,8 +566,10 @@ class SidecarShell:
         翻译成 {"ok": False, "detail": …} 摆到用户面前。
         """
 
-        data = self._result(self._client.call("session/create",
-            {"cwd": self._cwd, "mode": "craft"}))
+        params: dict = {"mode": "craft"}
+        if self._cwd:
+            params["cwd"] = self._cwd
+        data = self._result(self._client.call("session/create", params))
         if "error" in data or not data.get("sessionId"):
             raise RuntimeError(data.get("error") or "sidecar 没给出新会话 id")
         return data["sessionId"]

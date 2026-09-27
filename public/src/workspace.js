@@ -50,17 +50,17 @@ export const WorkspacePanel = {
       if (workspace.error) return workspace.error;
       const ws = workspace.info;
       if (!ws) return "—";
-      if (ws.kind === "default") return "默认：项目根";
+      if (ws.kind === "default") return "默认：.sandbox 沙箱";
       if (ws.kind === "dir") return "目录：" + (ws.id || lastSegment(ws.root));
       return "上传：" + (ws.id || "");
     });
 
-    /** 默认工作区可能不回传 root——那就写"项目根"，别留一段空白让人以为
+    /** 默认工作区可能不回传 root——那就写".sandbox"，别留一段空白让人以为
         没读到（vanilla 版踩过这个）。 */
     const pathText = computed(() => {
       const ws = workspace.info;
       if (!ws) return "";
-      return ws.root || (ws.kind === "default" ? "项目根" : "");
+      return ws.root || (ws.kind === "default" ? ".sandbox" : "");
     });
 
     /** 忙的时候这一行显示进度短语（"切换中…"），而不是把上半句留着
@@ -114,7 +114,7 @@ export const WorkspacePanel = {
                 @click="byPath">&#36755;</button>
         <button v-if="!isDefault" type="button" class="icon-btn"
                 :disabled="!!workspace.busy"
-                title="回到默认工作区（项目根）" aria-label="回到默认工作区"
+                title="回到默认工作区（.sandbox 沙箱）" aria-label="回到默认工作区"
                 @click="reset">&#22238;</button>
         <button type="button" class="icon-btn" :disabled="!!workspace.busy"
                 title="重新读一次工作区" aria-label="刷新工作区"

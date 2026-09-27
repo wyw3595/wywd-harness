@@ -46,6 +46,10 @@ learn-workbuddy/
 # s09 会话证据文件：运行时持久化数据（每会话一个 .jsonl），本地数据不进仓库
 .sessions/
 
+# 默认沙箱（2026-09-27）：新会话的工作区默认落这里，agent 的文件操作
+# 圈在这以内——运行时数据，不进仓库
+.sandbox/
+
 # s10 工作区记忆：daily 日志 / curated.json / MEMORY.md 都是本地运行数据
 .memory/
 
