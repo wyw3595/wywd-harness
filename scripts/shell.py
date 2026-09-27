@@ -335,7 +335,8 @@ class SidecarShell:
         """
 
         turn_id = str(uuid.uuid4())
-        entry: dict = {"event": threading.Event(), "result": None}
+        entry: dict = {"event": threading.Event(), "result": None,
+                       "sessionId": session_id}
         with self._turn_lock:
             self._pending_turns[turn_id] = entry
         resp = self._result(self._client.call("agent/send",
@@ -374,15 +375,55 @@ class SidecarShell:
             self._on_event(data)
 
     def _fail_pending_turns(self) -> None:
-        """连接断了/关了：所有等 turn 结局的 send_to 立刻拿诚实错误，
-        不陪一个已经不存在的 sidecar 挂死。"""
+        """连接断了/关了：所有在途 turn 诚实收场，不陪一个已经不存在的
+        sidecar 挂死。
+
+        两类等待者都要喂：
+        - send_to（同步模式）在 entry["event"] 上等——塞错误结果叫醒；
+        - submit_to（202 提交即返回，第 3 步）**没人等 entry**，靠
+          turn_end 事件收尾——补发一条合成的 turn_end（status=failed）
+          进事件管道，前端才能把 posting 旗放下来。entry 存了 sid，
+          合成事件才带得上 sessionId（前端按它分流）。
+        """
 
         with self._turn_lock:
-            pending = list(self._pending_turns.values())
+            pending = list(self._pending_turns.items())
             self._pending_turns.clear()
-        for entry in pending:
+        for turn_id, entry in pending:
             entry["result"] = {"error": "sidecar 连接中断"}
             entry["event"].set()
+            self._pipe_event({"event": "turn_end",
+                              "sessionId": entry.get("sessionId", ""),
+                              "turnId": turn_id, "status": "failed",
+                              "output": "", "usage": {},
+                              "error": "sidecar 连接中断"})
+
+    def submit_to(self, session_id: str, message: str) -> dict:
+        """提交一轮但**不等结局**（并发第 3 步：web 的 202 契约）。
+
+        和 send_to 同一条登记/提交流水线，只是不站在 entry["event"] 上
+        等——结局由 turn_end 事件送达（前端从 SSE 拿）。返回
+        {"sessionId","status":"started","turnId"}；提交被拒（closed/正在
+        跑）返回 {"error"}，之后不会有事件；对端是旧版同步 sidecar 时
+        原样返回结果（含 output），调用方自行按同步语义处理。
+        """
+
+        turn_id = str(uuid.uuid4())
+        entry: dict = {"event": threading.Event(), "result": None,
+                       "sessionId": session_id}
+        with self._turn_lock:
+            self._pending_turns[turn_id] = entry
+        resp = self._result(self._client.call("agent/send",
+            {"sessionId": session_id, "message": message,
+             "turnId": turn_id}))
+        if "error" in resp or resp.get("status") != "started":
+            # 提交被拒（不会有 turn_end）或对端是旧版同步语义（结局已在
+            # resp 里）：等待条目都没用了，摘掉。
+            with self._turn_lock:
+                self._pending_turns.pop(turn_id, None)
+            return resp
+        return {"sessionId": session_id, "status": "started",
+                "turnId": turn_id}
 
     def send(self, message: str) -> dict:
         """发给自己当前会话（懒建：还没有会话就现开一个）。

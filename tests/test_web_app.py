@@ -44,6 +44,7 @@ class FakeShell:
         self.session_id = sid
         self._rows = rows
         self.sent: list[tuple[str, str]] = []
+        self.submitted: list[tuple[str, str]] = []
         self.ops: list[tuple[str, str]] = []
         self.zip_existed: bool | None = None   # set_workspace 那刻 zip 在不在盘上
 
@@ -73,6 +74,13 @@ class FakeShell:
         self.sent.append((sid, message))
         return {"output": f"echo:{message}", "status": "completed",
                 "usage": {"prompt_tokens": 11, "completion_tokens": 7}}
+
+    def submit_to(self, sid: str, message: str) -> dict:
+        """202 契约（并发第 3 步）：提交即回 started + turnId，不等结局。"""
+
+        self.submitted.append((sid, message))
+        return {"sessionId": sid, "status": "started",
+                "turnId": f"turn-{len(self.submitted)}"}
 
     def status(self) -> dict:
         return {"sessions": len(self._rows), "handlers": 6,
@@ -192,9 +200,13 @@ class WebAppActionsTests(unittest.TestCase):
         self.assertEqual(status["modelCost"][0]["tier"], "craft")
 
     def test_send_passes_usage_through(self) -> None:
-        """每轮 token 账要能穿到前端——它是 sidecar 从接缝读出来的。"""
+        """每轮 token 账要能穿到前端——它是 sidecar 从接缝读出来的。
 
-        result = self.app.send("sess_0001", "你好")
+        （同步模式契约：默认已是 202 提交即返回，usage 随 turn_end 事件走。）
+        """
+
+        app = WebApp(shell=self.shell, sync_send=True)
+        result = app.send("sess_0001", "你好")
         self.assertEqual(result["usage"]["prompt_tokens"], 11)
         self.assertEqual(result["usage"]["completion_tokens"], 7)
 
@@ -506,16 +518,40 @@ class MessagesReadTests(unittest.TestCase):
 
 
 class SendTests(unittest.TestCase):
-    """发一轮：显式 sid 转发给壳。"""
+    """发一轮：显式 sid 转发给壳；两种契约各有各的钉法。"""
 
     def test_send_forwards_sid_and_text(self) -> None:
+        """同步模式（WYWD_SYNC_SEND=1）：send_to 等结局一起回。"""
+
         shell = FakeShell([])
-        app = WebApp(shell=shell)
+        app = WebApp(shell=shell, sync_send=True)
         result = app.send("sess_0003", "你好")
         self.assertEqual(result["output"], "echo:你好")
         self.assertEqual(shell.sent, [("sess_0003", "你好")])
+        self.assertEqual(shell.submitted, [])
 
     def test_send_blank_message_rejected(self) -> None:
+        app = WebApp(shell=FakeShell([]), sync_send=True)
+        self.assertIn("error", app.send("sess_0003", "   "))
+
+    def test_send_async_submits_and_returns_turn_id(self) -> None:
+        """默认契约（并发第 3 步）：提交即回 started + turnId，不等结局。
+
+        202 的意义：POST 的响应里**没有**结局——结局由 SSE 的 turn_end
+        事件送达（带 sessionId/turnId/status/output/usage）。所以这里
+        断言的是"受理"而不是"完成"。
+        """
+
+        shell = FakeShell([])
+        app = WebApp(shell=shell)
+        result = app.send("sess_0003", "你好")
+        self.assertEqual(result["status"], "started")
+        self.assertEqual(result["sessionId"], "sess_0003")
+        self.assertTrue(result["turnId"])
+        self.assertEqual(shell.submitted, [("sess_0003", "你好")])
+        self.assertEqual(shell.sent, [])     # 没走同步路
+
+    def test_send_blank_message_rejected_async_too(self) -> None:
         app = WebApp(shell=FakeShell([]))
         self.assertIn("error", app.send("sess_0003", "   "))
 
@@ -874,6 +910,45 @@ class WorkspaceHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(self.shell.ops, [("set_workspace", "dir:D:/proj")])
+
+    def test_post_message_returns_202_when_submitted(self) -> None:
+        """HTTP 契约（并发第 3 步）：默认 202 受理，结局走 SSE 事件。
+
+        响应体只有受理回执（status/turnId/sessionId），**没有** output
+        ——那是 turn_end 事件的职责。
+        """
+
+        status, payload = self._post(
+            "/api/sessions/sess_0001/messages", {"message": "你好"})
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "started")
+        self.assertEqual(payload["sessionId"], "sess_0001")
+        self.assertTrue(payload["turnId"])
+        self.assertEqual(self.shell.submitted, [("sess_0001", "你好")])
+
+    def test_post_message_sync_mode_keeps_200_with_result(self) -> None:
+        """同步模式（WYWD_SYNC_SEND=1）保持老契约：200 + 完整结果。
+
+        TestClient 里收 SSE 长连很别扭——同步模式就是留给 HTTP 层测试
+        的这条退路。
+        """
+
+        app = WebApp(shell=self.shell, sync_send=True)
+        client = TestClient(create_app(app), base_url="http://127.0.0.1:8765")
+        resp = client.post("/api/sessions/sess_0001/messages",
+                           json={"message": "你好"},
+                           headers={"X-Wywd-Ui": "1"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["output"], "echo:你好")
+
+    def test_post_message_error_keeps_200(self) -> None:
+        """被拒（空消息/正在跑/closed）是人话错误，不是 5xx：200 + {"error"}。"""
+
+        status, payload = self._post(
+            "/api/sessions/sess_0001/messages", {"message": "   "})
+        self.assertEqual(status, 200)
+        self.assertIn("error", payload)
+        self.assertEqual(self.shell.submitted, [])
 
     def test_get_workspace(self) -> None:
         resp = self.client.get("/api/workspace")

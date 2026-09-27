@@ -931,6 +931,14 @@ class TurnBackgroundingTests(unittest.TestCase):
         starts = [e for e in events if e.get("event") == "turn_start"]
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0]["turnId"], first["turnId"])
+        # 中途事件也带 sessionId（并发第 3 步）：round_start/model_reply/
+        # tool_start/tool_end 由 turn_runner 盖章——前端按 sid 分流直播行
+        # 的前提（turn_start/turn_end 在 _run_turn_task 里就带了）。
+        mids = [e for e in events
+                if e.get("event") in ("round_start", "model_reply",
+                                      "tool_start", "tool_end")]
+        self.assertTrue(mids)
+        self.assertEqual({e.get("sessionId") for e in mids}, {sid})
 
     def test_close_mid_turn_reports_failed_and_discards_result(self) -> None:
         """turn 跑到一半 session/close：晚到结果拒收（transcript 不落账），

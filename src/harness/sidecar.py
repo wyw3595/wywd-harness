@@ -460,7 +460,7 @@ class SidecarServer:
 
         return model_summarizer(self._model)
 
-    def _make_turn_runner(self, registry=None, runner=None):
+    def _make_turn_runner(self, registry=None, runner=None, sid: str = ""):
         """造 turn_runner 闭包：session 层的执行入口 → 本文件的 run_agent。
 
         `registry` / `runner` 不传就用 sidecar 级那套（老装配：所有会话共享）；
@@ -490,13 +490,22 @@ class SidecarServer:
                 print(f"[sidecar] 上下文压缩：{report.render()}")
             # s16：命中触发词的技能正文在这里**按需展开**（目录早就在 system 里）。
             view = self._inject_skills(view, message)
+            # 事件盖 sessionId 章（并发第 3 步）：round_start/tool_start 这些
+            # 中途事件本来不带会话信息，多 tab 前端没法分流（按 sid 画直播行
+            # 的前提）。turn_runner 是**按会话**造的（_make_turn_runner_for
+            # 传 record.id），在这里盖章正合适。self._on_event 保持"调用那
+            # 一刻才读"（per-connection，s06 的装配顺序不能破坏）。
+            def _stamped(event: str, data: dict) -> None:
+                base = self._on_event
+                if base is not None:
+                    base(event, {**data, "sessionId": sid})
             result = run_agent(
                 message, model=self._model,
                 registry=registry if registry is not None else self._registry,
                 history=view,
                 max_steps=self._max_steps,
                 externalize=self._externalize,   # s13：超阈值输出换到磁盘
-                on_event=self._on_event,
+                on_event=_stamped if sid else self._on_event,
                 runner=runner if runner is not None else self._runner)
             # 记账走**线程本地**（第 2 步起 turn 在执行器线程跑，可能并行）：
             # 每个线程只看得到自己这轮的 status/usage，同线程的调用方
@@ -565,7 +574,8 @@ class SidecarServer:
             registry=registry,
             audit=AuditTrail(),
         )
-        return self._make_turn_runner(registry=registry, runner=runner)
+        return self._make_turn_runner(registry=registry, runner=runner,
+                                      sid=record.id)
 
     def _log(self, msg: str) -> None:
         """写进 RingBuffer（模拟生产侧捕获子进程 stdout/stderr）。"""

@@ -331,10 +331,19 @@ class WebApp:
 
     def __init__(self, shell: Any = None, store_root: Optional[str] = None,
                  approval_timeout: float = APPROVAL_TIMEOUT,
-                 shell_factory: Any = None) -> None:
+                 shell_factory: Any = None,
+                 sync_send: Optional[bool] = None) -> None:
         self.ring = EventRing()
         self.board = ApprovalBoard(self.ring, approval_timeout)
         self.store = JsonlSessionStore(store_root or SESSIONS_ROOT)
+        # 发送契约（并发第 3 步）：默认 202 提交即返回，结局由前端从 SSE
+        # 的 turn_end 事件拿。WYWD_SYNC_SEND=1 切回同步（POST 等结局一起
+        # 回）——留给 HTTP 层测试：TestClient 里收 SSE 长连很别扭，同步
+        # 模式让"发一轮 → 断言 output"的老打法原样可用。
+        if sync_send is None:
+            sync_send = (os.environ.get("WYWD_SYNC_SEND") or "").strip() \
+                in ("1", "true", "yes")
+        self.sync_send = sync_send
         # 收尾标志：SSE 是长连，每条约占一个线程。停服务时先竖旗、再
         # wake_all()，它们醒来看到旗就自己收摊。
         self.stopping = False
@@ -489,14 +498,24 @@ class WebApp:
             return {"error": str(exc)}
         return {"sessionId": session_id, "messages": record.messages}
 
-    # ── API：发一轮（同步等 turn 完成）────────────────────────
+    # ── API：发一轮（202 提交即返回；WYWD_SYNC_SEND=1 同步等结局）──
 
     def send(self, session_id: str, text: str) -> dict:
-        """发一轮：显式 sid 交给 shell.send_to；turn 内部异常翻译成人话。"""
+        """发一轮：显式 sid 交给壳；turn 内部异常翻译成人话。
+
+        默认（异步契约）：壳 submit_to 提交即回——{"status":"started",
+        "turnId"} 交给端点回 202，结局走 SSE 的 turn_end 事件（带
+        sessionId/turnId/status/output/usage）。被拒（closed/正在跑上一
+        轮）和空消息一样回 {"error"}，端点维持 200。
+        同步模式（WYWD_SYNC_SEND=1，测试用）：壳 send_to 等到结局一起回，
+        形状是老的 {"output","status","usage"}。
+        """
 
         if not text.strip():
             return {"error": "空消息，没东西可发"}
-        return self.shell.send_to(session_id, text)
+        if self.sync_send:
+            return self.shell.send_to(session_id, text)
+        return self.shell.submit_to(session_id, text)
 
     # ── API：事件轮询 / 审批回执 ─────────────────────────────
 
@@ -1007,7 +1026,12 @@ def create_app(web: Optional[WebApp] = None) -> FastAPI:
     @app.post("/api/sessions/{sid}/messages")
     def post_message(sid: str, payload: dict = Depends(_json_body),
                      web: WebApp = Depends(get_web)) -> JSONResponse:
-        return JSONResponse(web.send(sid, payload.get("message", "")))
+        # 202 = 已受理，结局走 SSE 的 turn_end（带 turnId/sessionId）；
+        # {"error"} / 同步模式的结果维持 200。前端按 status=="started"
+        # 分流——它不该猜状态码（api.js 一处封装，错误语义都走人话）。
+        result = web.send(sid, payload.get("message", ""))
+        code = 202 if result.get("status") == "started" else 200
+        return JSONResponse(result, status_code=code)
 
     @app.post("/api/approvals/{ticket}")
     def post_approval(ticket: str, payload: dict = Depends(_json_body),

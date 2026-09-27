@@ -26,6 +26,7 @@ class FakeClient:
         self._id = 0
         self.resume_result = None   # 测试可改罐头（resume 失败场景）
         self.error_for: dict[str, str] = {}   # method → 让它回 JSON-RPC error
+        self.send_result = None     # 测试可改 agent/send 罐头（started 语义）
 
     def connect(self, sock) -> None:
         sock.close()
@@ -53,8 +54,9 @@ class FakeClient:
         elif method == "session/forget":
             result = {"status": "ok"}
         elif method == "agent/send":
-            result = {"output": f"echo:{(params or {}).get('message', '')}",
-                      "status": "completed"}
+            result = self.send_result or {
+                "output": f"echo:{(params or {}).get('message', '')}",
+                "status": "completed"}
         else:
             result = {}
         return {"jsonrpc": "2.0", "result": result, "id": self._id}
@@ -371,6 +373,54 @@ class SidecarShellTests(unittest.TestCase):
         t2.join()
         self.assertEqual(outcomes["a"]["output"], "echo:甲")
         self.assertEqual(outcomes["b"]["output"], "echo:乙")
+
+    def test_submit_to_returns_started_without_waiting(self) -> None:
+        """202 契约（并发第 3 步）：提交即回 started + turnId，不等结局。
+
+        与 send_to 的分野就在"等不等"：submit_to 登记完、提交完就走人，
+        结局由 turn_end 事件送达（web 前端从 SSE 拿）。
+        """
+
+        shell, client, _ = self._make()
+        shell.start()
+        client.send_result = {"status": "started"}
+        events: list[dict] = []
+        shell._on_event = events.append
+
+        result = shell.submit_to("sess_2", "你好")
+        self.assertEqual(result["status"], "started")
+        self.assertEqual(result["sessionId"], "sess_2")
+        self.assertTrue(result["turnId"])
+        method, params = client.calls[-1]
+        self.assertEqual(method, "agent/send")
+        # turnId 壳生成、原样带给 sidecar——结局按它配对（防串台）
+        self.assertEqual(params["turnId"], result["turnId"])
+
+    def test_fail_pending_turns_synthesizes_failed_turn_end(self) -> None:
+        """断连收场（并发第 3 步）：submit_to 没人等 entry，靠合成事件收尾。
+
+        send_to 的等待者拿 entry 里的错误结果；submit_to 的调用方早走了，
+        只能靠 turn_end 事件把"这轮死了"告诉前端——合成事件必须带
+        sessionId + 壳的 turnId + status=failed。
+        """
+
+        shell, client, _ = self._make()
+        shell.start()
+        client.send_result = {"status": "started"}
+        events: list[dict] = []
+        shell._on_event = events.append
+
+        result = shell.submit_to("sess_9", "你好")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "turn_end"], [])
+
+        shell._fail_pending_turns()
+        ends = [e for e in events if e.get("event") == "turn_end"]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["sessionId"], "sess_9")
+        self.assertEqual(ends[0]["turnId"], result["turnId"])
+        self.assertEqual(ends[0]["status"], "failed")
+        self.assertIn("连接中断", ends[0]["error"])
 
 
 if __name__ == "__main__":

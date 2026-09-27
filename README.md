@@ -108,7 +108,9 @@ setx DEEPSEEK_API_KEY "sk-..."
 `WYWD_API_TOKEN`（设了则所有 /api POST 需带 x-wywd-token，给 curl/局域网用）、
 `WYWD_MODEL` / `WYWD_API_BASE`（换 OpenAI 兼容网关）、`WYWD_MAX_STEPS`（单轮步数，
 默认 60）、`WYWD_APPROVAL_TIMEOUT`（审批超时秒数，默认 60）、
-`WYWD_IDLE_REAP_SECONDS`（空闲回收，默认关）、`WYWD_DISABLE_BASH`（下架 bash）。
+`WYWD_IDLE_REAP_SECONDS`（空闲回收，默认关）、`WYWD_DISABLE_BASH`（下架 bash）、
+`WYWD_TURN_WORKERS`（并行 turn 上限，默认 2）、`WYWD_SYNC_SEND`（发消息切回
+"同步等结局"的老契约——POST messages 现在默认 202 提交即返回，结局走 SSE）。
 
 ## 测试与冒烟
 

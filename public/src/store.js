@@ -9,9 +9,11 @@
        state.messages 只是"当前视图正在显示的那一份"，切会话就整体换掉。
      - 直播：state.live 是纯瞬态——turn 开始清空、切会话清空，绝不落盘。
        历史永远以 messages API 为准（写进边界的教学取舍）。
-     - 通知：state.notice 是"这一轮的结局"（failed / max_steps），也不是
-       transcript 的一部分——status 没有落账，F5 后它就没了。这是已知边界，
-       要持久化得让 session 记录带上它（归后端那一步）。
+     - 通知：state.notice 是"这一轮的结局"（failed / max_steps），不是
+       transcript 的一部分——结局不落账。但事件环在**服务端内存**里跨 F5
+       活着，打开会话时按 sessionId 从环里把最近一轮的结局重建回来
+       （restoreNotice）；环转出去（500 条上限）就算了。真持久化得让
+       session 记录带上它（归后端那一步）。
 
    事件流：一条 app 级的 SSE 长连，替代了早先"发消息期间每 500ms 轮询
    /api/events"。游标由浏览器管（Last-Event-ID），断线重连也是内建的。
@@ -258,6 +260,35 @@ export async function openSession(sid) {
   } catch (err) {
     state.chatError = "拉取历史失败";
   }
+  await restoreNotice(sid);
+}
+
+/** 打开会话时从事件环重建"上一轮结局"（并发第 3 步）。
+
+    结局（failed / max_steps 的人话）不进 transcript，F5 后历史里没
+    痕迹、notice 也随页面没了——用户看到"问了一句，什么都没发生"。
+    修复：事件环在服务端内存里跨 F5 活着，最后一轮的 turn_end 还在环
+    里——按 sessionId 找最近一条，非 completed 就把 notice 立回去。
+    环转出去（500 条上限）就算了：notice 本就是补充材料（教学取舍）。
+*/
+async function restoreNotice(sid) {
+  let res;
+  try {
+    res = await api.fetchEvents();
+  } catch (err) {
+    return;                                   // 环拿不到就算了
+  }
+  const events = (res && res.events) || [];
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.event !== "turn_end" || e.sessionId !== sid) continue;
+    if (e.status && e.status !== "completed") {
+      state.notice = e.error
+        ? { level: "error", text: e.error }
+        : { level: "warn", text: outcomeText(e.status, e.output) };
+    }
+    return;   // 只看最近一条：它 completed 就别拿更早的结局吓人
+  }
 }
 
 /** 点清单：live 的直接打开；closed 的先复活（resume）再打开。 */
@@ -333,24 +364,45 @@ export async function send(text) {
   state.notice = null;
   seenApprovals.clear();
 
+  let res;
   try {
-    const res = await api.sendMessage(state.sid, body);
-    finishPosting();
-    if (res && res.error) {
-      // 并发被拒 / 会话已关：后端回的是人话，摆到眼前而不是一闪而过的 toast
-      state.notice = { level: "error", text: res.error };
-    } else {
-      noteOutcome(res);
-      refreshSessions();
-      // 每轮 token 会让成本表变，顺手刷；抽屉开着就一起把日志带了
-      refreshStatus(ui.drawerOpen);
-    }
-    // turn 结束：以历史为准重拉全量渲染（含本次新对话）
-    const data = await api.fetchMessages(state.sid);
-    if (data && !data.error) state.messages = data.messages || [];
+    res = await api.sendMessage(state.sid, body);
   } catch (err) {
     finishPosting();
     state.notice = { level: "error", text: "后端没响应" };
+    return;
+  }
+
+  // 提交被拒（并发被拒 / 会话已关）：后端回的是人话，摆到眼前而不是
+  // 一闪而过的 toast。没有 turn 在跑，posting 当场落旗。
+  if (res && res.error) {
+    finishPosting();
+    state.notice = { level: "error", text: res.error };
+    return;
+  }
+
+  // 同步模式（WYWD_SYNC_SEND=1 / 旧版后端）：响应本身就是结局，老打法
+  // 原样走完。
+  if (res && res.output != null) {
+    finishPosting();
+    noteOutcome(res);
+    refreshSessions();
+    refreshStatus(ui.drawerOpen);
+    // turn 结束：以历史为准重拉全量渲染（含本次新对话）
+    const data = await api.fetchMessages(state.sid);
+    if (data && !data.error) state.messages = data.messages || [];
+    return;
+  }
+
+  // 202 提交即返回（并发第 3 步）：结局由 SSE 的 turn_end 事件送达
+  // （handleTurnEnd 落旗 + 重拉历史 + 刷清单/状态）。turnId 记下来做
+  // 配对——上一轮的晚到结局灌不进这一轮的等待（A/B 串台防的是它）。
+  activeTurnId = (res && res.turnId) || null;
+  if (!state.streamUp) {
+    // 流没连上（断线重连窗口）：turn 已提交，结局可能延迟——诚实喊一声。
+    // EventSource 会自动重连续传（Last-Event-ID），多数情况照常收到。
+    state.notice = { level: "warn",
+      text: "事件流没连上（正在重连）——结局可能延迟到达，长时间没动静请刷新页面。" };
   }
 }
 
@@ -383,16 +435,18 @@ function noteOutcome(res) {
     pushLive("end", "✓ 本轮完成");           // 单色 glyph，不用彩色 emoji
     return;
   }
-  // max_steps 是**暂停**而不是失败：后端给的 output 已经把该说的说清了
-  // （用了几轮 / 任务没做完 / 直接说「继续」就能接着做——历史完整保留，
-  // 续跑真的有效）。所以优先显示 output；兜底文案也保留「继续」这个暗示，
-  // 因为对用户来说那是唯一能据此行动的信息，"本轮被截断"只能让他干瞪眼。
-  const fallback = status === "failed"
-    ? "本轮失败"
-    : "达到步数上限，本轮暂停（任务还没做完）；说「继续」可以接着做。";
-  const text = (res && res.output) || fallback;
+  const text = outcomeText(status, res && res.output);
   state.notice = { level: "warn", text };
   pushLive("warn", "⚠︎ " + text);            // U+26A0 + U+FE0E：强制文字形态
+}
+
+/** 非 completed 结局的人话。output 优先（后端给的 output 已经把该说的
+    说清了——用了几轮 / 任务没做完 / 直接说「继续」就能接着做）；兜底
+    文案保留「继续」这个暗示：对用户来说那是唯一能据此行动的信息。 */
+function outcomeText(status, output) {
+  return output || (status === "failed"
+    ? "本轮失败"
+    : "达到步数上限，本轮暂停（任务还没做完）；说「继续」可以接着做。");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -402,6 +456,8 @@ function noteOutcome(res) {
 let stream = null;
 const seenApprovals = new Set();   // ticket → 已弹过（重连可能重放同一帧）
 let liveSeq = 0;                   // 直播行的稳定 key（v-for 需要）
+let activeTurnId = null;           // 本 tab 在途 turn 的 id（202 响应给的）——
+                                   // turn_end 按它配对，晚到的旧结局灌不进来
 
 export function startEventStream() {
   if (stream) return;
@@ -433,12 +489,19 @@ function pushLive(kind, text, name = "", extra = null) {
 }
 
 function handleEvent(ev) {
-  // 事件环是常驻且跨会话的，直播只关心"当前这一轮"。不在 turn 里就不画：
-  // ① 多 tab 时不会把别人那轮的卡片画到自己这儿；
-  // ② 顺手免疫"连上就把旧事件整批重放"（服务端还有 after=latest 兜底）。
+  // turn_end 是收尾事件（并发第 3 步）：posting 的结局全靠它，先于直播
+  // 闸门处理——它自带 sessionId，在 handleTurnEnd 里分流。
+  if (ev.event === "turn_end") { handleTurnEnd(ev); return; }
+
+  // 直播只画"本 tab 视图会话、当前正在跑的这一轮"：
+  // - sessionId 过滤（第 3 步起中途事件也带）：别的会话 / 别的 tab 的
+  //   turn 画不进来——旧版只有 posting 旗，两个 tab 同时跑会串台；
+  // - posting 闸：不在 turn 里就不画，顺手免疫"连上就把旧事件整批
+  //   重放"（服务端还有 after=latest 兜底）。
   // 代价是 turn 末尾那一两帧有极小概率赶在 posting 落旗之后到达、丢一行
   // 直播——直播本就是补充材料，历史才是真相（写进边界的教学取舍）。
   if (!state.posting) return;
+  if (ev.sessionId && ev.sessionId !== state.sid) return;
 
   if (ev.event === "round_start") {
     pushLive("round", "第 " + ((ev.step || 0) + 1) + " 轮");
@@ -501,6 +564,40 @@ function handleEvent(ev) {
       approval.submitting = false;
     }
   }
+}
+
+/** turn_end 事件 = 本轮结局（并发第 3 步）：posting 的收尾由事件驱动。
+
+    202 之后 POST 响应里没有结局了，收尾三件套全搬到这里：
+    落 posting 旗 → 重拉历史（以证据为准）→ 刷清单/状态（成本表随
+    usage 变）。结局本身：error（被状态机拒绝 / 内部异常）→ 红字摆到
+    台面；否则 noteOutcome——{status, output, usage} 和同步响应同一
+    形状，一套代码两条通道。
+*/
+function handleTurnEnd(ev) {
+  // 多 tab / 跨会话：不是本 tab 视图那一轮的不收（壳断连合成的
+  // turn_end 也带 sessionId——那是 sidecar 死掉时的诚实收场事件）。
+  if (ev.sessionId && ev.sessionId !== state.sid) return;
+  if (!state.posting || !activeTurnId) return;
+  // turnId 配对：A 的晚到结局灌给 B 的等待这种事，宁可白防不可不防。
+  if (ev.turnId && ev.turnId !== activeTurnId) return;
+  activeTurnId = null;
+
+  if (ev.error) {
+    state.notice = { level: "error", text: ev.error };
+    pushLive("warn", "⚠︎ " + ev.error);
+  } else {
+    noteOutcome(ev);
+  }
+  finishPosting();
+  refreshSessions();
+  // 每轮 token 会让成本表变，顺手刷；抽屉开着就一起把日志带了
+  refreshStatus(ui.drawerOpen);
+  // turn 结束：以历史为准重拉全量渲染（含本次新对话）。失败不打断
+  // 收尾——历史下次切会话还能拿到。
+  api.fetchMessages(state.sid).then((data) => {
+    if (data && !data.error) state.messages = data.messages || [];
+  }).catch(() => { /* 拉取失败：保持现状，不炸收尾 */ });
 }
 
 // ═══════════════════════════════════════════════════════════

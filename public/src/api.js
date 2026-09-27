@@ -52,8 +52,20 @@ export function fetchMessages(sid) {
 
 // ── 发一轮（同步等 turn 完成）───────────────────────────
 
+// ── 发一轮（默认 202 提交即返回，结局走 SSE 的 turn_end 事件；
+//    WYWD_SYNC_SEND=1 时后端切回同步等结局的老契约）──────
+
 export function sendMessage(sid, message) {
   return post(messagesPath(sid), { message });
+}
+
+// ── 事件环一次性读取（GET /api/events）──────────────────
+
+/** 从头翻旧账的入口：打开会话时按 sessionId 找最近一条 turn_end，
+    把上一轮结局的 notice 立回去（结局不进 transcript，F5 后只能从
+    环里找——环是服务端内存，转没了就算了）。SSE 仍是唯一的推送通道。 */
+export function fetchEvents() {
+  return get("/api/events?after=0");
 }
 
 // ── 审批回执 ────────────────────────────────────────────
