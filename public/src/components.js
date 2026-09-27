@@ -484,6 +484,14 @@ export const ChatArea = {
                   </summary>
                   <div class="think-body">{{ line.text }}</div>
                 </details>
+                <details v-else-if="line.kind === 'plan'" class="lf-line lf-plan-box">
+                  <summary>
+                    <span class="lf-plan-tag">☰ 计划</span>
+                    <span class="lf-plan-sum">{{ line.summary }}</span>
+                    <span class="fold-hint">{{ line.lines }} 行 · 点击展开</span>
+                  </summary>
+                  <div class="plan-body">{{ line.text }}</div>
+                </details>
                 <div v-else class="lf-line" :class="'lf-' + line.kind">
                 <template v-if="line.kind === 'call'">
                   <div v-if="line.explain" class="lf-explain">💬 {{ line.explain }}</div>

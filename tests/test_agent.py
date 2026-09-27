@@ -4,6 +4,7 @@ import unittest
 
 from src.harness.agent import run_agent
 from src.harness.models import ModelReply, ScriptedModel, ToolCall
+from src.harness.std_tools import plan_write
 from src.harness.tools import Tool, ToolRegistry
 
 
@@ -107,6 +108,53 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(last_message["role"], "tool")
         self.assertEqual(last_message["tool_call_id"], "call_1")
         self.assertIn("工具 add 返回：5", last_message["content"])
+
+    def test_plan_write_result_is_fed_back_and_lives_in_evidence(self) -> None:
+        """计划工具的回灌（plan-and-execute 第 1 步）：计划活在 transcript 里。
+
+        模型第一轮 plan_write 立计划、第二轮收到的消息里就有规范化全文
+        ——此后每轮都在历史里（直到被压缩），这就是"计划进证据"。
+        """
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(name="plan_write", description="整份重写任务计划",
+                 handler=plan_write,
+                 # 数组参数反射出不了（TYPE_MAP 只有标量）——真实装配
+                 # （toolbox）是手写 schema，这里同形状注册才校验得过。
+                 input_schema={
+                     "type": "object",
+                     "properties": {
+                         "tasks": {"type": "array",
+                                   "items": {"type": "string"}},
+                     },
+                     "required": ["tasks"],
+                 })
+        )
+        model = ScriptedModel(
+            [
+                ModelReply(
+                    kind="tool_calls",
+                    tool_calls=[ToolCall(
+                        "call_1", "plan_write",
+                        {"tasks": ["[x] 读配置", "改代码", "[>] 跑测试"]},
+                    )],
+                ),
+                ModelReply(kind="final", text="按计划推进"),
+            ]
+        )
+
+        result = run_agent("多步任务", model=model, registry=registry)
+
+        self.assertEqual(result.output, "按计划推进")
+        fed_back = model.received_inputs[1][-1]
+        self.assertEqual(fed_back["role"], "tool")
+        self.assertIn("工具 plan_write 返回：", fed_back["content"])
+        self.assertIn("【计划 1/3】", fed_back["content"])
+        # 计划全文进了 transcript（RunResult.messages 即证据），
+        # 而且在下一轮模型收到的输入里——"下一轮还能看见"是关键。
+        self.assertIn("【计划 1/3】", str(result.messages))
+        self.assertIn("[>] 3. 跑测试", model.received_inputs[1][-1]["content"])
 
     def test_unknown_tool_error_is_fed_back(self) -> None:
         model = ScriptedModel(

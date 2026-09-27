@@ -202,6 +202,8 @@ class DefaultBehaviorTests(unittest.TestCase):
             "load_skill",
             # bash 后台出口（2026-09-24）：长驻进程的 task_id 探活/停止
             "bash_output", "bash_stop",
+            # 任务计划（2026-09-27）：plan-and-execute 第 1 步
+            "plan_write",
         }
         self.assertEqual(set(build_registry().names()), expected)
 

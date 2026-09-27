@@ -54,6 +54,7 @@ from src.harness.std_tools import (
     find_text,
     glob_files,
     now,
+    plan_write,
     run_bash,
     run_bash_background,
     tree_dir,
@@ -277,6 +278,27 @@ def build_instant_tools(root_: Path) -> list[Tool]:
             name="now",
             description="获取当前日期和时间（本地时区），返回格式 YYYY-MM-DD HH:MM",
             handler=now,
+        ),
+        Tool(
+            name="plan_write",
+            description="整份重写任务计划（plan-and-execute）：多步任务先列计划，"
+                "做完一项或计划有变就整份重发。每项可带状态前缀 [x] 已完成 / "
+                "[>] 进行中 / [!] 失败，无前缀 = 待办",
+            handler=plan_write,
+            # 数组参数反射不出（TYPE_MAP 只有标量）——schema 手写，
+            # 桥接工具（ToolSearch/DeferExecuteTool）同一条先例。
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "计划全文，每项一条；可带状态前缀："
+                            "[x] 已完成 / [>] 进行中 / [!] 失败，无前缀 = 待办",
+                    },
+                },
+                "required": ["tasks"],
+            },
         ),
         Tool(
             name="fs_list",
@@ -620,6 +642,12 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     # 起的东西"。真要设防的仍然是 bash 本身那道 ASK：起进程那一瞬有人点头，
     # 之后读它的输出、停它的进程，不再重复打扰。
     "bash_output", "bash_stop",
+    # 任务计划（2026-09-27，plan-and-execute 第 1 步）：plan_write 是
+    # **无状态**的字符串规范化——计划本身活在 transcript 的工具结果里，
+    # 不落任何服务端存储，没有文件 IO、没有跨会话状态。下一轮它就在
+    # 模型自己的历史里，用户在界面上也看得到——没有"悄悄发生"的空间，
+    # 和 memory_write 同一条免审批理由。
+    "plan_write",
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions
@@ -690,6 +718,10 @@ SYSTEM_PROMPT_TEMPLATE = """你是运行在 wywd-harness 里的 Agent：能读�
 - **工具报错时先读错误信息。** 它通常已经说了原因和下一步
   （"路径不存在"会提示你先 fs_list 看看有什么）。
 - 没做完就说没做完。把"看起来完成了"和"确实完成了"分开。
+- **多步任务先立计划再动手。** 三步以上、没有现成路径的任务，开工前先 plan_write
+  列出计划，做完一项或计划有变就**整份重写**（全量替换，不是只发改动的那条）——
+  用户在界面上看得到进度，长任务也不容易跑偏。要是上下文里已经找不到最近的计划
+  （被压缩掉了），凭记忆重写一份再继续。
 - **先定位，再精读。** 找东西先用 fs_glob / fs_find 定位到具体文件和行，再 fs_read
   那一小段。对同一个文件反复跳读不同位置，通常是没想清楚要找什么——停下来先想。
 - **别读"元信息"文件**（NEXT_SESSION.md / MEMORY.md / 事故记录 / CI 配置 / 打包配置），

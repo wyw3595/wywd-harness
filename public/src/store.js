@@ -552,8 +552,21 @@ function handleEvent(ev) {
       approval.submitting = false;
       pushLive("warn", "审批已结束（被拒或超时），这条没执行");
     }
-    if (out.length > 240) out = out.slice(0, 240) + "…";
-    pushLive("out", out);
+    // 计划工具（plan-and-execute 第 1 步）：计划全文单独成卡——它是要
+    // 盯着看的进度，不进 240 字符截断的普通结果行。剥掉运行时包的
+    // "工具 plan_write 返回："前缀，卡片只呈现计划本身。
+    if (ev.name === "plan_write") {
+      const prefix = "工具 plan_write 返回：";
+      const text = out.startsWith(prefix) ? out.slice(prefix.length) : out;
+      const firstLine = text.split("\n")[0] || text;
+      pushLive("plan", text, "计划", {
+        summary: firstLine,
+        lines: text.split("\n").length,
+      });
+    } else {
+      if (out.length > 240) out = out.slice(0, 240) + "…";
+      pushLive("out", out);
+    }
   } else if (ev.event === "approval_request") {
     const ticket = ev.request_id;
     if (!seenApprovals.has(ticket)) {

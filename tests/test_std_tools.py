@@ -23,6 +23,7 @@ from src.harness.std_tools import (
     find_text,
     glob_files,
     now,
+    plan_write,
     run_bash,
     run_bash_background,
     tree_dir,
@@ -46,6 +47,55 @@ class NowTests(unittest.TestCase):
         result = now()
         self.assertRegex(result, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
         self.assertIn(str(datetime.now().year), result)
+
+
+class PlanWriteTests(unittest.TestCase):
+    """计划工具（plan-and-execute 第 1 步）：全文重写 + 状态前缀规范化。
+
+    无状态是它的安全声明：计划活在 transcript 的工具结果里，工具本身
+    只做"规范化渲染"。这里钉住输出格式（前端计划卡靠它渲染）、状态
+    前缀的容错解析、以及坏参数的人话报错。
+    """
+
+    def test_mixed_statuses_render_canonically(self) -> None:
+        """各种写法规范化成同一格式：进度行 + 对齐的编号清单。"""
+
+        result = plan_write([
+            "[x] 读配置文件",
+            "- [>] 修依赖",          # markdown checkbox 习惯也要吃
+            "跑测试",
+            "[!] 部署",
+        ])
+        self.assertEqual(result, "\n".join([
+            "【计划 1/4】",
+            "  [x] 1. 读配置文件",
+            "  [>] 2. 修依赖",
+            "  [ ] 3. 跑测试",
+            "  [!] 4. 部署",
+        ]))
+
+    def test_done_marker_is_case_insensitive(self) -> None:
+        result = plan_write(["[X] 已完成的事"])
+        self.assertIn("[x] 1. 已完成的事", result)
+        self.assertIn("【计划 1/1 · 全部完成】", result)
+
+    def test_all_done_header_announces_completion(self) -> None:
+        result = plan_write(["[x] 甲", "[x] 乙"])
+        self.assertTrue(result.startswith("【计划 2/2 · 全部完成】"))
+
+    def test_empty_list_gets_actionable_error(self) -> None:
+        """空计划不是崩溃是可行动文案：模型能据此修正参数。"""
+
+        self.assertIn("至少", plan_write([]))
+        self.assertIn("第 2 项是空的", plan_write(["有内容", "   "]))
+
+    def test_non_string_item_gets_actionable_error(self) -> None:
+        """模型把对象塞进数组时（顶层 array 校验拦不住），错误指明第几项。"""
+
+        self.assertIn("第 2 项必须是字符串", plan_write(["a", {"task": "b"}]))
+
+    def test_bare_marker_without_text_gets_actionable_error(self) -> None:
+        self.assertIn("只有状态前缀没有内容", plan_write(["[x]"]))
 
 
 class CalcTests(unittest.TestCase):
@@ -450,6 +500,32 @@ class ToolboxAssemblyTests(unittest.TestCase):
         )
         self.assertIs(decision.action, PermissionAction.ALLOW)
         self.assertEqual(decision.rule_id, "path.write_allow")
+
+    def test_plan_tool_wiring(self) -> None:
+        """plan_write 的接线三头（2026-09-27，plan-and-execute 第 1 步）：
+        免审批白名单（无状态字符串工具，同 memory_write 一条理由）、
+        策略实际放行（tool.allow_safe）、registry 里拿得到且 schema
+        的 tasks 是数组（反射出不了 list，手写 schema 必须生效）。"""
+
+        from scripts.toolbox import SAFE_TOOLS, build_policy, build_registry
+        from src.harness.permissions import PermissionAction, ToolRequest
+
+        self.assertIn("plan_write", SAFE_TOOLS)
+        decision = build_policy().decide(
+            ToolRequest(
+                tool_use_id="t1",
+                name="plan_write",
+                arguments={"tasks": ["[x] 甲"]},
+            )
+        )
+        self.assertIs(decision.action, PermissionAction.ALLOW)
+        self.assertEqual(decision.rule_id, "tool.allow_safe")
+
+        registry = build_registry()
+        schema = registry.get("plan_write").model_schema()
+        parameters = schema["function"]["parameters"]
+        self.assertEqual(parameters["properties"]["tasks"]["type"], "array")
+        self.assertEqual(parameters["required"], ["tasks"])
 
 
 class BashToolTests(unittest.TestCase):

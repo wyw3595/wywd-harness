@@ -1,7 +1,8 @@
-"""标准工具集：能看时间、能算、能按内容搜、能按名字找、能看树（全部只读 + 沙箱内）。
+"""标准工具集：能看时间、能算、能按内容搜、能按名字找、能看树、能立计划（全部只读 + 沙箱内）。
 
 往这里加"通用能力"工具：now（当前时间）、calc（安全数学）、
-find_text（按内容搜）、glob_files（按文件名找）、tree_dir（目录树）。
+find_text（按内容搜）、glob_files（按文件名找）、tree_dir（目录树）、
+plan_write（任务计划，plan-and-execute 第 1 步）。
 回归测试对应 tests/test_std_tools.py。
 
 find_text 与 glob_files 是**正交**的两件事——前者回答"内容在哪"，后者回答
@@ -63,6 +64,62 @@ def now() -> str:
     """
 
     return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+# plan_write 的状态前缀（GFM checkbox 习惯，模型零学习成本）：
+# [x] 完成（大小写都认）  [>] 进行中  [!] 失败  无前缀 = 待办。
+_PLAN_MARKERS = ("[x]", "[>]", "[!]")
+
+
+def plan_write(tasks: list[str]) -> str:
+    """整份重写任务计划：多步任务先列计划，做完一项或有变化就整份重发。
+
+    Args:
+        tasks: 计划全文，每项一条；可带状态前缀 [x] 已完成 / [>] 进行中 /
+            [!] 失败，不带前缀 = 待办。支持 "- [x]" 的 markdown checkbox
+            写法（前导 - / * 会被剥掉）。
+
+    无状态设计（plan-as-tool）：计划不落在任何服务端存储里，**活在
+    transcript 里**——每次调用返回规范化全文，最近一次的工具结果就是
+    当前计划。跨会话天然隔离（不同会话各有各的历史），也绝不串台；
+    已知边界：上下文压缩可能把旧计划吃掉，靠系统提示教模型"找不到
+    就凭记忆重写一份"。数组参数的类型契约反射不出（TYPE_MAP 只有
+    标量），schema 由装配层手写（桥接工具同款先例）。
+    """
+
+    if not isinstance(tasks, list):
+        # validate_arguments 已按 schema 的 "array" 拦过一道；这里兜底
+        # 防 handler 被直调（测试 / 将来的非模型调用方）。
+        return "参数错误：tasks 必须是数组"
+    if not tasks:
+        return "计划不能为空：tasks 至少要有一项"
+    items: list[tuple[str, str]] = []
+    for index, raw in enumerate(tasks, start=1):
+        if not isinstance(raw, str):
+            return (f"第 {index} 项必须是字符串（收到 {type(raw).__name__}）"
+                    "——每项一条纯文本，状态用前缀表达")
+        text = re.sub(r"^[-*]\s+", "", raw.strip())
+        if not text:
+            return f"第 {index} 项是空的：写上内容，或把这项从计划里删掉"
+        marker = "[ ]"
+        for want in _PLAN_MARKERS:
+            head = text[:3]
+            if head == want or (want == "[x]" and head.lower() == "[x]"):
+                marker = want
+                text = text[3:].strip()
+                break
+        if not text:
+            return (f"第 {index} 项只有状态前缀没有内容："
+                    "前缀后面要写这条步骤在干什么")
+        items.append((marker, text))
+
+    done = sum(1 for marker, _ in items if marker == "[x]")
+    header = f"【计划 {done}/{len(items)}"
+    header += " · 全部完成】" if done == len(items) else "】"
+    lines = [header]
+    for index, (marker, text) in enumerate(items, start=1):
+        lines.append(f"  {marker} {index}. {text}")
+    return "\n".join(lines)
 
 
 def calc(expression: str) -> str:

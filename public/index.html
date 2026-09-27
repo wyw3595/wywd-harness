@@ -294,6 +294,20 @@
   #live-feed .lf-think-sum{flex:1 1 auto;min-width:0;overflow:hidden;
     text-overflow:ellipsis;white-space:nowrap;font-style:italic}
   #live-feed .think-body{font-size:11.5px}
+  /* 直播区的计划行（plan_write）：同折叠块手法——全文在 details 里，
+     收起时摘要只露进度行（【计划 2/4】就是摘要本身） */
+  #live-feed .lf-plan-box{padding:2px 0}
+  #live-feed .lf-plan-box>summary{cursor:pointer;display:flex;gap:8px;
+    align-items:baseline;list-style:none;font-size:12px;color:var(--tx2)}
+  #live-feed .lf-plan-box>summary::-webkit-details-marker{display:none}
+  #live-feed .lf-plan-box>summary::before{content:"\25B8";font-size:10px;
+    color:var(--tx3);display:inline-block;flex:0 0 auto}
+  #live-feed .lf-plan-box[open]>summary::before{content:"\25BE"}
+  #live-feed .lf-plan-tag{flex:0 0 auto;color:var(--tx2)}
+  #live-feed .lf-plan-sum{flex:1 1 auto;min-width:0;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  #live-feed .plan-body{margin-top:5px;white-space:pre-wrap;
+    word-break:break-word;color:var(--tx2);font-size:11.5px;line-height:1.7}
   /* 本轮结局卡：不是历史的一部分，所以样式也和正文区分开 */
   .msg.notice{align-self:stretch;border-radius:10px;padding:9px 12px;
     font-size:13px;display:flex;gap:9px;align-items:baseline;
