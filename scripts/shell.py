@@ -26,6 +26,8 @@ import multiprocessing as mp
 import os
 import socket
 import sys
+import threading
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -207,8 +209,15 @@ class SidecarShell:
         _process_factory: Any = None,
     ) -> None:
         self._user_prompt = user_prompt
-        self._on_event = on_event
+        self._on_event = on_event            # 外部回调（web 的 ring / 终端 print）
         self._cwd = cwd
+        # turn 结局等待表（并发第 2 步：agent/send 提交即返回）——
+        # turnId（壳生成、随请求带给 sidecar 原样回传）→ {event, result}。
+        # 为什么按 **turnId** 配对而不按 sid：A 的 turn_end 可能晚于 B 的
+        # 提交才到（A 收尾 → 会话回 IDLE → B 的预检就通过了），按 sid 配对
+        # 会把 A 的结局灌进 B 的等待——串台。
+        self._turn_lock = threading.Lock()
+        self._pending_turns: dict[str, dict] = {}
         # 测试注入点（默认真实现；单测喂假 client/假 process 绕开 spawn）
         self._client_factory = _client_factory or MainProcessClient
         self._process_factory = _process_factory or mp.Process
@@ -244,7 +253,8 @@ class SidecarShell:
             self._proc.start()
             srv.close()   # 父进程不再持有这端（子进程有自己那份 duplicate）
             self._client = self._client_factory(
-                user_prompt=self._user_prompt, on_event=self._on_event)
+                user_prompt=self._user_prompt, on_event=self._pipe_event,
+                on_disconnect=self._fail_pending_turns)
             self._client.connect(cli)
             pong = self._client.call("sidecar/ping")["result"]
             # 走 _create_session_remote 而不是手写 ["result"]["sessionId"]：
@@ -314,14 +324,65 @@ class SidecarShell:
     def send_to(self, session_id: str, message: str) -> dict:
         """把一句话交给**指定**会话的 agent（显式 sid）。
 
+        第 2 步起 agent/send 是"提交即返回"：这里生成 turnId、登记等待、
+        提交，然后等 turn_end 事件拿结局——**对调用方的外层契约不变**
+        （返回 {"output","status","usage"} 或 {"error"}），但等待期间
+        客户端的全部其他 RPC 完全空闲（turn 在 sidecar 的执行器线程里跑，
+        壳不再占用任何 RPC 通道）。
+
         web_app（C 方案）用：单壳单 sidecar，多 tab 各看各的会话，
-        发消息必须带 sid，不能依赖壳的"当前会话指针"。返回
-        agent/send 的 result（可能含 "error"）。RPC 层错误由
-        _result 翻译成人话，不抛洞。
+        发消息必须带 sid，不能依赖壳的"当前会话指针"。
         """
 
-        return self._result(self._client.call("agent/send",
-            {"sessionId": session_id, "message": message}))
+        turn_id = str(uuid.uuid4())
+        entry: dict = {"event": threading.Event(), "result": None}
+        with self._turn_lock:
+            self._pending_turns[turn_id] = entry
+        resp = self._result(self._client.call("agent/send",
+            {"sessionId": session_id, "message": message,
+             "turnId": turn_id}))
+        if "error" in resp:
+            # 提交被拒（closed/正在跑）：不会有 turn_end 了，摘掉等待
+            with self._turn_lock:
+                self._pending_turns.pop(turn_id, None)
+            return resp
+        if resp.get("status") == "started":
+            entry["event"].wait()     # turn_end / 断连 / close 三者必到其一
+            result = entry["result"] or {}
+            if "error" in result:
+                return {"error": result["error"]}
+            return {"output": result.get("output", ""),
+                    "status": result.get("status", "completed"),
+                    "usage": result.get("usage", {})}
+        # 兜底：对端是不认识 started 的旧版 sidecar（同步语义）——原样返回
+        with self._turn_lock:
+            self._pending_turns.pop(turn_id, None)
+        return resp
+
+    def _pipe_event(self, data: dict) -> None:
+        """事件管道：截下本壳发出的 turn_end 唤醒等待者，其余（以及
+        turn_end 本身）原样转交外部回调——直播照旧，等待只是"多看一眼"。"""
+
+        if data.get("event") == "turn_end":
+            token = data.get("turnId") or ""
+            with self._turn_lock:
+                entry = self._pending_turns.pop(token, None)
+            if entry is not None:
+                entry["result"] = data
+                entry["event"].set()
+        if self._on_event is not None:
+            self._on_event(data)
+
+    def _fail_pending_turns(self) -> None:
+        """连接断了/关了：所有等 turn 结局的 send_to 立刻拿诚实错误，
+        不陪一个已经不存在的 sidecar 挂死。"""
+
+        with self._turn_lock:
+            pending = list(self._pending_turns.values())
+            self._pending_turns.clear()
+        for entry in pending:
+            entry["result"] = {"error": "sidecar 连接中断"}
+            entry["event"].set()
 
     def send(self, message: str) -> dict:
         """发给自己当前会话（懒建：还没有会话就现开一个）。

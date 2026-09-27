@@ -52,12 +52,13 @@
 """
 
 import json
+import os
 import queue
 import socket
 import threading
 import time
 import uuid
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -72,6 +73,7 @@ from src.harness.session import (
     SessionLifecycleError,
     SessionManager,
     SessionNotFoundError,
+    SessionProcess,
     SessionState,
     SessionStore,
 )
@@ -84,6 +86,30 @@ from src.harness.tools import ToolRegistry
 # harness 只负责原样转交；失败**必须翻成 ValueError / OSError 抛出**
 # （RPC 层只有这一条错误通道，与 session 四操作的约定一致）。
 WorkspaceRuntimeBuilder = Callable[[dict], tuple]
+
+
+def _resolve_turn_workers() -> int:
+    """并发 turn 上限（`WYWD_TURN_WORKERS`，默认 2）。
+
+    为什么默认 2 而不是更大：每个 turn 占一个模型会话的配额与本地资源，
+    单用户同时盯着两个会话已是常态、三个以上罕见；更激进只会放大"同时
+    改同一批文件"的混乱。0/负数按默认处理并喊一声——静默吞错配置比
+    报错更难查（shell.py 的 _idle_reap_seconds 同一条规矩）。
+    """
+
+    default = 2
+    raw = (os.environ.get("WYWD_TURN_WORKERS") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[sidecar] WYWD_TURN_WORKERS 不是数字（{raw!r}），用默认 {default}")
+        return default
+    if value < 1:
+        print(f"[sidecar] WYWD_TURN_WORKERS 必须 ≥1（{value}），用默认 {default}")
+        return default
+    return value
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -284,10 +310,24 @@ class SidecarServer:
         for record in self._manager.store.list():
             if record.status not in (SessionState.CLOSED, SessionState.ERROR):
                 self._manager.close_session(record.id)
-        self._last_turn_status = "completed"
-        # s08 续：每轮 token 账也走同一个接缝（TurnRunner 协议只回
-        # (output, messages)，装不下 usage——和 status 当初一样的处境）。
-        self._last_turn_usage: dict = {}
+        # ── turn 后台化（并发改造第 2 步，2026-09-26）──────────────
+        # 执行器在服务级（不是连接级）：连接换代不丢任务。max_workers 见
+        # _resolve_turn_workers——"同一时刻至多一个 turn"从此只对**同一
+        # 会话**成立（SessionProcess 的 turn 锁），不同会话并行跑。
+        self._executor = ThreadPoolExecutor(
+            max_workers=_resolve_turn_workers(), thread_name_prefix="wywd-turn")
+        # 审批回程票注册表：approver（执行器线程）发票 → future；主循环
+        # 读到 approval/response 完成它。旧的"嵌套 recv"在背景化之后会跟
+        # 主循环抢 socket，必须换成这张表。
+        self._approvals_lock = threading.Lock()
+        self._pending_approvals: dict[str, Future] = {}
+        # 并行 turn 的记账：status/usage 改线程本地。旧的两个实例属性在
+        # 并行 turn 下会串台（A 的 status 被读成 B 的）；threading.local
+        # 让每个执行器线程只看得到自己的账。
+        self._turn_ctx = threading.local()
+        # 全链发送锁：主循环（响应）、执行器（事件）、审批（发票）三个
+        # 线程都会写同一条 socket——newline 帧不许被两线程撕开。
+        self._conn_lock = threading.Lock()
         self.rpc_handlers: dict[str, Callable] = {}
         # 实例属性，不是类属性（教材的坑：类属性多实例共享）。
         self._start_time = time.time()
@@ -431,13 +471,13 @@ class SidecarServer:
           - 闭包捕获 self、调用那一刻才读 self._runner / self._on_event：
             这俩是 per-connection 的，构造期还是 None，连接建立才有值
             （s06 handle_connection 的装配顺序决定了只能这么写）；
-          - self._last_turn_status 是协议接缝的记账：TurnRunner 协议的
-            返回值只有 (output, messages)，装不下 run_agent 的 status——
-            但 agent/send 的 RPC 响应要诚实汇报 max_steps/failed。安全
-            前提：同一时刻至多一个 turn 在跑（handle_connection 是单循环
-            顺序处理——客户端并发 call 也会在这里排队，turn 后台化之前
-            这是硬边界）；跨连接并发 turn 是已知边界（status
-            可能串台，output 不受影响——它走返回值）。
+          - status/usage 是协议接缝的记账，走 self._turn_ctx
+            （threading.local）：TurnRunner 协议的返回值只有
+            (output, messages)，装不下 run_agent 的 status——run_turn
+            返回后由执行器线程立刻读走，并行 turn 各记各的账不串台
+            （第 2 步起 turn 在执行器线程跑，"同一时刻至多一个 turn"
+            只对**同一会话**成立——SessionProcess 的 turn 锁）。结局
+            由 _run_turn_task 广播进 turn_end 事件。
         """
         def turn_runner(message: str, history: list[dict]):
             # s14：先做四层压缩（预算内不动；超了从最便宜的层开始压），
@@ -458,11 +498,14 @@ class SidecarServer:
                 externalize=self._externalize,   # s13：超阈值输出换到磁盘
                 on_event=self._on_event,
                 runner=runner if runner is not None else self._runner)
-            self._last_turn_status = result.status
+            # 记账走**线程本地**（第 2 步起 turn 在执行器线程跑，可能并行）：
+            # 每个线程只看得到自己这轮的 status/usage，同线程的调用方
+            # （_run_turn_task）在 run_turn 返回后立刻读——并行不串台。
+            self._turn_ctx.status = result.status
             # usage 是这一轮的账（run_agent 在轮内跨 step 累加出来的 totals）。
             # dict() 复制是防御习惯：存引用的话，将来谁在返回后动了那个字典，
             # 这里会跟着变——"快照存的应该是那一刻的值"（练习 08 的老教训）。
-            self._last_turn_usage = dict(result.usage)
+            self._turn_ctx.usage = dict(result.usage)
 
             # 落盘的必须是【原始历史 + 本轮新增】——压缩视图只发给模型，
             # **不进证据**。
@@ -530,17 +573,41 @@ class SidecarServer:
         ts = time.strftime("%H:%M:%S")
         self.ring_buffer.write(f"[{ts}] [sidecar] {msg}\n")
 
+    def _send(self, msg: dict) -> None:
+        """线程安全的写（第 2 步起主循环/执行器/审批三个线程都会写 socket）：
+        newline-delimited 的帧必须一气呵成，不许被两个线程撕成两半。"""
+
+        with self._conn_lock:
+            self._conn.send_message(msg)
+
+    def _emit_event(self, event: str, data: dict) -> None:
+        """后台线程安全的事件广播。连接不在（换代/已关/已停）就静默——
+        事件是直播不是证据；发送失败也不能炸掉正在收尾的 turn。"""
+
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event, data)
+        except Exception as exc:
+            self._log(f"event emit failed: {exc}")
+
     # ── 连接循环 + per-connection 装配 ─────────────────────────
 
     def handle_connection(self, conn: RPCConnection) -> None:
-        """处理一条 RPC 连接：循环收消息 → 路由 → 回 result/error。"""
+        """处理一条 RPC 连接：循环收消息 → 路由 → 回 result/error。
+
+        第 2 步起本循环是**自由的**：agent/send 只提交不等待，turn 在执行
+        器线程里跑——循环随时能收下一条请求（另一个会话发消息、查状态、
+        关会话都不再被 turn 堵住）。它多了一项新职责：**兑审批回执**——
+        approver 活在执行器线程，回执只能由本循环读进来完成 future。
+        """
         self._conn = conn
         self._runner = GovernedToolRunner(
             policy=self._policy, approver=self._make_approver(conn),
             registry=self._registry, audit=AuditTrail())
-        self._on_event = lambda event, data: conn.send_message(
-            {"jsonrpc":"2.0","method":"event",
-             "params":{"event":event,**data},"id":None})
+        self._on_event = lambda event, data: self._send(
+            {"jsonrpc": "2.0", "method": "event",
+             "params": {"event": event, **data}, "id": None})
         self._log("new RPC connection established")
         while not self._shutdown:
             try: req = conn.recv_message()
@@ -549,36 +616,75 @@ class SidecarServer:
             method = req.get("method",""); params = req.get("params") or {}
             req_id = req.get("id")
             self._log(f"RPC: {method} (id={req_id})")
+            if method == "approval/response":
+                self._complete_approval(params)   # 兑票：不进领域路由
+                continue
             handler = self.rpc_handlers.get(method)
             if handler:
                 try:
                     result = handler(params)
-                    conn.send_message({"jsonrpc":"2.0","result":result,"id":req_id})
+                    self._send({"jsonrpc":"2.0","result":result,"id":req_id})
                 except Exception as error:
-                    conn.send_message({"jsonrpc":"2.0",
+                    self._send({"jsonrpc":"2.0",
                         "error":{"code":-32603,"message":str(error)},"id":req_id})
             else:
-                conn.send_message({"jsonrpc":"2.0",
+                self._send({"jsonrpc":"2.0",
                     "error":{"code":-32601,"message":f"Method not found: {method}"},
                     "id":req_id})
+        # 循环退出（EOF/关停）：挂起的审批全部 fail-closed——执行器线程里
+        # 等回执的 approver 会拿到 False，turn 不会陪连接一起挂死。
+        self._fail_pending_approvals()
         conn.close()
         self._log("RPC connection closed")
 
+    def _complete_approval(self, params: dict) -> None:
+        """主循环兑票：按 request_id 找到挂着的 future 并完成它。"""
+
+        with self._approvals_lock:
+            future = self._pending_approvals.get(params.get("request_id"))
+        if future is None:
+            # 票已超时被收走 / 重复回执：喊一声，不炸。
+            self._log("approval/response for unknown ticket (ignored)")
+            return
+        future.set_result(bool(params.get("approved")))
+
+    def _fail_pending_approvals(self) -> None:
+        """连接收尾时把所有挂起审批置为失败（approver 侧 fail-closed 返回 False）。"""
+
+        with self._approvals_lock:
+            pending = list(self._pending_approvals.values())
+            self._pending_approvals.clear()
+        for future in pending:
+            try:
+                future.set_exception(ConnectionClosed("sidecar 连接中断"))
+            except Exception:
+                pass   # 极端竞态下已 done——收尾逻辑不许再炸
+
     def _make_approver(self, conn: RPCConnection) -> Approver:
-        """审批回程票闭包（s05 同构，只是从队列换成 socket）。"""
+        """审批回程票（2026-09-26 改造）：发票 → future 注册表，主循环兑票。
+
+        背景化之后 approver 活在**执行器线程**，而主循环是另一个线程——
+        旧的"嵌套 recv"会跟主循环抢同一条 socket（两个 recv 者把帧撕开）。
+        现在：发票走 _send 锁；回执由主循环读进来完成 future；连接断/
+        关停时 future 被置异常 → fail-closed 返回 False（turn 拿到
+        permission_blocked，不陪连接挂死）。
+        """
         def approver(decision) -> bool:
             ticket = str(uuid.uuid4())
-            conn.send_message({"jsonrpc":"2.0","method":"approval/request",
-                "params":{"request_id":ticket,"rule_id":decision.rule_id,
-                          "reason":decision.reason},"id":None})
-            while True:
-                try: msg = conn.recv_message()
-                except Exception: return False
-                if msg is None: return False
-                p = msg.get("params") or {}
-                if (msg.get("method")=="approval/response"
-                        and p.get("request_id")==ticket):
-                    return bool(p.get("approved"))
+            future: Future = Future()
+            with self._approvals_lock:
+                self._pending_approvals[ticket] = future
+            try:
+                self._send({"jsonrpc":"2.0","method":"approval/request",
+                    "params":{"request_id":ticket,"rule_id":decision.rule_id,
+                              "reason":decision.reason},"id":None})
+                return bool(future.result())
+            except Exception:
+                # 断连 / 关停 / 收尾炸掉 future：没人批准 = 拒绝（fail-closed）
+                return False
+            finally:
+                with self._approvals_lock:
+                    self._pending_approvals.pop(ticket, None)
         return approver
 
     # ── RPC Handlers ──────────────────────────────────────────
@@ -625,6 +731,9 @@ class SidecarServer:
     def _handle_shutdown(self, params: dict) -> dict:
         self._shutdown = True
         self.stop_reaper()        # 回收线程是独立开关，得单独放它走
+        # 执行器：不再接新任务，排队的取消；**正在跑的 turn 让它跑完**——
+        # 它的 turn_end 会照常广播（连接可能已关，事件静默丢弃）。
+        self._executor.shutdown(wait=False, cancel_futures=True)
         self._log("shutdown requested")
         return {"status": "shutting down"}
 
@@ -828,34 +937,63 @@ class SidecarServer:
         return {"sessionId": sid, "messages": record.messages}
 
     def _handle_agent_send(self, params: dict) -> dict:
-        """跑一个 turn：状态机接管（并发拒绝 / close 竞态拒收都在里面）。
+        """提交一个 turn（后台化，第 2 步）：立刻回 started，结局走事件。
 
         - get_session 只回 live 运行时：closed 的会话在这里就是 None——
           "记录还在"和"运行时活着"是两回事（s07 学习目标⑤）
-        - run_turn 内部走 turn_runner 闭包（_make_turn_runner）：run_agent +
-          trim_history + 权限 runner + 事件直播的拼装全在里面；历史回写由
-          _commit_transcript_if_running 原子落账
-        - status 从 _last_turn_status 接缝读；run_turn 抛
-          SessionLifecycleError = 并发 turn 被拒 / close 竞态丢结果，
-          翻译成 {"error"} 人话
-        - usage 同路（_last_turn_usage）：金额和轮次都得让前端看得见，
-          "成本可观测"不该只有终端能看。离线模型 usage 是空字典——诚实
-          地回 {}，不编造 0
+        - **预检**：会话不在 IDLE（正在跑上一轮）就同步拒绝——人话直接回
+          给本次请求，而不是提交之后在后台失败。竞态窗口（两个同时发、
+          都过了预检）仍存在，那时由 run_turn 的 turn 锁兜底，turn_end
+          事件如实报 failed
+        - turn 在执行器线程里跑（_run_turn_task）：run_agent 的拼装、
+          压缩、审批、事件直播全在既有闭包里；结束后广播 turn_end
+          （带 status/output/usage）——壳层等它收结果，主循环继续伺候
+          其他 RPC。"一轮堵全部"在服务端的那一半就此解除
+        - turnId 由壳生成、这里原样回传并在 turn_end 里带回——壳按它
+          配对结局（按 sid 配对会被快速连发串台：A 的结局灌给 B 的等待）
         """
-        sid = params.get("sessionId","")
-        text = params.get("message","")
+        sid = params.get("sessionId", "")
+        text = params.get("message", "")
+        turn_id = str(params.get("turnId") or "")
         runtime = self._manager.get_session(sid)
         if runtime is None:
             # 这句会直接弹给用户看：说清"为什么发不出去"和"怎么办"。
             # 记录还在但运行时没了 = 已关闭，复活即可（历史接着用）。
             return {"error": (f"会话 {sid} 发不了：不存在或已关闭"
                               "（已关闭的点\"复活\"后可以继续对话）")}
+        if runtime.status != SessionState.IDLE:
+            return {"error": f"会话 {sid} 正在跑上一轮，等它结束再发"}
+        self._executor.submit(self._run_turn_task, sid, text, runtime, turn_id)
+        self._log(f"turn submitted: {sid} (turnId={turn_id[:8]})")
+        return {"sessionId": sid, "status": "started", "turnId": turn_id}
+
+    def _run_turn_task(self, sid: str, text: str,
+                       runtime: SessionProcess, turn_id: str) -> None:
+        """执行器线程里跑一个 turn，结束时广播 turn_end（壳等它收结果）。
+
+        三种结局都如实上报：正常完成（status 来自 run_agent 的诚实汇报）、
+        被状态机拒绝（并发 turn / close 竞态——SessionLifecycleError）、
+        内部异常。连接已死时事件静默丢弃（_emit_event 兜住），turn 照常收尾。
+        """
+        self._emit_event("turn_start", {"sessionId": sid, "turnId": turn_id})
         try:
             output = runtime.run_turn(text)
+            status = getattr(self._turn_ctx, "status", "completed")
+            usage = getattr(self._turn_ctx, "usage", {})
+            self._emit_event("turn_end", {"sessionId": sid, "turnId": turn_id,
+                                          "status": status, "output": output,
+                                          "usage": usage})
         except SessionLifecycleError as exc:
-            return {"error": str(exc)}
-        return {"output": output, "status": self._last_turn_status,
-                "usage": self._last_turn_usage}
+            self._log(f"turn rejected: {sid}: {exc}")
+            self._emit_event("turn_end", {"sessionId": sid, "turnId": turn_id,
+                                          "status": "failed", "output": "",
+                                          "usage": {}, "error": str(exc)})
+        except Exception as exc:
+            self._log(f"turn crashed: {sid}: {exc!r}")
+            self._emit_event("turn_end", {"sessionId": sid, "turnId": turn_id,
+                                          "status": "failed", "output": "",
+                                          "usage": {},
+                                          "error": f"turn 内部异常：{exc}"})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -902,11 +1040,16 @@ class MainProcessClient:
         self,
         user_prompt: Optional[Callable[[str, str], bool]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_disconnect: Optional[Callable[[], None]] = None,
     ) -> None:
         self._conn: Optional[RPCConnection] = None
         self._rpc_id = 0
         self._user_prompt = user_prompt or _terminal_prompt
         self._on_event = on_event
+        # 连接断/关的回调（第 2 步：壳靠它唤醒"等 turn 结局"的 send_to）。
+        # 幂等：多个退出路径都会触发，_disconnect_notified 挡重复。
+        self._on_disconnect = on_disconnect
+        self._disconnect_notified = False
         # 并发三件套：id 分配锁（防撞号）/ 写锁（帧不许被两线程撕开）/
         # future 登记（读线程配对响应、call 等待、close 唤醒，三方共用）。
         self._id_lock = threading.Lock()
@@ -970,6 +1113,18 @@ class MainProcessClient:
         with self._send_lock:
             self._conn.send_message(msg)
 
+    def _notify_disconnect(self) -> None:
+        """连接断/关回调（幂等）：壳靠它唤醒"等 turn 结局"的等待者。"""
+
+        if self._disconnect_notified:
+            return
+        self._disconnect_notified = True
+        if self._on_disconnect is not None:
+            try:
+                self._on_disconnect()
+            except Exception as exc:
+                print(f"[rpc] on_disconnect 回调失败：{exc}")
+
     def _reader_loop(self) -> None:
         """唯一 recv 的线程：响应按 id 配对给 future，通知丢进分派队列。
 
@@ -982,9 +1137,11 @@ class MainProcessClient:
                     msg = self._conn.recv_message()
                 except OSError:
                     self._fail_pending(ConnectionClosed("sidecar 连接中断"))
+                    self._notify_disconnect()
                     return
                 if msg is None:
                     self._fail_pending(ConnectionClosed("sidecar 进程已退出"))
+                    self._notify_disconnect()
                     return
                 if "method" in msg:
                     # 通知：丢给分派线程。读线程绝不自己处理——处理可能
@@ -998,6 +1155,7 @@ class MainProcessClient:
                     # 没有配对对象的响应（超时被弃 / close 后晚到）→ 静默丢弃
         except Exception as exc:
             self._fail_pending(ConnectionClosed(f"读线程异常退出：{exc!r}"))
+            self._notify_disconnect()
 
     def _dispatch_loop(self) -> None:
         """通知的单消费者：FIFO 保事件顺序，审批阻塞不外溢。"""
@@ -1065,3 +1223,4 @@ class MainProcessClient:
             self._notifier.join(timeout=2)
         if self._reader is not None:
             self._reader.join(timeout=2)
+        self._notify_disconnect()

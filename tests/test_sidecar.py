@@ -4,6 +4,7 @@
 测试线程扮演 main 客户端——不真起 mp.Process（进程编排留到 scripts 冒烟）。
 """
 
+import os
 import socket
 import tempfile
 import threading
@@ -178,6 +179,34 @@ class SidecarServerTests(unittest.TestCase):
                 continue
             return msg
 
+    def _send_turn(self, conn: RPCConnection, sid: str, message: str,
+                   events: list[dict] | None = None) -> dict:
+        """agent/send 后台化后的同步语义助手：提交 + 等 turn_end。
+
+        返回 turn_end 的载荷（status/output/usage/error）；沿途事件进
+        events（调用方传自己的列表可收集全程直播）。started 确认响应
+        就地丢弃——结局只认 turn_end。5 秒等不到 = 测试失败（离线模型
+        毫秒级，超时说明后台化出了问题）。
+        """
+        events = events if events is not None else []
+        conn.send_message({"jsonrpc": "2.0", "method": "agent/send",
+                           "params": {"sessionId": sid, "message": message},
+                           "id": 1})
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            msg = conn.recv_message()
+            if "method" in msg:
+                payload = msg.get("params") or {}
+                events.append(payload)
+                # 事件帧的顶层 method 恒为 "event"，事件名在 params["event"]
+                # ——按顶层 method 找 turn_end 永远找不到（recv 会阻塞到
+                # 天荒地老，deadline 只在循环顶检查救不了阻塞中的 recv）。
+                if payload.get("event") == "turn_end":
+                    return payload
+                continue
+            # started 确认（result 响应）——不是结局，继续等
+        raise AssertionError("5 秒内没等到 turn_end")
+
     def test_ping_returns_status_uptime(self) -> None:
         server = SidecarServer(model=None, registry=ToolRegistry(),
                                policy=build_default_policy())
@@ -244,11 +273,11 @@ class SidecarServerTests(unittest.TestCase):
                                policy=build_default_policy())
         conn, _ = self._spawn(server)
         sid = self._request(conn, "session/create", {"cwd": "."})["result"]["sessionId"]
-        self._request(conn, "agent/send", {"sessionId": sid, "message": "任务甲"})
+        self._send_turn(conn, sid, "任务甲")
         self._request(conn, "session/close", {"sessionId": sid})
         resumed = self._request(conn, "session/resume", {"sessionId": sid})["result"]
         self.assertEqual(resumed["generation"], 2)   # 换代：第 2 代运行时
-        self._request(conn, "agent/send", {"sessionId": sid, "message": "任务乙"})
+        self._send_turn(conn, sid, "任务乙")
         second = scripted.received_inputs[1]
         self.assertIn("任务甲", str(second))   # 跨 close/resume 的记忆延续
         conn.close()
@@ -348,7 +377,7 @@ class SidecarServerTests(unittest.TestCase):
                                     store=JsonlSessionStore(root))
             conn1, _ = self._spawn(server1)
             sid = self._request(conn1, "session/create", {"cwd": "."})["result"]["sessionId"]
-            self._request(conn1, "agent/send", {"sessionId": sid, "message": "任务甲"})
+            self._send_turn(conn1, sid, "任务甲")
             conn1.close()   # EOF：第一代死亡，证据文件留在磁盘
 
             # 第二代 sidecar：同目录新 store，重启后一切从证据重建
@@ -363,7 +392,7 @@ class SidecarServerTests(unittest.TestCase):
             self.assertFalse(listed[0]["live"])               # 记录在，运行时没了
             resumed = self._request(conn2, "session/resume", {"sessionId": sid})["result"]
             self.assertEqual(resumed["generation"], 2)        # 换代重建
-            self._request(conn2, "agent/send", {"sessionId": sid, "message": "任务乙"})
+            self._send_turn(conn2, sid, "任务乙")
             second = scripted2.received_inputs[0]
             self.assertIn("任务甲", str(second))   # 跨进程死亡的记忆延续
             conn2.close()
@@ -388,8 +417,8 @@ class SidecarServerTests(unittest.TestCase):
                                policy=build_default_policy())
         conn, _ = self._spawn(server)
         sid = self._request(conn, "session/create")["result"]["sessionId"]
-        self._request(conn, "agent/send", {"sessionId": sid, "message": "任务甲"})
-        self._request(conn, "agent/send", {"sessionId": sid, "message": "任务乙"})
+        self._send_turn(conn, sid, "任务甲")
+        self._send_turn(conn, sid, "任务乙")
         second = scripted.received_inputs[1]
         self.assertIn("任务甲", str(second))  # 第一轮的问答还在历史里
         conn.close()
@@ -413,10 +442,8 @@ class SidecarServerTests(unittest.TestCase):
         conn, _ = self._spawn(server)
         sid = self._request(conn, "session/create")["result"]["sessionId"]
 
-        first = self._request(conn, "agent/send",
-                              {"sessionId": sid, "message": "甲"})["result"]
-        second = self._request(conn, "agent/send",
-                               {"sessionId": sid, "message": "乙"})["result"]
+        first = self._send_turn(conn, sid, "甲")
+        second = self._send_turn(conn, sid, "乙")
         self.assertEqual(first["usage"],
                          {"prompt_tokens": 100, "completion_tokens": 20})
         self.assertEqual(second["usage"],
@@ -430,9 +457,8 @@ class SidecarServerTests(unittest.TestCase):
                                policy=build_default_policy())
         conn, _ = self._spawn(server)
         sid = self._request(conn, "session/create")["result"]["sessionId"]
-        result = self._request(conn, "agent/send",
-                               {"sessionId": sid, "message": "你好"})["result"]
-        self.assertEqual(result["usage"], {})
+        end = self._send_turn(conn, sid, "你好")
+        self.assertEqual(end["usage"], {})
         conn.close()
 
     def test_agent_send_max_steps_honest(self) -> None:
@@ -447,8 +473,8 @@ class SidecarServerTests(unittest.TestCase):
         )
         conn, _ = self._spawn(server)
         sid = self._request(conn, "session/create")["result"]["sessionId"]
-        resp = self._request(conn, "agent/send", {"sessionId": sid, "message": "循环"})
-        self.assertEqual(resp["result"]["status"], "max_steps")
+        end = self._send_turn(conn, sid, "循环")
+        self.assertEqual(end["status"], "max_steps")
         conn.close()
 
     def test_shutdown_flag_then_eof_exits(self) -> None:
@@ -760,6 +786,189 @@ class SidecarServerTests(unittest.TestCase):
             self.assertFalse(server._reaper.is_alive())
 
 
+class TurnBackgroundingTests(unittest.TestCase):
+    """并发第 2 步：agent/send 后台化的三条核心语义（2026-09-26）。
+
+    全部直调 handler（CompactionTranscriptTests 同款）：事件订阅就是给
+    server._on_event 挂收集列表——真实链路里这根线由 handle_connection
+    装配。时序用真 threading.Barrier/Event 证明，不靠 sleep 猜：并行
+    测试里 Barrier(2) 两个 turn 不到齐就超时炸掉，串行执行立刻现形。
+    """
+
+    def setUp(self) -> None:
+        # 测试自我兜底：并行证明要求执行器至少 2 个工人。环境里万一
+        # 设了 1（合法配置），Barrier 会假阴——这条测试自己钉 2，走时还原。
+        self._old_workers = os.environ.get("WYWD_TURN_WORKERS")
+        os.environ["WYWD_TURN_WORKERS"] = "2"
+
+    def tearDown(self) -> None:
+        if self._old_workers is None:
+            os.environ.pop("WYWD_TURN_WORKERS", None)
+        else:
+            os.environ["WYWD_TURN_WORKERS"] = self._old_workers
+
+    # ── 装配助手 ──────────────────────────────────────────────
+
+    def _server_with_tool(self, handler: Callable[[], str]) -> SidecarServer:
+        """自带 slowpoke 工具的 server：会话的 registry 由 runtime_builder
+        现造（"一个会话一个目录"），所以自定义工具必须从工厂里给，
+        进程级 registry 管不到会话。safe_tools 放行——测的是后台化时序，
+        不是审批。"""
+
+        def builder(params: dict):
+            registry = ToolRegistry()
+            registry.register(Tool(
+                name="slowpoke", description="测试堵门工具", handler=handler))
+            return (registry, build_default_policy(safe_tools=("slowpoke",)),
+                    {"kind": "dir", "root": params.get("path")})
+
+        return SidecarServer(model=None, registry=ToolRegistry(),
+                             policy=build_default_policy(),
+                             runtime_builder=builder)
+
+    @staticmethod
+    def _collect_events(server: SidecarServer) -> list[dict]:
+        events: list[dict] = []
+        server._on_event = lambda event, data: events.append(
+            {"event": event, **data})
+        return events
+
+    def _wait_turn_ends(self, events: list[dict], n: int,
+                        timeout: float = 5.0) -> list[dict]:
+        """限时收齐 n 个 turn_end；等不到 = 测试失败（离线模型毫秒级，
+        超时说明后台化断了）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ends = [e for e in list(events) if e.get("event") == "turn_end"]
+            if len(ends) >= n:
+                return ends
+            time.sleep(0.01)
+        raise AssertionError(f"{timeout} 秒内只等到 {len(ends)} 个 turn_end")
+
+    @staticmethod
+    def _script(steps: int, final: str) -> ScriptedModel:
+        """steps 次 tool_calls(slowpoke) + 一次 final 的剧本。"""
+        return ScriptedModel(
+            [ModelReply(kind="tool_calls",
+                        tool_calls=[ToolCall("call_1", "slowpoke", {})])
+             for _ in range(steps)]
+            + [ModelReply(kind="final", text=final)])
+
+    # ── 三条核心语义 ──────────────────────────────────────────
+
+    def test_two_sessions_turns_run_in_parallel(self) -> None:
+        """不同会话的 turn 真并行：Barrier(2) 不到齐不放行。
+
+        串行执行（旧世界）第一个 wait 必超时炸 Barrier → turn 挂掉，
+        断言立刻现形；并行执行两个会师，各自拿到 final。
+        """
+
+        barrier = threading.Barrier(2, timeout=5)
+
+        def slow_handler() -> str:
+            barrier.wait()          # 两人不到齐就超时 → BrokenBarrierError
+            return "会师了"
+
+        server = self._server_with_tool(slow_handler)
+        sid_a = server._handle_session_create({})["sessionId"]
+        sid_b = server._handle_session_create({})["sessionId"]
+        events = self._collect_events(server)
+        # 两个 turn 各要做 1 次工具调用：剧本得有 2 条 tool_calls——只给 1 条
+        # 的话第二个 turn 直接拿到 final、根本不碰 barrier，第一个独自超时。
+        server._model = self._script(2, "收工")
+
+        resp_a = server._handle_agent_send({"sessionId": sid_a,
+                                            "message": "任务甲", "turnId": "t-a"})
+        resp_b = server._handle_agent_send({"sessionId": sid_b,
+                                            "message": "任务乙", "turnId": "t-b"})
+        self.assertEqual(resp_a["status"], "started")
+        self.assertEqual(resp_b["status"], "started")
+
+        ends = self._wait_turn_ends(events, 2)
+        self.assertEqual({e["status"] for e in ends}, {"completed"})
+        by_sid = {e["sessionId"]: e for e in ends}
+        # 共享一个剧本，谁先到谁先拿——输出对得上号就行，顺序不钉
+        self.assertEqual({by_sid[sid_a]["output"], by_sid[sid_b]["output"]},
+                         {"收工", "收工"})
+        # 事件载荷带 sessionId（第 3 步前端分流的依据）：turn_start 也算
+        starts = [e for e in events if e.get("event") == "turn_start"]
+        self.assertEqual({s["sessionId"] for s in starts}, {sid_a, sid_b})
+        self.assertEqual({s["turnId"] for s in starts},
+                         {resp_a["turnId"], resp_b["turnId"]})
+
+    def test_second_send_same_session_rejected_before_submit(self) -> None:
+        """同会话第二个 send 同步被拒：预检的人话直接回给本次请求，
+        不提交、不产生 turn——不用等后台失败才知道发不出去。"""
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_handler() -> str:
+            entered.set()
+            release.wait(timeout=5)
+            return "放行"
+
+        server = self._server_with_tool(slow_handler)
+        sid = server._handle_session_create({})["sessionId"]
+        events = self._collect_events(server)
+        server._model = self._script(1, "第二轮见")
+
+        first = server._handle_agent_send({"sessionId": sid,
+                                           "message": "第一轮", "turnId": "t-1"})
+        self.assertEqual(first["status"], "started")
+        self.assertTrue(entered.wait(timeout=5))   # 第一轮真的在跑了（RUNNING）
+
+        second = server._handle_agent_send({"sessionId": sid, "message": "插队"})
+        self.assertIn("error", second)
+        self.assertIn("正在跑", second["error"])
+
+        release.set()
+        ends = self._wait_turn_ends(events, 1)
+        self.assertEqual(ends[0]["status"], "completed")
+        self.assertEqual(ends[0]["output"], "第二轮见")
+        self.assertEqual(ends[0]["turnId"], first["turnId"])
+        # 插队请求没有产生第二个 turn：turn_start 只有一个
+        starts = [e for e in events if e.get("event") == "turn_start"]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["turnId"], first["turnId"])
+
+    def test_close_mid_turn_reports_failed_and_discards_result(self) -> None:
+        """turn 跑到一半 session/close：晚到结果拒收（transcript 不落账），
+        turn_end 如实报 failed——不装作无事发生，也不陪会话一起挂死。"""
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_handler() -> str:
+            entered.set()
+            release.wait(timeout=5)
+            return "白跑了"
+
+        server = self._server_with_tool(slow_handler)
+        sid = server._handle_session_create({})["sessionId"]
+        events = self._collect_events(server)
+        server._model = self._script(1, "晚到的结局")
+
+        resp = server._handle_agent_send({"sessionId": sid,
+                                          "message": "跑到一半", "turnId": "t-1"})
+        self.assertEqual(resp["status"], "started")
+        self.assertTrue(entered.wait(timeout=5))
+
+        self.assertEqual(server._handle_session_close({"sessionId": sid}),
+                         {"status": "ok", "closed": True})
+        release.set()                  # 放 turn 出来：结果已经没人要了
+
+        ends = self._wait_turn_ends(events, 1)
+        self.assertEqual(ends[0]["status"], "failed")
+        self.assertIn("turn discarded", ends[0]["error"])
+        self.assertEqual(ends[0]["turnId"], resp["turnId"])
+        # 晚到结果拒收：这一轮的用户消息和回复都没进证据
+        record = server._manager.store.load(sid)
+        self.assertNotIn("跑到一半", str(record.messages))
+        self.assertNotIn("晚到的结局", str(record.messages))
+        self.assertEqual(record.status, "closed")
+
+
 class _ScriptedPeer:
     """socketpair 对端的剧本演员（2026-09-26 多路复用测试专用）。
 
@@ -848,16 +1057,22 @@ class MainProcessClientTests(unittest.TestCase):
         client.close(); thread.join(timeout=2)
 
     def test_dispatch_loop_consumes_approval_before_result(self) -> None:
-        """分派环核心：审批通知混在半路时，弹 y/n 回执后继续等 result。"""
+        """分派环核心：审批通知混在半路时，弹 y/n 回执后 turn 照常完成。
+
+        第 2 步起 agent/send 提交即返回 started，结局走 turn_end 事件
+        （client._on_event 收到的 params 里 event 字段才是事件名）。
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             tracked = {"calls": 0}
             prompts: list[tuple[str, str]] = []
+            events: list[dict] = []
             server, client, thread = self._run_server(
                 tmp, tracked,
                 user_prompt=lambda rule_id, reason: prompts.append(
                     (rule_id, reason)) or True,
             )
+            client._on_event = events.append
             sid = client.call("session/create")["result"]["sessionId"]
             server._model = ScriptedModel([
                 ModelReply(kind="tool_calls", tool_calls=[
@@ -866,9 +1081,16 @@ class MainProcessClientTests(unittest.TestCase):
                 ModelReply(kind="final", text="跑完了"),
             ])
             resp = client.call("agent/send", {"sessionId": sid, "message": "跑命令"})
+            self.assertEqual(resp["result"]["status"], "started")
+            deadline = time.time() + 5
+            while time.time() < deadline and not any(
+                    e.get("event") == "turn_end" for e in events):
+                time.sleep(0.01)
+            end = next(e for e in events if e.get("event") == "turn_end")
             self.assertEqual(tracked["calls"], 1)
             self.assertEqual(prompts[0][0], "bash.requires_approval")  # 审批真的弹了
-            self.assertIn("跑完了", resp["result"]["output"])
+            self.assertEqual(end["status"], "completed")
+            self.assertEqual(end["output"], "跑完了")
             client.call("sidecar/shutdown")
             client.close(); thread.join(timeout=2)
 
@@ -877,9 +1099,11 @@ class MainProcessClientTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             tracked = {"calls": 0}
+            events: list[dict] = []
             server, client, thread = self._run_server(
                 tmp, tracked, user_prompt=lambda rule_id, reason: False,
             )
+            client._on_event = events.append
             sid = client.call("session/create")["result"]["sessionId"]
             server._model = ScriptedModel([
                 ModelReply(kind="tool_calls", tool_calls=[
@@ -888,6 +1112,12 @@ class MainProcessClientTests(unittest.TestCase):
                 ModelReply(kind="final", text="好吧不跑了"),
             ])
             resp = client.call("agent/send", {"sessionId": sid, "message": "跑命令"})
+            self.assertEqual(resp["result"]["status"], "started")
+            deadline = time.time() + 5
+            while time.time() < deadline and not any(
+                    e.get("event") == "turn_end" for e in events):
+                time.sleep(0.01)
+            end = next(e for e in events if e.get("event") == "turn_end")
             self.assertEqual(tracked["calls"], 0)  # 拒绝：不碰 handler
             # s07-b：transcript 从 store 存档读（server.sessions 裸字典已退役）
             tool_msgs = " ".join(
@@ -896,7 +1126,8 @@ class MainProcessClientTests(unittest.TestCase):
             )
             self.assertIn("permission_blocked", tool_msgs)
             self.assertIn("bash.requires_approval", tool_msgs)
-            self.assertEqual(resp["result"]["output"], "好吧不跑了")
+            self.assertEqual(end["status"], "completed")
+            self.assertEqual(end["output"], "好吧不跑了")
             client.call("sidecar/shutdown")
             client.close(); thread.join(timeout=2)
 
@@ -1104,6 +1335,27 @@ class CompactionTranscriptTests(unittest.TestCase):
             max_history=max_history,
         )
 
+    def _send_and_wait(self, server: SidecarServer, sid: str,
+                       message: str) -> dict:
+        """直调 handler 的后台化适配：订阅事件 → 提交 → 等 turn_end。
+
+        第 2 步起 agent/send 提交即返回 started，结局走 turn_end 事件——
+        这里没有 socket，直接把 server._on_event 指到收集列表（真实链路里
+        这根线由 handle_connection 装配）。
+        """
+        events: list[dict] = []
+        server._on_event = lambda event, data: events.append(
+            {"event": event, **data})
+        resp = server._handle_agent_send({"sessionId": sid, "message": message})
+        self.assertEqual(resp.get("status"), "started")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            for item in events:
+                if item.get("event") == "turn_end":
+                    return item
+            time.sleep(0.01)
+        raise AssertionError("5 秒内没等到 turn_end")
+
     def test_compaction_keeps_the_evidence_append_only(self) -> None:
         """压缩真出手时，落盘的仍是**原始历史**——第二轮照常能发。"""
 
@@ -1111,12 +1363,12 @@ class CompactionTranscriptTests(unittest.TestCase):
         store = server._manager.store
         sid = server._handle_session_create({})["sessionId"]
 
-        first = server._handle_agent_send({"sessionId": sid, "message": "第一问"})
+        first = self._send_and_wait(server, sid, "第一问")
         self.assertEqual(first.get("status"), "completed")
         after_first = store.load(sid).messages
 
         # 第二轮：压缩会动手（日志里能看到 L3/L4），但**不能碰落盘前缀**
-        second = server._handle_agent_send({"sessionId": sid, "message": "第二问"})
+        second = self._send_and_wait(server, sid, "第二问")
         self.assertEqual(second.get("status"), "completed")
 
         after_second = store.load(sid).messages
@@ -1132,9 +1384,9 @@ class CompactionTranscriptTests(unittest.TestCase):
         store = server._manager.store
         sid = server._handle_session_create({})["sessionId"]
 
-        server._handle_agent_send({"sessionId": sid, "message": "第一问"})
+        self._send_and_wait(server, sid, "第一问")
         after_first = store.load(sid).messages
-        server._handle_agent_send({"sessionId": sid, "message": "第二问"})
+        self._send_and_wait(server, sid, "第二问")
         after_second = store.load(sid).messages
 
         self.assertEqual(after_second[:len(after_first)], after_first)

@@ -17,9 +17,10 @@ from scripts.shell import SidecarShell
 class FakeClient:
     """记录调用 + 罐装响应；connect 立刻关掉 cli（防测试 fd 泄漏）。"""
 
-    def __init__(self, user_prompt=None, on_event=None):
+    def __init__(self, user_prompt=None, on_event=None, on_disconnect=None):
         self.user_prompt = user_prompt
         self.on_event = on_event
+        self.on_disconnect = on_disconnect
         self.calls: list[tuple[str, dict | None]] = []
         self.closed = False
         self._id = 0
@@ -137,9 +138,12 @@ class SidecarShellTests(unittest.TestCase):
         shell, client, _ = self._make()
         shell.start()
         shell.send("你好")
-        self.assertEqual(client.calls[-1], ("agent/send", {
-            "sessionId": "sess_2", "message": "你好",
-        }))
+        method, params = client.calls[-1]
+        self.assertEqual(method, "agent/send")
+        self.assertEqual(params["sessionId"], "sess_2")
+        self.assertEqual(params["message"], "你好")
+        # turnId 由壳生成、随请求带给 sidecar——结局按它配对（防串台）
+        self.assertTrue(params["turnId"])
 
     def test_stop_idempotent_and_ordered(self) -> None:
         shell, client, factory = self._make(alive=False)  # 子进程已正常退出
