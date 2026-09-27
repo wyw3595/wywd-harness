@@ -2475,10 +2475,26 @@ notice 改从事件来——打开会话时按 sessionId 从事件环重建最�
 
 冒烟：curl 验 202 + 事件环全帧带 sessionId；浏览器真 UI 全链路（发
 消息 → 懒建 → 直播轨迹 → 历史落账 → 成本表刷新 → F5 恢复）。两个
-记录在案的事实：FakeModel 恒为 completed，restoreNotice 的非
-completed 分支靠代码审查覆盖；shell.new_session 本来就是"关旧开新"
-（冒烟时看到旧会话变 closed 不是 bug）。
+记录在案的事实：shell.new_session 本来就是"关旧开新"（冒烟时看到
+旧会话变 closed 不是 bug）；FakeModel 恒为 completed——因此
+restoreNotice 的非 completed 分支当时只做了代码审查，补验见下节。
 
-**并发改造三步全部完成**。剩余：push（本地领先远端 12+ 提交，等用户
-发话）；偶发 flake 条目仍有效（未再现）。
+## 六、失败路径端到端验证（2026-09-27 续，62067ca 之后的补验）
+
+上节留的边界"restoreNotice 非 completed 分支靠代码审查覆盖"已补验
+**通过**。造法（不用真模型、不碰外部 API）：本地起一个"任何 POST 都
+回 401"的 mock 网关，`WYWD_API_BASE` 指过去 + 任意假 key——RealModel
+的 4xx 快速失败路径（`_is_permanent_error` 不重试）立刻给出诚实失败。
+验证了三层：curl 层 turn_end `status=failed` 且 **output 带人话**
+（"调用模型失败：DeepSeek 拒绝请求（HTTP 401）…"，注意失败走 output
+不走 error，前端走 warn 结局卡而非红色"没能开始"卡）；浏览器实时发
+一轮 → 黄色"本轮结局"卡渲染 + transcript 照常落账（run_turn 正常
+返回时连失败轮的 user 消息也 commit）；**F5/重开页面 → 结局卡从事件
+环重建**（SSE 用 after=latest 不重放，唯一来源就是 restoreNotice 翻
+环）——"结局不落盘 F5 就丢"在环存活窗口内的修复正式闭环。
+顺带验证：mock 场景下两轮失败 transcript 单调增长、事件环两条
+turn_end turnId 各自独立。
+
+**并发改造三步全部完成，已推送远端**（0d26515..62067ca，含 README
+测试数修正）。剩余观察项：偶发 flake 条目仍有效（未再现）。
 
