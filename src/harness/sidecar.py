@@ -1008,7 +1008,13 @@ class SidecarServer:
         self._manager.store.save(runtime.record)
         self._metrics_upsert_session(sid)
         try:
-            return runtime.run_turn(spec["prompt"])
+            output = runtime.run_turn(spec["prompt"])
+            # s24 综合验收抓到的缺口：自动化直调 run_turn 绕过了
+            # _run_turn_task 的记账点——自动任务的用量也得进统计账
+            # （_turn_ctx 是线程本地，本线程跑的 turn 账就在这）。
+            self._record_usage(
+                sid, getattr(self._turn_ctx, "usage", {}) or {})
+            return output
         finally:
             self._manager.close_session(sid)
 
