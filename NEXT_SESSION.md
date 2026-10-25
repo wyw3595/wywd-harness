@@ -2924,3 +2924,62 @@ srcdoc 的 SVG/viewBox、卡片标题全部核对通过，截图留证。README 
 - s22 自动化调度 / s23 审计沙盒（教材最后两章机制课）；
 - s24 综合收官；
 - 运行中切专家 / 召回自动注入 / 自动打开主交付（同一批管线课）。
+
+# 2026-10-25（六续）：s21 SQLite 统计库——JSONL 管证据，SQLite 管查询
+
+用户"提交继续"后：s20 落 614e143，顺位做 s21。
+
+## 一、新文件与接线
+
+- `src/harness/sqlite_store.py`（内核，sqlite3 标准库）：`HarnessDB`——
+  WAL/synchronous=NORMAL/foreign_keys 三 PRAGMA；migration_meta 迁移
+  账本（每版本一事务，重开幂等）；sessions/usage_tracking/tool_usage
+  三张表（automations 三张是 s22 的课，迁移框架已备）；软删除（永远
+  不 DELETE FROM）；聚合查询（session_usage/usage_summary 月度前缀/
+  top_tools 确定性排行）；一把锁串行化写（挂钩点在执行器/事件线程）。
+- sidecar：`metrics_db` 可选注入（None 零感知）；挂钩点——
+  session/create/close/resume 镜像元数据、forget 软删除、
+  `_run_turn_task` 的 turn_end 后记轮级 token 用量（失败只喊一声不炸
+  收尾）、`_stamped` 里记工具账；新 RPC `stats/summary`
+  （未启用明确说"没有"，不给一串零）。
+- shell：`.sessions/harness.db` 开库传入（统计派生自会话证据，
+  不新开一级目录）。
+
+## 二、与教材的差异（刻意的）
+
+- 教材 7 张表兼存消息；本项目消息**只在 JSONL**（证据不搬家），
+  sessions 表是元数据索引——大文本不进 SQLite（教材误区清单第一条）。
+- cost 列保留记 0.0：成本核算在 router 层，本层只记 token 原始量
+  （成本可后算，反之不行）。
+- 会话权威仍是 JSONL + SessionManager；本层是只增不删的投影，
+  方向单一（sidecar 写、查询面读）不打架。
+
+## 三、本次踩的坑（一个真 bug 两个测试错）
+
+1. **工具账钩子挂错层**（真 bug，测试抓的）：第一版把 tool_end 记账
+   放在 `_emit_event`——但中途事件（round_start/tool_end）走
+   `_stamped` 包装器**直呼** `self._on_event`，根本不经过 _emit_event
+   （那条路只有 turn_start/turn_end）。钩子挪进 `_stamped`（sessionId
+   闭包自带，订阅者不在也记账）。教训：**挂钩前先画事件流**——
+   "哪个事件走哪条路"是接线题的第一问。
+2. 测试算术错两处：轮级 usage 是跨 step 累加（120+180=300 不是 180）；
+   "平票排序"其实不平（fs_read 3 次 > calc 2 次）。预期写错时先怀疑
+   自己的算式，再怀疑被测代码——两条都判了"测试错"。
+3. Windows：SQLite 连接不关，TemporaryDirectory 清理 WinError 32
+   ——全部走 `_open_db` 上下文强制 close；sidecar 测试（服务端线程
+   生命周期超出测试）加 ignore_cleanup_errors 兜底，泄漏由显式
+   close 的内核测试兜住。
+
+## 四、验收
+
+新 `tests/test_sqlite_store.py` 11 条：PRAGMA/迁移幂等/并发写串行、
+upsert 排序与行数不涨、软删除行还在磁盘、月度前缀过滤、外键
+IntegrityError、排行确定性、sidecar 真实 turn 路径（用量/工具账/
+会话镜像/forget 软删除/stats RPC 两态）。全量 **837 条 OK（含 2
+skip）**，README 已跟上。改动未提交，等用户发话。
+
+## 五、下一步候选（由用户定）
+
+- s22 自动化调度（automations 三张表的迁移条目已备好）；
+- s23 审计沙盒 → s24 综合收官；
+- stats 面板进 UI（运维抽屉加一块，数据源 stats/summary）。

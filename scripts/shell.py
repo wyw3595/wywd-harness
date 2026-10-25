@@ -60,6 +60,7 @@ from scripts.toolbox import (
 from src.harness.artifact import ArtifactStore
 from src.harness.jsonl_store import JsonlSessionStore
 from src.harness.sidecar import MainProcessClient, RPCConnection, SidecarServer
+from src.harness.sqlite_store import HarnessDB
 from src.harness.workspace import Workspace
 
 
@@ -185,6 +186,9 @@ def _sidecar_process(sock: socket.socket) -> None:
     # s17：默认工作区的 MCP 连接器（.sandbox 没有 mcp.json = None，
     # 与改造前完全一致）。
     mcp_manager = build_mcp_manager(default_workspace.root)
+    # s21：SQLite 统计库（WAL）——会话元数据镜像 + 用量/工具账。
+    # 放 .sessions/ 旁边：它派生自会话证据，不是新的一级目录。
+    metrics_db = HarnessDB(Path(_PROJECT_ROOT) / ".sessions" / "harness.db")
     server = SidecarServer(
         model=build_model_router(),
         registry=build_registry_for(default_workspace, mcp_manager=mcp_manager),
@@ -206,6 +210,7 @@ def _sidecar_process(sock: socket.socket) -> None:
         externalize=artifacts.externalize,    # s13：超阈值工具输出外化
         skill_index=skills,                   # s16：命中触发词时展开正文
         expert_index=build_expert_index(default_workspace.root),  # s18
+        metrics_db=metrics_db,                # s21：统计索引（WAL）
     )
     server.handle_connection(RPCConnection(sock))
 

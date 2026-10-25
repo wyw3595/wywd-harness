@@ -83,6 +83,7 @@ from src.harness.session import (
     SessionStore,
 )
 from src.harness.skills import SkillIndex, skill_marker
+from src.harness.sqlite_store import HarnessDB
 from src.harness.tools import ToolRegistry
 
 # 工作区运行件工厂（s11 上传目录）：由装配层注入，harness 不认识 Workspace。
@@ -285,6 +286,7 @@ class SidecarServer:
         compact_budget: int = COMPACT_THRESHOLD_TOKENS,
         skill_index: Optional[SkillIndex] = None,
         expert_index: Optional["ExpertIndex"] = None,
+        metrics_db: Optional["HarnessDB"] = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -330,6 +332,10 @@ class SidecarServer:
         # session/create（expertId 参数）——specialization 作为一条 system
         # 消息写进起步历史，转录即证据，resume 自然带着人格回来。
         self._expert_index = expert_index
+        # SQLite 统计库（s21）：None = 不启用（老装配零感知）。只增不删的
+        # 投影——会话元数据镜像 + 用量/工具账；真相在 JSONL，这里只管
+        # 查询面（SUM/GROUP BY 不用重放转录）。
+        self._metrics_db = metrics_db
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
         # s09：持久化注入 + 启动清账。
@@ -439,6 +445,8 @@ class SidecarServer:
         self.rpc_handlers["session/list"] = self._handle_session_list
         # s18 专家：目录给 UI 挑人用；激活走 session/create 的 expertId。
         self.rpc_handlers["expert/list"] = self._handle_expert_list
+        # s21 统计：SQLite 索引层的查询面（用量/工具排行）。
+        self.rpc_handlers["stats/summary"] = self._handle_stats_summary
         # s07-b 四操作路由（老 session/destroy"一删全没"已退役）
         self.rpc_handlers["session/close"] = self._handle_session_close
         self.rpc_handlers["session/resume"] = self._handle_session_resume
@@ -549,6 +557,17 @@ class SidecarServer:
             # 传 record.id），在这里盖章正合适。self._on_event 保持"调用那
             # 一刻才读"（per-connection，s06 的装配顺序不能破坏）。
             def _stamped(event: str, data: dict) -> None:
+                # s21 工具账：中途事件不经过 _emit_event（那条路只走
+                # turn_start/turn_end），钩子挂在这里才接得住 tool_end。
+                # 记在订阅判断**之外**——没有直播订阅者账也要记，统计
+                # 不依赖有没有人看。
+                if (event == "tool_end" and self._metrics_db is not None
+                        and data.get("name")):
+                    try:
+                        self._metrics_db.record_tool_call(
+                            sid, str(data["name"]))
+                    except Exception as exc:
+                        self._log(f"metrics tool record failed: {exc}")
                 base = self._on_event
                 if base is not None:
                     base(event, {**data, "sessionId": sid})
@@ -648,7 +667,10 @@ class SidecarServer:
 
     def _emit_event(self, event: str, data: dict) -> None:
         """后台线程安全的事件广播。连接不在（换代/已关/已停）就静默——
-        事件是直播不是证据；发送失败也不能炸掉正在收尾的 turn。"""
+        事件是直播不是证据；发送失败也不能炸掉正在收尾的 turn。
+        （中途事件的 sessionId 盖章与 s21 工具账都在 _stamped 那层——
+        本方法只服务 turn_start/turn_end 这两个框架级事件。）
+        """
 
         if self._on_event is None:
             return
@@ -656,6 +678,46 @@ class SidecarServer:
             self._on_event(event, data)
         except Exception as exc:
             self._log(f"event emit failed: {exc}")
+
+    def _record_usage(self, sid: str, usage: dict) -> None:
+        """s21：一轮的 token 用量入 SQLite 索引。
+
+        失败只喊一声不炸 turn——统计缺一轮可以忍，收尾路径不能陪葬。
+        轮级汇总记在 craft 主档位名下；router 的分档账在装配层，本层
+        只存 token 原始量（成本可后算，反之不行）。
+        """
+
+        if self._metrics_db is None or not usage:
+            return
+        try:
+            self._metrics_db.record_usage(
+                sid, "craft",
+                input_tokens=usage.get("prompt_tokens", 0),
+                output_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0))
+        except Exception as exc:
+            self._log(f"metrics record failed: {exc}")
+
+    def _metrics_upsert_session(self, sid: str) -> None:
+        """s21：会话元数据镜像进 SQLite（查询面，不是真源）。"""
+
+        if self._metrics_db is None:
+            return
+        try:
+            record = self._manager.load_record(sid)
+            self._metrics_db.upsert_session({
+                "id": record.id,
+                "cwd": record.cwd,
+                "title": record.title,
+                "status": record.status,
+                "mode": record.mode,
+                "created_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created_at)),
+                "updated_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.updated_at)),
+            })
+        except Exception as exc:
+            self._log(f"metrics upsert failed: {exc}")
 
     # ── 连接循环 + per-connection 装配 ─────────────────────────
 
@@ -853,6 +915,7 @@ class SidecarServer:
             self._log(f"expert activated: {expert_id}")
         runtime.record.messages = seed
         self._manager.store.save(runtime.record)
+        self._metrics_upsert_session(sid)      # s21：元数据镜像进索引
         self._log(f"session created: {sid}")
         return {"sessionId": sid}
 
@@ -862,6 +925,26 @@ class SidecarServer:
         if self._expert_index is None:
             return {"experts": []}
         return {"experts": self._expert_index.list()}
+
+    def _handle_stats_summary(self, params: dict) -> dict:
+        """统计查询面（s21）：用量汇总 + 工具排行，SQLite 出，不重放转录。
+
+        month='YYYY-MM' 时多给一份月度视图；未启用统计库的装配明确说
+        没有，而不是给一串零——零和"没这功能"是两个答案。
+        """
+
+        if self._metrics_db is None:
+            return {"enabled": False,
+                    "reason": "这个装配没有启用 SQLite 统计库"}
+        month = str(params.get("month") or "").strip() or None
+        summary = {
+            "enabled": True,
+            "total": self._metrics_db.usage_summary(),
+            "top_tools": self._metrics_db.top_tools(5),
+        }
+        if month:
+            summary["monthly"] = self._metrics_db.usage_summary(month)
+        return summary
 
     def _handle_session_list(self, params: dict) -> dict:
         """会话清单：Record.summary() + live 标志（s07 的 UI 安全视图）。
@@ -881,6 +964,7 @@ class SidecarServer:
             closed = self._manager.close_session(params.get("sessionId", ""))
         except (SessionLifecycleError, ValueError, OSError) as exc:
             return {"error": str(exc)}
+        self._metrics_upsert_session(params.get("sessionId", ""))  # s21
         self._log(f"session closed: {params.get('sessionId', '')} ({closed})")
         return {"status": "ok", "closed": closed}
 
@@ -892,6 +976,7 @@ class SidecarServer:
         except (SessionLifecycleError, ValueError, OSError) as exc:
             return {"error": str(exc)}
         generation = self._manager.load_record(sid).runtime_generation
+        self._metrics_upsert_session(sid)      # s21：generation/状态变了
         self._log(f"session resumed: {sid} (generation {generation})")
         return {"sessionId": sid, "generation": generation}
 
@@ -904,6 +989,13 @@ class SidecarServer:
             return {"error": str(exc)}
         if not forgot:
             return {"error": f"没有这个会话：{sid}（可能已被删除）"}
+        # s21：索引层软删除（行保留，查询面不再出现）——JSONL 侧由
+        # forget 真删（用户明确要求的删除），两层各自的语义。
+        if self._metrics_db is not None:
+            try:
+                self._metrics_db.soft_delete_session(sid)
+            except Exception as exc:
+                self._log(f"metrics soft delete failed: {exc}")
         self._log(f"session forgotten: {sid}")
         return {"status": "ok"}
 
@@ -1108,6 +1200,7 @@ class SidecarServer:
             self._emit_event("turn_end", {"sessionId": sid, "turnId": turn_id,
                                           "status": status, "output": output,
                                           "usage": usage})
+            self._record_usage(sid, usage)   # s21：用量入账（失败不炸收尾）
         except SessionLifecycleError as exc:
             self._log(f"turn rejected: {sid}: {exc}")
             self._emit_event("turn_end", {"sessionId": sid, "turnId": turn_id,

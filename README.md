@@ -54,6 +54,11 @@
   存在性）；只交付**新生成**的产物；沙箱外路径拒绝建卡（存在性是
   信息不是展示）；缺失文件如实标"未找到"；[files] JSON 协议合同测试
   钉死。
+- **SQLite 统计库**：JSONL 管事件流（证据），SQLite 管索引/状态/统计
+  （派生）——WAL 三 PRAGMA、migration_meta 迁移账本、软删除（永远
+  不 DELETE FROM）、外键 fail-closed（用量必须挂真实会话）；会话
+  元数据镜像 + 轮级 token 用量 + 工具调用账，`stats/summary` 查询面
+  （月度/总量/工具排行）不用重放转录。
 - **技能系统**：SKILL.md 先列目录、触发词命中再展开全文；manifest 只能收窄权限。
 - **提示词组装**：记忆候选选择管线（scope 门 → 置信度门 → 权限三层 →
   精确去重 → 冲突裁决 → top-k/双预算装箱，每条候选一个稳定原因码）+
@@ -88,6 +93,7 @@ src/harness/        内核（不认识任何 UI 和具体模型）
   experts.py          领域专家包（索引 / specialization / 工具倾向）
   widgets.py          可视化（设计指引 / 校验 / [widget] 注入协议）
   presentation.py     成果交付（artifact 卡 / 沙箱边界 / [files] 协议）
+  sqlite_store.py     SQLite 统计库（WAL / 迁移 / 软删除 / 聚合）
   session.py          SessionRecord / SessionProcess / SessionManager
   jsonl_store.py      JSONL 证据持久化
   sidecar.py          Sidecar 服务端 + RPC 客户端（读线程 + Future）
@@ -105,7 +111,7 @@ scripts/            壳层与入口
   native_dialog.py    系统目录选择框（降级机制）
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              826 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              837 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始
