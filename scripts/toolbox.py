@@ -55,6 +55,7 @@ from src.harness.permissions import (
     WorkspaceScope,
     build_default_policy,
 )
+from src.harness.presentation import present_payload
 from src.harness.prompt_assembly import (
     MemorySelectionPolicy,
     PromptPlan,
@@ -595,6 +596,19 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
             return ("没渲染：" + "；".join(errors) + "——按指引进改再调一次")
         return widget_payload(title, widget_code)
 
+    def present_files(files: list[str], explanation: str = "") -> str:
+        """交付成果（s20）：唯一交付入口，任务收尾时调用。
+
+        顺序即优先级（第一个最重要，标主交付）；只列**新生成的**
+        交付物；缺失的文件会如实标注"未找到"。沙箱外的路径拒绝
+        交付——存在性是信息，不是展示。
+        """
+
+        try:
+            return present_payload(files, explanation, root=root_)
+        except ValueError as error:
+            return f"没交付：{error}"
+
     return [
         Tool(
             name="load_skill",
@@ -657,6 +671,28 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
                         "description": "渲染进度提示（1-4 条，可选）"},
                 },
                 "required": ["title", "widget_code"],
+            },
+            defer=True,
+        ),
+        Tool(
+            name="present_files",
+            description="任务收尾的**唯一交付入口**：把新生成的交付物一次性"
+            "展示给用户。files 的顺序就是观看优先级——最重要的放第一个"
+            "（会标为主交付）。只列新生成的文件，别列只是读过或改过几行"
+            "的；它是文字回复的补充——先用文字说清做了什么，再调用我。"
+            "条目可以是文件路径或 http(s) URL。",
+            handler=present_files,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "交付物路径/URL，按观看优先级排序"},
+                    "explanation": {
+                        "type": "string",
+                        "description": "一句话说明这批交付物是什么（可选）"},
+                },
+                "required": ["files"],
             },
             defer=True,
         ),
@@ -948,6 +984,9 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     # 同一条免审批理由）。运行时行为由前端 sandbox iframe 兜底。
     "read_widget_guide",
     "show_widget",
+    # 成果交付（s20）：纯呈现——沙箱内 stat 出卡片信息（越界路径在
+    # presentation.build_cards 里就拒了），不改任何文件。
+    "present_files",
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions

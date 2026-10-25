@@ -209,6 +209,9 @@ class DefaultBehaviorTests(unittest.TestCase):
             # 可视化（s19，2026-10-25）：设计指引 + SVG/HTML widget 注入，
             # 纯呈现（运行时行为由前端 sandbox iframe 兜底）
             "read_widget_guide", "show_widget",
+            # 成果交付（s20，2026-10-25）：唯一交付入口，纯呈现
+            # （沙箱内 stat，越界路径在 presentation 层拒绝）
+            "present_files",
         }
         self.assertEqual(set(build_registry().names()), expected)
 

@@ -502,6 +502,23 @@ export const ChatArea = {
                   <iframe class="widget-frame" :srcdoc="line.text"
                           sandbox="allow-scripts" title="widget 渲染区"></iframe>
                 </div>
+                <div v-else-if="line.kind === 'files'" class="lf-line lf-files-box">
+                  <div class="lf-widget-head">
+                    <span class="lf-widget-tag">📦 交付</span>
+                    <span class="lf-plan-sum">{{ line.summary }}</span>
+                  </div>
+                  <div class="files-row">
+                    <div v-for="(card, i) in line.cards" :key="i"
+                         class="file-card"
+                         :class="{ 'is-missing': !card.exists }"
+                         :title="card.path">
+                      <span class="fc-primary" v-if="card.isPrimary">★</span>
+                      <span class="fc-icon">{{ card.icon }}</span>
+                      <span class="fc-name">{{ card.name }}</span>
+                      <span class="fc-size">{{ card.exists ? card.size : '未找到' }}</span>
+                    </div>
+                  </div>
+                </div>
                 <div v-else class="lf-line" :class="'lf-' + line.kind">
                 <template v-if="line.kind === 'call'">
                   <div v-if="line.explain" class="lf-explain">💬 {{ line.explain }}</div>

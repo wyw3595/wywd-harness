@@ -49,6 +49,11 @@
   约定 / 片段无文档标签 / 尺寸上限）→ 前端 **sandbox iframe** 原地
   渲染（allow-scripts 不带 allow-same-origin）；校验失败人话回灌；
   [widget] 注入协议两端钉死。
+- **成果交付**：`present_files` 唯一交付入口——顺序即观看优先级
+  （第一个标主交付 ★），每文件一张 artifact 卡（类型图标/名字/大小/
+  存在性）；只交付**新生成**的产物；沙箱外路径拒绝建卡（存在性是
+  信息不是展示）；缺失文件如实标"未找到"；[files] JSON 协议合同测试
+  钉死。
 - **技能系统**：SKILL.md 先列目录、触发词命中再展开全文；manifest 只能收窄权限。
 - **提示词组装**：记忆候选选择管线（scope 门 → 置信度门 → 权限三层 →
   精确去重 → 冲突裁决 → top-k/双预算装箱，每条候选一个稳定原因码）+
@@ -82,6 +87,7 @@ src/harness/        内核（不认识任何 UI 和具体模型）
   mcp.py              MCP 连接器（信任 / grant / 命名空间化 / dispatch）
   experts.py          领域专家包（索引 / specialization / 工具倾向）
   widgets.py          可视化（设计指引 / 校验 / [widget] 注入协议）
+  presentation.py     成果交付（artifact 卡 / 沙箱边界 / [files] 协议）
   session.py          SessionRecord / SessionProcess / SessionManager
   jsonl_store.py      JSONL 证据持久化
   sidecar.py          Sidecar 服务端 + RPC 客户端（读线程 + Future）
@@ -99,7 +105,7 @@ scripts/            壳层与入口
   native_dialog.py    系统目录选择框（降级机制）
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              808 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              826 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始
