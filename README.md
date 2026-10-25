@@ -64,6 +64,10 @@
   隔离会话执行（跑完即关，转录即证据）+ run 历史可审计；错过不补
   （下一次从执行时刻起算）；软删除可恢复；runner/clock 全注入可离线
   测到任意时间点。
+- **审计链**：工具执行留痕的 SHA256 哈希链——每条 hash 覆盖前一条，
+  改任何历史当场断链；链外锚点文件（条数 + 链尾 hash）交叉比对，
+  **防哈希链防不了的删尾**（合法链的前缀也是合法链）；canonical
+  JSON 键排序保证重放确定性；指认到"第几条坏了"。
 - **技能系统**：SKILL.md 先列目录、触发词命中再展开全文；manifest 只能收窄权限。
 - **提示词组装**：记忆候选选择管线（scope 门 → 置信度门 → 权限三层 →
   精确去重 → 冲突裁决 → top-k/双预算装箱，每条候选一个稳定原因码）+
@@ -100,6 +104,7 @@ src/harness/        内核（不认识任何 UI 和具体模型）
   presentation.py     成果交付（artifact 卡 / 沙箱边界 / [files] 协议）
   sqlite_store.py     SQLite 统计库（WAL / 迁移 / 软删除 / 聚合）
   automations.py      自动化调度（RRULE / tick / 隔离执行）
+  audit.py            审计链（SHA256 哈希链防改 + 锚点防删尾）
   session.py          SessionRecord / SessionProcess / SessionManager
   jsonl_store.py      JSONL 证据持久化
   sidecar.py          Sidecar 服务端 + RPC 客户端（读线程 + Future）
@@ -117,7 +122,7 @@ scripts/            壳层与入口
   native_dialog.py    系统目录选择框（降级机制）
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              845 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              851 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始

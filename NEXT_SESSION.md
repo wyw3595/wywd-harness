@@ -3026,3 +3026,29 @@ PAUSED、recurring 锚定执行时刻（错过不补）、失败入历史、软�
 PAUSED 不到期、sidecar 全链（create→手动 tick→真实 run_turn→历史→
 软删除两态）、坏参数人话。全量 **845 条 OK（含 2 skip）**。改动未
 提交。教材只剩 s23 审计沙盒、s24 收官。
+
+# 2026-10-25（八续）：s23 审计链——每步留痕，不可篡改
+
+s22 未提交，接着做 s23（教材倒数第二章）。
+
+## 做了什么
+
+- `src/harness/audit.py`（内核）：`AuditChain`——append-only JSONL +
+  SHA256 哈希链（每条 hash 覆盖 canonical JSON + prev_hash，改历史
+  断链、verify 指认第几条）+ **链外锚点** audit.head（条数 + 链尾
+  hash 交叉比对，防"合法链前缀也是合法链"的删尾攻击——教材明确
+  指出的哈希链盲区）；重开无缝续链（从盘上重放拿链尾）。
+- sidecar：`audit_chain` 可选注入；挂在 _stamped 的 tool_end（与
+  s21 工具账同一点）——谁在哪个会话调了什么、返回了什么，失败只
+  喊一声不炸 turn。shell 传 .sessions/audit.jsonl。
+- 分账：权限决策的审计在 permissions.AuditTrail（s04）；本模块补
+  **工具执行留痕**。命令分级/沙盒我们 s04（bash 硬拒/只读白名单）
+  与 file_tools 沙箱已覆盖，s23 的增量就是防篡改链。
+
+## 验收
+
+新 `tests/test_audit.py` 6 条：建链/续链/重开无缝、篡改第 1 条被
+指认、**删尾被锚点抓住**（链本身仍合法——盲区即考点）、canonical
+确定性（键序无关）、sidecar 真实 turn 工具调用落链且 verify 通过。
+全量 **851 条 OK（含 2 skip）**。教材只剩 s24 综合收官。s22+s23
+均未提交。

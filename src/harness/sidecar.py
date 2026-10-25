@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from src.harness.agent import run_agent
+from src.harness.audit import AuditChain
 from src.harness.automations import (
     AutomationError,
     AutomationScheduler,
@@ -295,6 +296,7 @@ class SidecarServer:
         expert_index: Optional["ExpertIndex"] = None,
         metrics_db: Optional["HarnessDB"] = None,
         automation_interval: float = 0.0,
+        audit_chain: Optional["AuditChain"] = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -354,6 +356,9 @@ class SidecarServer:
                              args=(automation_interval,),
                              daemon=True, name="automation-tick").start()
         self._history_seed = history_seed or (lambda: [])
+        # s23 审计链：工具执行留痕（哈希链防改 + 锚点防删尾）。
+        # None = 不启用（老装配零感知）；权限决策的审计在 AuditTrail。
+        self._audit = audit_chain
         self.ring_buffer = RingBuffer()
         # s09：持久化注入 + 启动清账。
         # 1. store 透传（None → Manager 自己落 InMemory，离线测试零感知）：
@@ -589,6 +594,16 @@ class SidecarServer:
                             sid, str(data["name"]))
                     except Exception as exc:
                         self._log(f"metrics tool record failed: {exc}")
+                # s23：同一点顺手留审计痕——谁在哪个会话调了什么、
+                # 返回了什么。失败只喊一声：审计缺一条可忍，turn 不陪葬。
+                if event == "tool_end" and self._audit is not None:
+                    try:
+                        self._audit.append("tool_call", {
+                            "session_id": sid,
+                            "tool": str(data.get("name", "")),
+                        }, str(data.get("content", "")))
+                    except Exception as exc:
+                        self._log(f"audit append failed: {exc}")
                 base = self._on_event
                 if base is not None:
                     base(event, {**data, "sessionId": sid})

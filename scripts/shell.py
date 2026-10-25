@@ -58,6 +58,7 @@ from scripts.toolbox import (
     resolve_max_agent_steps,
 )
 from src.harness.artifact import ArtifactStore
+from src.harness.audit import AuditChain
 from src.harness.jsonl_store import JsonlSessionStore
 from src.harness.sidecar import MainProcessClient, RPCConnection, SidecarServer
 from src.harness.sqlite_store import HarnessDB
@@ -208,6 +209,9 @@ def _sidecar_process(sock: socket.socket) -> None:
         # s22：自动化 tick 线程（WYWD_AUTOMATION_TICK 秒；默认 0 = 不起
         # 线程，RPC 常在，测试手动 tick）。
         automation_interval=_automation_interval(),
+        # s23：审计链（工具执行留痕，哈希链 + 锚点防删尾）。
+        audit_chain=AuditChain(
+            Path(_PROJECT_ROOT) / ".sessions" / "audit.jsonl"),
         # s10：工具目录 + 工作区记忆（空记忆时与旧行为一致）。
         # s11：用户记忆（跨项目）。s16：技能**目录**（正文按需展开）。
         # s17：MCP 连接器目录（无连接器时整段 inactive，零开销）。
