@@ -2526,3 +2526,167 @@ KeyError: generation）。修法：执行器拿 gate 等 started 帧上线再开
 分支也放）；**直调 handler 的路径（无 socket）不等待**——`self._conn`
 为 None 即视为 gate 已放开，4 个直调测试因此零改动。全量 674 条 OK
 （含 2 skip）。
+
+# 2026-10-25：先提交存量（500085a），再做 s15 提示词组装
+
+## 〇、存量提交（500085a，不 push）
+
+上窗口完成的两个特性躺在工作区 19 文件 +900/-27：①停止/暂停全链接线
+（TurnControl 两检查点 → aborted/paused 状态 → sidecar agent/stop|pause
+→ API 202 受理 → 前端按钮）；②技能去重闭环（skill_marker 单一真源、
+去重扫全视图）+ started 帧 gate（修后台化后事件先于响应的错位竞态）。
+提交前复跑全量 674 条确认全绿（含 2 skip）。**注意：停止/暂停特性当时
+没有单独的 NEXT_SESSION 小节**，细节散在代码注释里——本条即补记。
+
+## 一、s15：两层决策，一份都不能少
+
+教材（learn-workbuddy/s15）的骨架：召回结果 ≠ 该进 Prompt——先**选择**
+（scope 门 → 置信度门 → 权限三层排序 → 精确去重 → 显式冲突裁决 →
+top-k/双预算装箱，每条候选一个稳定原因码），再**装箱**（片段规划器：
+required fail-closed，optional 按 budget_priority 竞争，展示序 priority
+与预算序是两件事）。两份决策日志不合并：一个回答"为什么没选这条记忆"，
+一个回答"为什么最终没放这个片段"。
+
+新文件 `src/harness/prompt_assembly.py`（内核、纯标准库）：
+- 第一层 `select_memory_context`：六步顺序逐条实现，教材同名同契约
+  （MemoryContextCandidate / MemorySelectionPolicy / MemoryContextPlan /
+  九个原因码 / estimate_context_tokens 教学估算）；
+- 第二层 `plan_prompt`：PromptSegment / PromptPlan / SegmentDecision /
+  PromptBudgetError，required 超预算抛错绝不静默删安全规则；
+- 适配器 `candidates_from_user_memory`：结构化属性（不 import
+  user_memory，同教材 bridge 的 duck-typing 纪律）。
+
+## 二、与教材的三处差异（都是刻意的）
+
+1. **召回源**：教材输入是 s12 云端记忆的 RecallResult；我们没有 s12，
+   召回源换成自己的用户记忆——偏好 key 天然就是事实槽位
+   （conflict_key=preference:<key>），profile 字段是无槽恒真事实。
+2. **工作区记忆不进管线**：它在 s10 已过 harness 控制的蒸馏闸门，
+   "选择"发生在那一层；s15 把它的有界视图当一个**原子片段**参与
+   第二层预算。
+3. **分数恒 1.0**：蒸馏/人工确认的记录不是检索命中，min_score 门
+   天然放行，真正起作用的是 top-k 与预算；s12 落地后真分数从那条
+   链来，契约零改动。
+
+## 三、接线：build_history_seed 升级为"规划器说了算"
+
+`scripts/toolbox.py` 新增 `plan_history_seed`：起步历史三块各自成段
+（workspace_memory 10/70、user_memory 20/60、skills_directory 30/50，
+priority/budget_priority 分离），用户记忆先过选择管线再整体成段。
+`build_history_seed` 变薄：with_system（required 的等价物，不进规划器、
+永远第一条）+ 按 plan.included_names 的展示顺序逐段发消息；超预算被
+舍弃的片段 print 喊一声（静默降级比失败难查）。默认预算 6000 宽裕——
+三块全进、顺序不变，**既有 seed 测试零改动全绿**。
+
+## 四、测试与验收
+
+新 `tests/test_prompt_assembly.py` 42 条：契约校验（frozen 构造期炸、
+发明权限层级 fail-closed）、两道门（scope/置信度连 current_turn 都
+不能绕过）、权限 vs 分数（教材 A/B/C 反例：同文不同槽都必须活过
+去重，否则槽位 winner 缺席、被裁决的偏好复活）、top-k/双预算（超标
+不停止、小记录回填 vs 冲突败者永不回填）、渲染（provenance 属性、
+html 转义、空结果是空串不是空标签）、适配器（真 UserMemory 临时目录、
+过期偏好排除、可信方标注层级）、规划器（required fail-closed、展示序
+与预算序分离、inactive 日志）、装配接线（默认形状零变化、收紧预算
+技能目录先被舍弃）。全量 **716 条 OK（含 2 skip）**，README 已跟上。
+
+## 五、下一步候选（由用户定）
+
+- **s12 云端记忆**：主线断点——真召回分数 + 跨用户 scope 才让
+  select_memory_context 的门禁吃上真数据；
+- s17 MCP 连接器 / s18 专家系统（current_turn 权限层的生产者）；
+- plan-and-execute 第 2 步（plan_write 之后的执行循环）。
+
+## 六、flake 观察再记一笔（2026-10-25）
+
+s15 完成后的一次**后台**全量跑出 `FAILED (failures=2, errors=1)`，且
+耗时 18635 秒（正常 17~20 秒）；前台立刻复跑 716 条全绿。名字又被滤
+掉了（当时 grep 只留结果行）——但这次有了新证据：异常时长 ≈ 机器
+睡眠/挂起。假说：后台任务跨睡眠，计时敏感的测试（超时/时间戳类）被
+拖坏。对策两条：①跑全量别再滤 `FAIL:/ERROR:` 行（本次复跑已改
+tee 全量留档）；②后台跑测试避免跨长空闲时段。与 09-27 记录的
+"failures=1 未再现"疑似同源。
+
+# 2026-10-25（续）：s12 历史召回——补上 s15 留下的断点
+
+用户拍板做 s12（s15 当时刻意留下的空位）。教材五段召回链
+`normalize → candidate → score → stable rank → render` 全部落地。
+
+## 一、新文件与接线
+
+- `src/harness/recall.py`（内核，纯标准库）：StoredMemory / MemorySource
+  （投影契约）→ RecallQuery（自包含、NFKC+casefold、**中文按二元切词**：
+  "分层记忆"→分层/层记/记忆）→ RecallCandidate（只有词项重合，未评分）
+  → RecallScoreBreakdown（0.85×覆盖率 + 0.15×新近度，30 天衰减，逐项
+  可解释）→ RecallHit / RecallResult（searched/candidate 分开计数，
+  empty_reason 区分 no_records / no_overlap）。排序键显式：
+  total↓ 覆盖率↓ 采集时间↓ id↑——并列不靠语料顺序。
+- `prompt_assembly.memory_candidates_from_recall`：教材同款桥（结构化
+  属性、零 import），score 照抄 breakdown.total——**s15 的 min_score
+  门与分数排序从此吃真分数**，恒 1.0 时代结束（端到端测试：弱命中
+  1/3 覆盖 + 31 天前 → total≈0.283 < 0.35 → LOW_CONFIDENCE）。
+- `toolbox.recall_corpus`：把现有存储投影成语料（**不建第三份存储**，
+  机制只保留一套）——工作区 daily log 全量原始证据（FACT）+ 偏好
+  （PREFERENCE）+ 资料（PROFILE），每次召回现读，日志增长即时可见。
+- `recall_memory` 延迟工具（SAFE_TOOLS 纯读）：query 自包含纪律写进
+  工具描述（召回服务看不到当前聊天）；只搜 FACT——偏好/资料已由
+  seed 常驻，再召回只会制造第二份；空结果回"原因码 + 人话"双轨
+  （s04 的 rule_id + reason 同款）。
+
+## 二、与教材的差异（刻意的，写在 recall.py 模块头）
+
+教材的 RemoteMemoryStore 是"远端服务"教学模拟（JSONL+文件锁）；本项目
+durable 证据已存在（daily log 就是 append-only JSONL），StoredMemory 是
+**投影契约**不是第三份存储，文件锁随之不需要。scope 语义：跨用户防线
+在引擎（测试验证），工作区/用户两层用 provenance.source_type 区分——
+所有权标签，不是安全边界。
+
+## 三、本次踩的坑（都进了代码注释/测试）
+
+- `re.fullmatch(单字符 pattern, 多字串)` 永远不命中——CJK 分支靠它
+  判定，第一次跑 5 条测试集体翻车；改成 `[\u3400-\u9fff]+` 的 run
+  pattern 才对。教训：fullmatch 的语义是"整个串匹配整个 pattern"。
+- 教材"原始输入先折叠空白"是两步（text 折空白保留可读、normalized
+  再 NFKC+casefold），我第一版只 strip 了外层——可读原文里留着三个
+  连续空格，断言当场抓住。
+- `append_daily_log(recorded_at=)` 要 datetime 不是 ISO 字符串。
+- 全量一次红：test_workspace 的默认工具清单测试钉死了注册名单——
+  加工具是有意变更，更新期望集合（这条测试就是干这个的，红得正确）。
+
+## 四、验收
+
+新 `tests/test_recall.py` 29 条；全量 **745 条 OK（含 2 skip）**，
+README 已跟上。s12 + s15 的改动都在工作区**未提交**（等用户发话）。
+
+## 五、下一步候选（由用户定）
+
+- s17 MCP 连接器 / s18 专家系统（current_turn 权限层的生产者）；
+- plan-and-execute 第 2 步（plan_write 之后的执行循环）；
+- 召回的自动注入（turn 开始时按用户消息召回 + s15 选择进 system 视图
+  ——教材 set_recalled_memory 的等价物；要动 sidecar turn 管线，单独立课）。
+
+## 六、真实浏览器全链路验证（2026-10-25 同日，用户点名要的）
+
+服务真起（web_app 8765，真 DeepSeek），两条线：
+
+1. **smoke_frontend.cjs**：绝大多数 PASS，2 项 FAIL。做了**归因试验**
+   （stash 全部 s15/s12 改动 → HEAD 上重跑 → 同样 2 红 → pop 恢复）：
+   - "缩进列表 → ul>li"：断言依赖真模型输出恰好含缩进列表，本轮模型
+     没写列表——模型非确定性导致的存量 flake；
+   - "SSE 长连，不再有轮询"（polls:2）：前端 `api.js` 的 restoreNotice
+     会 `GET /api/events?after=0` **一次性**环快照（并发第 3 步的设计），
+     smoke 把"任何非 /stream 的事件请求"都算轮询——断言比设计严，
+     属存量。两个都待修（改 smoke 启发式或接受快照设计）。
+2. **手工浏览器全链路**（in-app browser 驱动真 UI）：新建会话（起步
+   3 条 system——s15 规划器产物在工作）→ 发消息（Enter 没触发发送，
+   点发送按钮才行；smoke 用的是按钮，无此问题）→ 真 DeepSeek 跑
+   ToolSearch + memory_write（回执"已记录 [decision]…"）→ 第二轮
+   recall_memory 命中，**分数明细完整且账目对**：coverage 0.667×0.85
+   + recency 0.99997×0.15 = total 0.716662，matched_terms 里可见中文
+   二元切词；scope.user_scope 落在真实用户名，provenance 指回
+   workspace_daily_log → **F5 后两轮历史、已记录回执、分数明细全部
+   恢复**，SSE 重连。
+
+结论：s12/s15 在真实浏览器全链路可用；smoke 的 2 个存量红项已归因
+登记。环境坑再记一条：Git Bash 后台跑 web_app，stdout 缓冲导致日志
+文件看着是空的——判活用 curl，别看日志（老坑重现）。

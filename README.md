@@ -30,7 +30,15 @@
   已确认事实走无损旁路，永不交给摘要；压缩产物不落盘（模型看压缩视图，证据记原始历史）。
 - **记忆**：工作区记忆（从 daily 日志蒸馏，模型只能提名、门槛由 harness 控制）、
   用户记忆（Profile + Preference，语义 key 去重）、session transcript 三层分账。
+- **历史召回**：五段召回链 normalize → candidate → score → stable rank →
+  render（词法覆盖率 + 新近度可解释评分，total/覆盖率/新近度并列时按显式
+  键破序）；`recall_memory` 工具按主题搜 daily log 全量原始证据，纯读不写回；
+  跨用户 scope 防线在引擎；RecallResult 经桥接器进 s15 选择管线吃真分数。
 - **技能系统**：SKILL.md 先列目录、触发词命中再展开全文；manifest 只能收窄权限。
+- **提示词组装**：记忆候选选择管线（scope 门 → 置信度门 → 权限三层 →
+  精确去重 → 冲突裁决 → top-k/双预算装箱，每条候选一个稳定原因码）+
+  系统提示片段规划器（required fail-closed、optional 按价值竞争、
+  展示序与预算序分离）；起步历史三块按预算装箱，双决策日志。
 - **RPC 并发**：客户端"读线程 + Future 多路复用"——任意线程可并发 call，
   事件/审批走独立分派线程（2026-09-26 起，全局 _rpc_lock 已退役）。
 - **Web 运输层**：FastAPI + uvicorn + SSE；守卫中间件（Host 校验 / X-Wywd-Ui 全量
@@ -54,6 +62,8 @@ src/harness/        内核（不认识任何 UI 和具体模型）
   memory.py           历史窗口截断
   compact.py          四层上下文压缩 + 无损旁路
   artifact.py         工具输出外化
+  prompt_assembly.py  记忆候选选择管线 + 提示片段规划器（两层预算）
+  recall.py           历史召回链（normalize / score / stable rank / render）
   session.py          SessionRecord / SessionProcess / SessionManager
   jsonl_store.py      JSONL 证据持久化
   sidecar.py          Sidecar 服务端 + RPC 客户端（读线程 + Future）
@@ -71,7 +81,7 @@ scripts/            壳层与入口
   native_dialog.py    系统目录选择框（降级机制）
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              674 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              745 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始

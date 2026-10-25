@@ -204,6 +204,8 @@ class DefaultBehaviorTests(unittest.TestCase):
             "bash_output", "bash_stop",
             # 任务计划（2026-09-27）：plan-and-execute 第 1 步
             "plan_write",
+            # 历史召回（s12，2026-10-25）：daily log 全量原始证据按主题找回，纯读
+            "recall_memory",
         }
         self.assertEqual(set(build_registry().names()), expected)
 

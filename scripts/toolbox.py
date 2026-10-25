@@ -46,7 +46,21 @@ from src.harness.permissions import (
     WorkspaceScope,
     build_default_policy,
 )
+from src.harness.prompt_assembly import (
+    MemorySelectionPolicy,
+    PromptPlan,
+    PromptSegment,
+    candidates_from_user_memory,
+    plan_prompt,
+    select_memory_context,
+)
 from src.harness.real_model import RealModel
+from src.harness.recall import (
+    MemoryKind,
+    MemorySource,
+    RecallEngine,
+    StoredMemory,
+)
 from src.harness.std_tools import (
     bash_output,
     bash_stop,
@@ -62,7 +76,6 @@ from src.harness.std_tools import (
 from src.harness.skills import SKILLS_DIR_NAME, SkillError, SkillIndex, skill_marker
 from src.harness.tools import Tool, ToolRegistry
 from src.harness.user_memory import (
-    NO_USER_MEMORY_PLACEHOLDER,
     UserMemory,
     UserMemoryError,
 )
@@ -74,7 +87,9 @@ from src.harness.workspace_memory import (
 )
 
 import getpass
+import json
 import os
+from datetime import datetime, timezone
 
 # 历史窗口大小（练习 19）：按"条数"计（一条 = 一条消息，一轮工具往返
 # 约占 3 条）。数字越小越省钱、记忆越短——这是取舍题，不是优化题。
@@ -504,6 +519,36 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
         # 认出"模型已经看得到了"，不再注入第二份。
         return f"{skill_marker(name)}\n\n{body}"
 
+    def recall_memory(query: str, limit: int = 5) -> str:
+        """按主题找回过去记下的事实（s12 召回链）。
+
+        query 必须**自包含**：说清要找什么（"之前为什么选 SQLite WAL"），
+        召回服务看不到当前聊天，"继续上次"什么也找不回来。返回结构化
+        JSON（命中 + 分数明细 + 来源），每条命中带 score_breakdown
+        ——为什么命中、每部分贡献多少，事后可查。
+
+        只搜工作区事实（FACT）：偏好/资料已常驻系统提示，再召回只会
+        制造第二份。纯读，不写回任何存储（读到不等于又发生了一次）。
+        """
+
+        memory = build_user_memory()
+        engine = RecallEngine(
+            lambda: recall_corpus(root_, memory))
+        result = engine.recall(
+            query, user_scope=memory.user_scope, limit=limit,
+            kinds={MemoryKind.FACT})
+        if result.empty_reason:
+            hints = {
+                "no_records": "日志里还没有任何记录",
+                "no_overlap": "没有词项重合——换个说法描述主题再试",
+            }
+            # 原因码 + 人话双轨（s04 的 rule_id + reason 同款）：
+            # 模型看得懂码，测试与日志钉得住码。
+            return (f"没召回到（{result.empty_reason}）："
+                    f"{hints.get(result.empty_reason, result.empty_reason)}"
+                    f"（query terms：{'、'.join(result.query.terms)}）")
+        return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+
     return [
         Tool(
             name="load_skill",
@@ -526,6 +571,15 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
             description="更新用户资料：名字 / 怎么称呼 / 时区 / 备注。"
             "只改传进来的字段，留空表示不动。",
             handler=update_user_profile,
+            defer=True,
+        ),
+        Tool(
+            name="recall_memory",
+            description="按主题找回过去记下的事实（工作区记忆的**全量原始日志**，"
+            "不只是系统提示里那点蒸馏视图）。query 要自包含：说清要找什么"
+            "（如「之前为什么选 SQLite WAL」），召回服务看不到当前聊天。"
+            "返回命中清单 + 分数明细，纯读不写回。",
+            handler=recall_memory,
             defer=True,
         ),
         Tool(
@@ -570,49 +624,192 @@ ALL_TOOLS: list[Tool] = build_instant_tools(ALLOWED_ROOT)
 DEFERRED_TOOLS: list[Tool] = build_deferred_tools(ALLOWED_ROOT)
 
 
-def build_history_seed(root=None, max_steps: int | None = None,
-                       user_memory: "UserMemory | None" = None,
-                       skill_index: "SkillIndex | None" = None) -> list[dict]:
-    """sidecar 会话的起步历史：工具目录 + 工作区记忆 + 用户记忆 + 技能目录。
+def recall_corpus(root: Path,
+                  user_memory: "UserMemory | None" = None
+                  ) -> tuple[StoredMemory, ...]:
+    """把现有存储投影成召回语料（s12，不建第三份存储——见 recall.py 模块头）。
 
-    四块**各自成一条 system**，不合并：所有权不同（项目 / 个人 / 扩展），
-    分开注入才能在日志里一眼看出哪块是谁的；到 s15 做 Prompt 组装时，
-    顺序与预算由那一层统一决定——现在先各就各位。
-
-    技能这里只放**目录**（名字 + 摘要 + 何时用，每个技能约 50 token）；
-    正文等命中触发词再展开——见 SkillIndex.render_matches 与 load_skill 工具。
-
-    两个刻意的取舍：
-
-    - **工具目录永远第一条**：FakeModel"只读第一条消息"的老怪癖不受影响；
-    - **每会话开局读一次**，不是每 turn：记忆在会话中途变化不会被察觉，
-      换来的是一个固定的、可预期的起步成本（有界视图的教学取舍）。
-
-    空记忆**不追加消息**：seed 与 s06.5 完全一致——"没记忆"和"有记忆"
-    的区别只该是多出一条 system，不该改变别的。这也是为什么判空要用
-    共享常量而不是就地写字符串字面量。
+    - 工作区事实（daily log **全量原始证据**，不只是蒸馏视图）：kind=FACT；
+    - 用户偏好：kind=PREFERENCE；用户资料：kind=PROFILE。
+    三类都落在当前用户的 scope 下（单用户本地场景，跨用户防线在引擎，
+    工作区/用户两层用 provenance.source_type 区分——所有权标签，
+    不是安全边界）。每次召回现投影：daily log 增长即时可见，
+    不存在"投影与存储不一致"的同步问题。
     """
 
-    seed = with_system([], max_steps)
+    memory = user_memory or build_user_memory()
+    scope = memory.user_scope
+
+    records: list[StoredMemory] = []
+    for fact in WorkspaceMemory(root).read_all_facts():
+        records.append(StoredMemory(
+            memory_id=f"fact:{fact.fact_id}",
+            user_scope=scope,
+            kind=MemoryKind.FACT,
+            content=fact.content,
+            summary=f"{fact.kind}：{fact.content[:60]}",
+            source=MemorySource(
+                source_id=fact.fact_id,
+                source_type="workspace_daily_log",
+                title=fact.kind,
+                captured_at=fact.recorded_at,
+            ),
+            stored_at=fact.recorded_at,
+        ))
+    for preference in memory.list_active_preferences():
+        records.append(StoredMemory(
+            memory_id=f"pref:{preference.key}",
+            user_scope=scope,
+            kind=MemoryKind.PREFERENCE,
+            content=f"{preference.key} = {preference.value}",
+            summary=f"偏好 {preference.key}",
+            source=MemorySource(
+                source_id=preference.source_event_id
+                or f"preference:{preference.key}",
+                source_type="user_memory",
+                title=f"偏好 {preference.key}",
+                captured_at=preference.updated_at,
+            ),
+            stored_at=preference.updated_at,
+        ))
+    profile = memory.read_profile()
+    if profile:
+        profile_file = memory.profile_file
+        if profile_file is None or not profile_file.exists():
+            raise ValueError("profile 有字段但拿不到证据时刻（mtime）")
+        stamp = datetime.fromtimestamp(
+            profile_file.stat().st_mtime, tz=timezone.utc)
+        captured = stamp.isoformat()
+        for name in sorted(profile):
+            value = str(profile[name]).strip()
+            if not value:
+                continue
+            records.append(StoredMemory(
+                memory_id=f"profile:{name}",
+                user_scope=scope,
+                kind=MemoryKind.PROFILE,
+                content=f"{name} = {value}",
+                summary=f"资料 {name}",
+                source=MemorySource(
+                    source_id="profile",
+                    source_type="user_memory",
+                    title=f"个人资料 {name}",
+                    captured_at=captured,
+                ),
+                stored_at=captured,
+            ))
+    return tuple(records)
+
+
+# s15 起步片段预算：默认宽裕（三块全进也远用不完），保证既有行为
+# 零变化；收紧它是在测试里验证"预算紧张时按价值舍弃"的入口。
+# 主 system（with_system）不在这份预算里——它是 required 段的等价物。
+DEFAULT_SEED_BUDGET_CHARS = 6000
+
+
+def plan_history_seed(root=None, max_steps: int | None = None,
+                      user_memory: "UserMemory | None" = None,
+                      skill_index: "SkillIndex | None" = None,
+                      budget_chars: int | None = DEFAULT_SEED_BUDGET_CHARS,
+                      memory_policy: MemorySelectionPolicy | None = None,
+                      ) -> tuple[PromptPlan, dict[str, str]]:
+    """s15：起步历史的可选片段交给规划器——顺序与预算由这一层统一决定。
+
+    三块**各自成段**（仍不合并：所有权不同——项目 / 个人 / 扩展），
+    但"谁先谁后、预算不够时舍弃谁"不再由追加顺序拍脑袋：
+
+      workspace_memory  priority=10 budget=70  蒸馏闸门（s10）治理过的
+                                              有界视图，作为原子段；
+      user_memory       priority=20 budget=60  偏好/资料先过
+                                              select_memory_context 选择
+                                              管线，<recalled_memory>
+                                              整体成段；
+      skills_directory  priority=30 budget=50  只列目录（s16），正文等
+                                              触发词再展开。
+
+    展示顺序与 s15 之前完全一致——默认预算宽裕时三块全进，seed 的
+    形状零变化（既有测试不改）。预算收紧时按 budget_priority 舍弃
+    （工作区 > 用户 > 技能目录），每段落一条 SegmentDecision：日志要
+    能回答"为什么最终没放这个片段"。
+
+    工具目录 system（with_system）**不进规划器**：它是教材片段表里
+    required 段（base instructions / tool descriptions / working mode）
+    的等价物，不参与 optional 预算竞争，也永远第一条——FakeModel
+    "只读第一条消息"的老怪癖不受影响。
+
+    返回 (PromptPlan, contents)：contents 按 name 给出每段正文，
+    调用方（build_history_seed）按 plan.included_names 的展示顺序
+    逐段发消息；测试可以直接拿 plan 断言决策日志。
+    """
+
+    contents: dict[str, str] = {}
+    segments: list[PromptSegment] = []
 
     workspace = WorkspaceMemory(root if root is not None else ALLOWED_ROOT)
     context = workspace.get_context_for_agent()
     if context and context != NO_MEMORY_PLACEHOLDER:
-        seed.append({"role": "system", "content": context})
+        contents["workspace_memory"] = context
+        segments.append(PromptSegment(
+            name="workspace_memory", builder=lambda: context,
+            priority=10, budget_priority=70, provenance="workspace"))
 
-    # 用户记忆（s11）：跨项目的那一份。注意它**不接收 workspace path**——
-    # 两个来源的存储与更新策略完全分开，只在这里并排出现一次。
+    # 用户记忆（s11）走 s15 选择管线：偏好 key 是事实槽位，资料是
+    # 无槽位的恒真事实；预算/top-k 由 MemorySelectionPolicy 管。
     if user_memory is not None:
-        user_context = user_memory.get_context_for_agent()
-        if user_context and user_context != NO_USER_MEMORY_PLACEHOLDER:
-            seed.append({"role": "system", "content": user_context})
+        memory_plan = select_memory_context(
+            candidates_from_user_memory(user_memory),
+            user_scope=user_memory.user_scope,
+            policy=memory_policy or MemorySelectionPolicy(),
+        )
+        if memory_plan.context:
+            contents["user_memory"] = memory_plan.context
+            segments.append(PromptSegment(
+                name="user_memory", builder=lambda: memory_plan.context,
+                priority=20, budget_priority=60, provenance="user"))
 
-    # 技能目录（s16）：**只列目录**，正文等命中触发词再展开。这一段是常驻的，
-    # 所以它必须便宜——每个技能约 50 token，而不是 500~5000。
+    # 技能目录（s16）：**只列目录**，正文等命中触发词再展开。这一段是
+    # 常驻的，所以它必须便宜——每个技能约 50 token，而不是 500~5000。
     if skill_index is not None:
         directory = skill_index.render_directory()
         if directory:
-            seed.append({"role": "system", "content": directory})
+            contents["skills_directory"] = directory
+            segments.append(PromptSegment(
+                name="skills_directory", builder=lambda: directory,
+                priority=30, budget_priority=50, provenance="skills"))
+
+    plan = plan_prompt(segments, budget_chars=budget_chars)
+    return plan, contents
+
+
+def build_history_seed(root=None, max_steps: int | None = None,
+                       user_memory: "UserMemory | None" = None,
+                       skill_index: "SkillIndex | None" = None) -> list[dict]:
+    """sidecar 会话的起步历史：工具目录 system + 规划器收录的可选片段。
+
+    每会话开局读一次（不是每 turn）：记忆在会话中途变化不会被察觉，
+    换来的是一个固定的、可预期的起步成本（有界视图的教学取舍）。
+
+    空记忆**不追加消息**：seed 与 s06.5 完全一致——"没记忆"和"有记忆"
+    的区别只该是多出一条 system，不该改变别的。判空用共享常量而不是
+    就地写字符串字面量。
+
+    超预算被舍弃的片段要**喊一声**（print 进日志）：静默降级比失败
+    更难查——界面上少了哪块记忆，答案在日志里。
+    """
+
+    seed = with_system([], max_steps)
+    plan, contents = plan_history_seed(
+        root=root, max_steps=max_steps,
+        user_memory=user_memory, skill_index=skill_index)
+
+    # included_names 按 (priority, name) 排序——展示顺序由规划器说了算。
+    for name in plan.included_names:
+        seed.append({"role": "system", "content": contents[name]})
+
+    for decision in plan.decisions:
+        if decision.status == "dropped":
+            print(f"[toolbox] 起步片段 {decision.name} 超预算被舍弃："
+                  f"{decision.reason}")
 
     return seed
 
@@ -652,6 +849,9 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     # 模型自己的历史里，用户在界面上也看得到——没有"悄悄发生"的空间，
     # 和 memory_write 同一条免审批理由。
     "plan_write",
+    # 历史召回（s12）：纯读——投影现有存储（daily log + 偏好/资料），
+    # 不写回任何东西（"读到不等于又发生了一次"是召回的铁律）。
+    "recall_memory",
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions
