@@ -39,6 +39,11 @@
   收窄，网络位与门）、命名空间化 `mcp__连接器__工具`、可见即注册成
   **真延迟工具**骑 ToolSearch / DeferExecute 轨道；执行期双检（权限层
   ASK + handler 撤权复查）防 TOCTOU；无 mcp.json 的默认工作区零开销。
+- **专家系统**：领域专家整包加载——人格（system_prompt）+ 行为准则 +
+  工具倾向（preferred 调序、disabled 摘除，**只能收窄**）+ 技能束；
+  会话创建时激活（expertId），specialization 作为 system 消息叠加在
+  核心提示之后（不覆盖），**转录即证据**：close/resume 人格自然回来；
+  工具倾向进 registry 的接缝已备（select_tools 纯函数）。
 - **技能系统**：SKILL.md 先列目录、触发词命中再展开全文；manifest 只能收窄权限。
 - **提示词组装**：记忆候选选择管线（scope 门 → 置信度门 → 权限三层 →
   精确去重 → 冲突裁决 → top-k/双预算装箱，每条候选一个稳定原因码）+
@@ -70,6 +75,7 @@ src/harness/        内核（不认识任何 UI 和具体模型）
   prompt_assembly.py  记忆候选选择管线 + 提示片段规划器（两层预算）
   recall.py           历史召回链（normalize / score / stable rank / render）
   mcp.py              MCP 连接器（信任 / grant / 命名空间化 / dispatch）
+  experts.py          领域专家包（索引 / specialization / 工具倾向）
   session.py          SessionRecord / SessionProcess / SessionManager
   jsonl_store.py      JSONL 证据持久化
   sidecar.py          Sidecar 服务端 + RPC 客户端（读线程 + Future）
@@ -87,7 +93,7 @@ scripts/            壳层与入口
   native_dialog.py    系统目录选择框（降级机制）
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              769 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              790 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始

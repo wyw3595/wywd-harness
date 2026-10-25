@@ -39,6 +39,7 @@ from src.harness.file_tools import (
     read_file,
     write_file,
 )
+from src.harness.experts import ExpertIndex
 from src.harness.mcp import (
     ConnectorManager,
     MCPServer,
@@ -226,6 +227,18 @@ def build_skill_index(root=None) -> SkillIndex:
         user_dir=user_skills_dir(),
         project_dir=workspace / ".workbuddy" / SKILLS_DIR_NAME,
     )
+
+
+def build_expert_index(root=None) -> ExpertIndex:
+    """建专家索引（s18）：{workspace}/.workbuddy/experts/*.json。
+
+    单级（项目级）：专家人格是"这个项目怎么干活"的一部分，跟着
+    工作区走；跨项目的个人人格库等真有需求再开两级（技能的先例
+    在那儿，抄就行）。目录不存在 = 空索引，零开销。
+    """
+
+    workspace = Path(root) if root is not None else ALLOWED_ROOT
+    return ExpertIndex(workspace)
 
 
 def get_weather(city: str) -> str:

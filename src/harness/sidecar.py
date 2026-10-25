@@ -68,6 +68,11 @@ from src.harness.compact import (
     compact,
     model_summarizer,
 )
+from src.harness.experts import (
+    ExpertError,
+    ExpertIndex,
+    render_specialization,
+)
 from src.harness.permissions import Approver, AuditTrail, GovernedToolRunner
 from src.harness.session import (
     SessionLifecycleError,
@@ -279,6 +284,7 @@ class SidecarServer:
         externalize: Optional[Callable[[str, str], str]] = None,
         compact_budget: int = COMPACT_THRESHOLD_TOKENS,
         skill_index: Optional[SkillIndex] = None,
+        expert_index: Optional["ExpertIndex"] = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -320,6 +326,10 @@ class SidecarServer:
         # 技能索引（s16）：None = 这个 sidecar 不带技能（老装配零感知）。
         # 目录由装配层放进 history_seed，正文由这里的 _inject_skills 按需展开。
         self._skill_index = skill_index
+        # 专家索引（s18）：None = 不带专家（老装配零感知）。激活发生在
+        # session/create（expertId 参数）——specialization 作为一条 system
+        # 消息写进起步历史，转录即证据，resume 自然带着人格回来。
+        self._expert_index = expert_index
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
         # s09：持久化注入 + 启动清账。
@@ -427,6 +437,8 @@ class SidecarServer:
         self.rpc_handlers["sidecar/logs"] = self._handle_logs
         self.rpc_handlers["session/create"] = self._handle_session_create
         self.rpc_handlers["session/list"] = self._handle_session_list
+        # s18 专家：目录给 UI 挑人用；激活走 session/create 的 expertId。
+        self.rpc_handlers["expert/list"] = self._handle_expert_list
         # s07-b 四操作路由（老 session/destroy"一删全没"已退役）
         self.rpc_handlers["session/close"] = self._handle_session_close
         self.rpc_handlers["session/resume"] = self._handle_session_resume
@@ -815,16 +827,41 @@ class SidecarServer:
 
         不传 cwd 时的默认落点由装配层决定（self._default_session_cwd，
         web 装配传 .sandbox 沙箱）——"新建会话默认在项目根里干活"退役。
+
+        s18 专家激活（expertId 可选）：specialization 作为一条 system
+        消息追加在起步历史**末尾**（叠加不覆盖），写进两个副本——
+        转录即证据，resume/重开自然带着人格回来，不需要额外字段。
+        未知专家/坏包翻成 ValueError 人话（RPC 的唯一错误通道）。
         """
         sid = self._manager.create_session(
             cwd=params.get("cwd", self._default_session_cwd),
             mode=params.get("mode", "craft"),
             title=params.get("title", "未命名会话"))
         runtime = self._manager.get_session(sid)
-        runtime.record.messages = self._history_seed()
+        seed = self._history_seed()
+        expert_id = str(params.get("expertId") or "").strip()
+        if expert_id:
+            if self._expert_index is None:
+                raise ValueError(
+                    "这个装配没有专家索引（.workbuddy/experts/）——无法激活专家")
+            try:
+                package = self._expert_index.load(expert_id)
+            except ExpertError as error:
+                raise ValueError(str(error)) from error
+            seed.append({"role": "system",
+                         "content": render_specialization(package)})
+            self._log(f"expert activated: {expert_id}")
+        runtime.record.messages = seed
         self._manager.store.save(runtime.record)
         self._log(f"session created: {sid}")
         return {"sessionId": sid}
+
+    def _handle_expert_list(self, params: dict) -> dict:
+        """专家目录（s18）：给 UI 的摘要清单——正文等激活时才加载。"""
+
+        if self._expert_index is None:
+            return {"experts": []}
+        return {"experts": self._expert_index.list()}
 
     def _handle_session_list(self, params: dict) -> dict:
         """会话清单：Record.summary() + live 标志（s07 的 UI 安全视图）。

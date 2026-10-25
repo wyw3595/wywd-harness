@@ -47,6 +47,7 @@ if _PROJECT_ROOT not in _env_paths:
 
 from scripts.electron_shell import choose_model
 from scripts.toolbox import (
+    build_expert_index,
     build_history_seed,
     build_mcp_manager,
     build_model_router,
@@ -204,6 +205,7 @@ def _sidecar_process(sock: socket.socket) -> None:
         max_steps=max_steps,                  # 单轮步数上限（默认 30）
         externalize=artifacts.externalize,    # s13：超阈值工具输出外化
         skill_index=skills,                   # s16：命中触发词时展开正文
+        expert_index=build_expert_index(default_workspace.root),  # s18
     )
     server.handle_connection(RPCConnection(sock))
 

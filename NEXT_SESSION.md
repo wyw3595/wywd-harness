@@ -2758,3 +2758,59 @@ s17 是下一章）。先提交 fb10626（s15+s12，745 绿）。
 - s19 可视化 / s20 结果呈现（trace.py 部分覆盖 s19）；
 - 真实 stdio MCP 连接器接入（spawn + JSON-RPC，sidecar 模式照搬）；
 - plan-and-execute 第 2 步。
+
+# 2026-10-25（三续）：s18 专家系统——会话级人格，转录即证据
+
+教材顺位继续（s17 完成后用户说"继续"）。s17 改动仍躺工作区，与 s18
+一起等提交指令。
+
+## 一、新文件与接线
+
+- `src/harness/experts.py`（内核，纯标准库）：
+  - `ExpertPackage`（frozen + 构造期校验：id 进文件名走正则白名单，
+    路径穿越在门口挡掉；`ToolsConfig` 未知键 fail-closed）；
+  - `render_specialization`：<expert_specialization> 块——**叠加不
+    覆盖**，核心提示/审批纪律仍是 harness 说了算；无准则省空块；
+  - `select_tools` 纯函数：disabled 摘除、preferred 只调排序**永不
+    新增**——扩展生态只能收窄的铁律（s16 manifest / s17 grant 同款）；
+  - `ExpertIndex`：{root}/.workbuddy/experts/*.json，目录常驻、整包
+    按需、坏包标"（包损坏）"不拖垮目录。
+- sidecar：`expert_index` 注入参数（老装配 None 零感知）；`session/
+  create` 收 `expertId`——specialization 作为一条 system 消息追加在
+  起步历史末尾（写进两个副本）；新 RPC `expert/list`（摘要不带正文）。
+- toolbox `build_expert_index`（项目级单目录，个人库两级留待）+ shell
+  装配传入。
+
+## 二、与教材的差异（刻意的）
+
+- 教材的会话级持久化靠 sessions 表 expert_id 字段；本项目**转录即
+  证据**：激活写进起步历史，resume 从 transcript 重放——不需要额外
+  字段，证据与派生分离的老原则直接复用。
+- 教材 switch_expert 运行中切换；本课只做创建时激活（切换要处理
+  "旧人格已入转录"的叠加语义，单独立课）。
+- 市场缓存 → 工作区 JSON 文件（谁能读、能 diff、能进 git）。
+- `select_tools` 落到 registry 的产品接线**未做**（要动会话构建
+  管线，与"召回自动注入"同一批）——纯函数已测，接缝已备。
+
+## 三、本次踩的坑
+
+- 测试里 `package = _package(...),` 行尾多一个逗号——赋值成了单元素
+  元组，AttributeError。Python 的元组字面量陷阱在"函数调用跨行 +
+  收尾括号后随手加逗号"时最容易踩；教训：断言报"类型奇怪"先查赋值行。
+
+## 四、验收
+
+新 `tests/test_experts.py` 21 条：契约（缺字段/坏 id/空字段/拼错键
+构造期炸）、specialization 形状与空块省略、select_tools 收窄语义、
+索引容错（坏包不拖垮目录）、sidecar 端到端（激活追加在 seed 之后、
+不带 expertId 零变化、**close→resume 人格还在**、未知专家人话、
+无索引装配大声报错、expert/list 两态）。全量 **790 条 OK（含 2
+skip）**，README 已跟上。s17+s18 均未提交。
+
+## 五、下一步候选（由用户定）
+
+- s19 可视化（trace.py 部分覆盖）/ s20 结果呈现；
+- s21 SQLite / s22 自动化调度 / s23 审计沙盒；
+- 运行中切专家 / 专家工具倾向落 registry / 召回自动注入（同一批
+  会话管线课）；
+- 真实 stdio MCP 连接器。
