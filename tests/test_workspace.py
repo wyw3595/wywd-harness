@@ -206,6 +206,9 @@ class DefaultBehaviorTests(unittest.TestCase):
             "plan_write",
             # 历史召回（s12，2026-10-25）：daily log 全量原始证据按主题找回，纯读
             "recall_memory",
+            # 可视化（s19，2026-10-25）：设计指引 + SVG/HTML widget 注入，
+            # 纯呈现（运行时行为由前端 sandbox iframe 兜底）
+            "read_widget_guide", "show_widget",
         }
         self.assertEqual(set(build_registry().names()), expected)
 

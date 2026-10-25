@@ -593,10 +593,19 @@ function handleEvent(ev) {
       approval.submitting = false;
       pushLive("warn", "审批已结束（被拒或超时），这条没执行");
     }
-    // 计划工具（plan-and-execute 第 1 步）：计划全文单独成卡——它是要
-    // 盯着看的进度，不进 240 字符截断的普通结果行。剥掉运行时包的
-    // "工具 plan_write 返回："前缀，卡片只呈现计划本身。
-    if (ev.name === "plan_write") {
+    // 可视化（s19）：按 **payload 形状**判定，与工具名无关——延迟工具
+    // 有两条执行路径（模型直呼其名 / DeferExecuteTool 桥），事件里的
+    // name 分别是工具名和桥名，按名字分流会漏掉桥路径（真浏览器验证
+    // 抓到的）。代码进 sandbox iframe 原地渲染：sandbox 只给
+    // allow-scripts、不给 allow-same-origin——脚本可跑、父页面不可触
+    // （服务端校验管协议形状，这里管运行时行为，各查各的）。
+    const widgetMatch = out.match(
+      /widget「(.+?)」已注入对话。\n\[widget\]\n([\s\S]*?)\n\[\/widget\]/);
+    if (widgetMatch) {
+      pushLive("widget", widgetMatch[2], "图表", {
+        summary: widgetMatch[1],
+      });
+    } else if (ev.name === "plan_write") {
       const prefix = "工具 plan_write 返回：";
       const text = out.startsWith(prefix) ? out.slice(prefix.length) : out;
       const firstLine = text.split("\n")[0] || text;

@@ -494,6 +494,14 @@ export const ChatArea = {
                   </summary>
                   <div class="plan-body">{{ line.text }}</div>
                 </details>
+                <div v-else-if="line.kind === 'widget'" class="lf-line lf-widget-box">
+                  <div class="lf-widget-head">
+                    <span class="lf-widget-tag">▦ 可视化</span>
+                    <span class="lf-plan-sum">{{ line.summary }}</span>
+                  </div>
+                  <iframe class="widget-frame" :srcdoc="line.text"
+                          sandbox="allow-scripts" title="widget 渲染区"></iframe>
+                </div>
                 <div v-else class="lf-line" :class="'lf-' + line.kind">
                 <template v-if="line.kind === 'call'">
                   <div v-if="line.explain" class="lf-explain">💬 {{ line.explain }}</div>

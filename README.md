@@ -44,6 +44,11 @@
   会话创建时激活（expertId），specialization 作为 system 消息叠加在
   核心提示之后（不覆盖），**转录即证据**：close/resume 人格自然回来；
   工具倾向进 registry 的接缝已备（select_tools 纯函数）。
+- **可视化**：两步协议——`read_widget_guide`（五模块设计指引 × 明暗
+  主题）→ 模型按指引生成 SVG/HTML → `show_widget` 服务端校验（viewBox
+  约定 / 片段无文档标签 / 尺寸上限）→ 前端 **sandbox iframe** 原地
+  渲染（allow-scripts 不带 allow-same-origin）；校验失败人话回灌；
+  [widget] 注入协议两端钉死。
 - **技能系统**：SKILL.md 先列目录、触发词命中再展开全文；manifest 只能收窄权限。
 - **提示词组装**：记忆候选选择管线（scope 门 → 置信度门 → 权限三层 →
   精确去重 → 冲突裁决 → top-k/双预算装箱，每条候选一个稳定原因码）+
@@ -76,6 +81,7 @@ src/harness/        内核（不认识任何 UI 和具体模型）
   recall.py           历史召回链（normalize / score / stable rank / render）
   mcp.py              MCP 连接器（信任 / grant / 命名空间化 / dispatch）
   experts.py          领域专家包（索引 / specialization / 工具倾向）
+  widgets.py          可视化（设计指引 / 校验 / [widget] 注入协议）
   session.py          SessionRecord / SessionProcess / SessionManager
   jsonl_store.py      JSONL 证据持久化
   sidecar.py          Sidecar 服务端 + RPC 客户端（读线程 + Future）
@@ -93,7 +99,7 @@ scripts/            壳层与入口
   native_dialog.py    系统目录选择框（降级机制）
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              790 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              808 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始

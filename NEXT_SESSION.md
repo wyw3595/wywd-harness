@@ -2814,3 +2814,56 @@ skip）**，README 已跟上。s17+s18 均未提交。
 - 运行中切专家 / 专家工具倾向落 registry / 召回自动注入（同一批
   会话管线课）；
 - 真实 stdio MCP 连接器。
+
+# 2026-10-25（四续）：s19 可视化——两步协议 × sandbox 渲染
+
+教材顺位继续。s17/s18 仍躺工作区，三课一起等提交。
+
+## 一、新文件与接线
+
+- `src/harness/widgets.py`（内核，纯标准库）：五个设计模块
+  （diagram/chart/mockup/interactive/art）× 明暗主题的调色板与规则；
+  `validate_widget` 只管**协议形状**（SVG 开头 + viewBox 0 0 680 /
+  HTML 片段无文档标签 / 20k 上限）；`widget_payload` 的 [widget]
+  注入协议（前端 store.js 同款字面量，合同测试钉死）；SVG 构建器
+  （svg_node/arrow/bar_chart）当**确定性参照物**——按指引生成的
+  代码必须过校验，指引与校验互相咬合。
+- toolbox：`read_widget_guide`（纯读）+ `show_widget`（校验过→payload，
+  不过→人话回灌）两个延迟工具（show_widget 带 list 参数，手写
+  input_schema——反射不出）；均进 SAFE_TOOLS（纯呈现）。
+- 前端：store.js 按 **payload 形状**分流（正则取标题+代码）、
+  components.js 渲染 `sandbox="allow-scripts"` 的 iframe（**不给**
+  allow-same-origin——脚本可跑、父页面不可触，XSS 防线在沙箱）；
+  index.html 补卡片样式。
+
+## 二、与教材的差异（刻意的）
+
+- 教材 WidgetRenderer 写文件 + 终端预览；本项目注入**真聊天 UI**
+  （plan_write 计划卡的既有轨道）。read_me 的"内部步骤别叙述"纪律
+  原样写进工具描述。
+- 服务端校验管协议形状、iframe 沙箱管运行时行为——两层各司其职
+  （教材只有前者，浏览器渲染场景必须补后者）。
+
+## 三、本次踩的坑（两个真 bug，都有测试/验证兜住）
+
+1. **validate_widget 的分支顺序**：第一版把"含禁标签"当 HTML 路线
+   的唯一入口，合法 `<div>` 片段落进"必须以 <svg 开头"兜底——
+   单测当场抓住。修正：`<svg` 开头走 SVG 规则；否则任何位置含
+   文档标签拒绝；否则不以 `<` 开头才报"该给什么"。
+2. **前端按工具名分流的盲区**（真浏览器验证抓的）：延迟工具有两条
+   执行路径——模型直呼其名 / DeferExecuteTool 桥。真模型走了桥，
+   事件 name 是 DeferExecuteTool，`ev.name === "show_widget"` 永远
+   漏网。改成**按 payload 形状正则判定**，与工具名无关。教训：
+   plan_write 的同名分支同样有这个潜在盲区（模型走桥时计划卡
+   不出）——记录在案，修法照抄这条。
+
+## 四、验收
+
+新 `tests/test_widgets.py` 18 条：五模块/双主题、未知模块与未知主题
+fail-closed、校验各拒绝路径文案可行动、注入协议的**合同测试**（复刻
+store.js 解析逻辑，两端协议谁改谁红）、构建器 ↔ 校验咬合、工具走真
+延迟轨道端到端。全量 **808 条 OK（含 2 skip）**。真实浏览器验证：
+真 DeepSeek 走完 ToolSearch → read_widget_guide(chart) → show_widget
+两轮（第一轮桥路径暴露 bug②，修复后第二轮），iframe sandbox 属性、
+srcdoc 的 SVG/viewBox、卡片标题全部核对通过，截图留证。README 已
+跟上。s17/s18/s19 三课改动未提交。

@@ -88,6 +88,11 @@ from src.harness.user_memory import (
     UserMemory,
     UserMemoryError,
 )
+from src.harness.widgets import (
+    render_guide,
+    validate_widget,
+    widget_payload,
+)
 from src.harness.workspace import Workspace
 from src.harness.workspace_memory import (
     NO_MEMORY_PLACEHOLDER,
@@ -570,6 +575,26 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
                     f"（query terms：{'、'.join(result.query.terms)}）")
         return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
 
+    def read_widget_guide(module: str = "diagram",
+                          theme: str = "light") -> str:
+        """拿可视化设计指引（s19 两步协议第 ① 步）。"""
+
+        return render_guide(module, theme)
+
+    def show_widget(title: str, widget_code: str,
+                    loading_messages: list | None = None) -> str:
+        """在对话里原地渲染 SVG/HTML widget（s19 两步协议第 ② 步）。
+
+        校验只管协议形状（SVG 开头/viewBox、HTML 片段无文档标签、
+        尺寸上限）；不合规给人话错误回灌，模型改好再调。loading_messages
+        收下但即时渲染用不上——协议参数，流式渲染的 UX 留给以后。
+        """
+
+        errors = validate_widget(widget_code)
+        if errors:
+            return ("没渲染：" + "；".join(errors) + "——按指引进改再调一次")
+        return widget_payload(title, widget_code)
+
     return [
         Tool(
             name="load_skill",
@@ -601,6 +626,38 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
             "（如「之前为什么选 SQLite WAL」），召回服务看不到当前聊天。"
             "返回命中清单 + 分数明细，纯读不写回。",
             handler=recall_memory,
+            defer=True,
+        ),
+        Tool(
+            name="read_widget_guide",
+            description="拿可视化设计指引（CSS 变量/颜色/排版/规则）。"
+            "第一次 show_widget 之前必须先调我；换设计模块（diagram/chart/"
+            "mockup/interactive/art）或换主题（light/dark）要重新拿。"
+            "这是内部准备步骤——不要向用户叙述这次调用。",
+            handler=read_widget_guide,
+            defer=True,
+        ),
+        Tool(
+            name="show_widget",
+            description="在对话里原地渲染 SVG 图表或 HTML 小组件。"
+            "widget_code 必须是原始 SVG（viewBox 以 0 0 680 开头）或 "
+            "HTML 片段（不带 <html>/<head>/<body>/<!DOCTYPE>）；"
+            "先 read_widget_guide 拿指引再动笔。复杂主题拆成多个小 "
+            "widget，中间用文字串联叙事。",
+            handler=show_widget,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string",
+                              "description": "widget 标题（卡片头）"},
+                    "widget_code": {"type": "string",
+                                    "description": "原始 SVG 或 HTML 片段"},
+                    "loading_messages": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "渲染进度提示（1-4 条，可选）"},
+                },
+                "required": ["title", "widget_code"],
+            },
             defer=True,
         ),
         Tool(
@@ -886,6 +943,11 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     # 历史召回（s12）：纯读——投影现有存储（daily log + 偏好/资料），
     # 不写回任何东西（"读到不等于又发生了一次"是召回的铁律）。
     "recall_memory",
+    # 可视化（s19）：read_widget_guide 是纯读；show_widget 是纯呈现——
+    # 无文件 IO、无跨会话状态，代码进转录用户当场看得见（与 plan_write
+    # 同一条免审批理由）。运行时行为由前端 sandbox iframe 兜底。
+    "read_widget_guide",
+    "show_widget",
 })
 
 # 读写工具集合（练习 s04 · 去重）：治理语义集中在装配层声明，permissions
