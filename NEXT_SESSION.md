@@ -2498,3 +2498,31 @@ turn_end turnId 各自独立。
 **并发改造三步全部完成，已推送远端**（0d26515..62067ca，含 README
 测试数修正）。剩余观察项：偶发 flake 条目仍有效（未再现）。
 
+## 七、技能去重闭环 + started 帧乱序修复（2026-09-27 再续）
+
+**技能正文双入口的去重闭环**（s16 收尾）。背景：技能正文有两个入口——
+触发词命中自动展开（sidecar._inject_skills 的 system 消息）与模型主动
+load_skill（正文随 tool 消息进 transcript 且落盘）。后者加载过的技能，
+后续轮次触发词再命中会被注入第二份——去重只扫 system 消息看不见
+tool 消息。修法三件套：
+
+- `skills.skill_marker(name)`：标记头单一真源，两个入口共用（# 技能：N）；
+- `_inject_skills` 去重扫描从"只扫 system"扩到**全视图**（任何角色的
+  消息里认得出标记就跳过）；范围仍是"本轮视图"不跨轮记账——正文被
+  compact 压出视图后重新注入是正确行为；
+- `toolbox.load_skill` 返回值带同一标记头，去重才有锚点。
+
+新测试 8 条：InjectSkillsTests 6 条（命中展开/未命中原样/tool 加载过
+不重注/system 注入过不重注/压缩出视图会重注/无索引 no-op）+
+LoadSkillToolTests 2 条（返回标记头/未知技能人话）。
+
+**顺手修掉一个存量竞态**（HEAD 上 test_session_resume_continues_history
+就是红的，与技能无关但在同一片代码）：后台化后 `_handle_agent_send`
+submit 一返回，执行器线程就可能把整个 turn（离线模型微秒级）跑完，
+事件流先于 started 帧上线——按序收结果的客户端把 started 错当成下一
+个请求的响应，此后整体错位一格（实测 resume 拿到的是 close 的结果，
+KeyError: generation）。修法：执行器拿 gate 等 started 帧上线再开跑
+（`_release_started_gate` 在 handle_connection 的 finally 放行，error
+分支也放）；**直调 handler 的路径（无 socket）不等待**——`self._conn`
+为 None 即视为 gate 已放开，4 个直调测试因此零改动。全量 674 条 OK
+（含 2 skip）。

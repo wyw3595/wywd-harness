@@ -517,6 +517,20 @@ class WebApp:
             return self.shell.send_to(session_id, text)
         return self.shell.submit_to(session_id, text)
 
+    # ── API：停止 / 暂停在跑的 turn（2026-09-27）──────────────
+
+    def stop(self, session_id: str) -> dict:
+        """请求停止：受理即回，结局由 SSE 的 turn_end（status=aborted）
+        送达。没有在跑的 turn 时回 {"error"} 人话。"""
+
+        return self.shell.stop_turn(session_id)
+
+    def pause(self, session_id: str) -> dict:
+        """请求暂停：受理即回，结局由 SSE 的 turn_end（status=paused）
+        送达。「继续」即恢复。"""
+
+        return self.shell.pause_turn(session_id)
+
     # ── API：事件轮询 / 审批回执 ─────────────────────────────
 
     def events(self, after: int = 0) -> dict:
@@ -1031,6 +1045,21 @@ def create_app(web: Optional[WebApp] = None) -> FastAPI:
         # 分流——它不该猜状态码（api.js 一处封装，错误语义都走人话）。
         result = web.send(sid, payload.get("message", ""))
         code = 202 if result.get("status") == "started" else 200
+        return JSONResponse(result, status_code=code)
+
+    @app.post("/api/sessions/{sid}/stop")
+    def post_stop(sid: str, web: WebApp = Depends(get_web)) -> JSONResponse:
+        # 停止受理即回（stop_requested → 202）；没有在跑的 turn → 200
+        # + {"error"} 人话。
+        result = web.stop(sid)
+        code = 202 if result.get("status") == "stop_requested" else 200
+        return JSONResponse(result, status_code=code)
+
+    @app.post("/api/sessions/{sid}/pause")
+    def post_pause(sid: str, web: WebApp = Depends(get_web)) -> JSONResponse:
+        # 暂停与停止同一条纪律（2026-09-27）：受理 202，结局走 SSE。
+        result = web.pause(sid)
+        code = 202 if result.get("status") == "pause_requested" else 200
         return JSONResponse(result, status_code=code)
 
     @app.post("/api/approvals/{ticket}")

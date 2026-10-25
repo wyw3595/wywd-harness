@@ -234,6 +234,161 @@ class AgentToolLoopTests(unittest.TestCase):
         )
 
 
+class _Control:
+    """TurnControl 的测试实现：构造时定死两个信号。"""
+
+    def __init__(self, abort: bool = False, pause: bool = False) -> None:
+        self._abort = abort
+        self._pause = pause
+
+    def abort_requested(self) -> bool:
+        return self._abort
+
+    def pause_requested(self) -> bool:
+        return self._pause
+
+
+class _FlipsOnNthCheck:
+    """某谓词第 n 次被调用后才置位——精确落在检查点 A（第 1 次）与
+    B（第 2 次）之间。两个谓词各自独立计数（A 处两个都会被查一次）。"""
+
+    def __init__(self, abort: bool = True, pause: bool = False) -> None:
+        self._abort_checks = 0
+        self._pause_checks = 0
+        self._abort = abort
+        self._pause = pause
+
+    def abort_requested(self) -> bool:
+        self._abort_checks += 1
+        return self._abort and self._abort_checks > 1
+
+    def pause_requested(self) -> bool:
+        self._pause_checks += 1
+        return self._pause and self._pause_checks > 1
+
+
+class TurnControlTests(unittest.TestCase):
+    """停止 / 暂停钩子（2026-09-27）：协作式早退 + 入账补齐配对。
+
+    检查点 B 的决定性断言是**配对结构完整**：assistant 消息带工具清单
+    落账，每个未执行的调用补一条合成 tool 消息（"未执行"如实写）——
+    下次调 API 不会因为残缺的 tool_call 报错，恢复后模型也看得到
+    "我想调 X，用户停了"。
+    """
+
+    def setUp(self) -> None:
+        self.registry = ToolRegistry()
+        self.executed = {"n": 0}
+
+        def worker() -> str:
+            self.executed["n"] += 1
+            return "干了活"
+
+        self.registry.register(
+            Tool(name="worker", description="干活", handler=worker))
+
+    def test_abort_at_checkpoint_a(self) -> None:
+        """一上来就停——模型一次都不被调用。"""
+
+        model = ScriptedModel([ModelReply(kind="final", text="不该被看到")])
+        result = run_agent("任务", model=model, registry=self.registry,
+                           control=_Control(abort=True))
+
+        self.assertEqual(result.status, "aborted")
+        self.assertIn("用户已停止", result.output)
+        self.assertEqual(model.received_inputs, [])
+        self.assertEqual(self.executed["n"], 0)
+
+    def test_pause_at_checkpoint_a(self) -> None:
+        """一上来就暂停——模型一次都不被调用，status=paused。"""
+
+        model = ScriptedModel([ModelReply(kind="final", text="不该被看到")])
+        result = run_agent("任务", model=model, registry=self.registry,
+                           control=_Control(pause=True))
+
+        self.assertEqual(result.status, "paused")
+        self.assertIn("已暂停", result.output)
+        self.assertEqual(model.received_inputs, [])
+
+    def test_stop_at_checkpoint_b_commits_reply_and_synthesizes(self) -> None:
+        """检查点 B（修订版）：回复**入账**，每个未执行调用补配对合成消息。
+
+        修订理由（vs 旧的丢弃方案）：思考链与"模型想干什么"进证据；
+        恢复后模型亲眼看到"我想调 worker，用户停了"。
+        """
+
+        model = ScriptedModel([
+            ModelReply(kind="tool_calls",
+                       reasoning="我决定先干活",
+                       usage={"prompt_tokens": 5, "completion_tokens": 2},
+                       tool_calls=[ToolCall("call_1", "worker", {})]),
+            ModelReply(kind="final", text="不该被看到"),
+        ])
+
+        result = run_agent("任务", model=model, registry=self.registry,
+                           control=_FlipsOnNthCheck(abort=True))
+
+        self.assertEqual(result.status, "aborted")
+        self.assertIn("未执行", result.output)
+        self.assertEqual(self.executed["n"], 0)       # 工具一次都没跑
+        # 入账 + 补齐配对：assistant 带清单落账（含 reasoning），合成
+        # tool 消息如实写"未执行"——配对结构完整，对 API 合法。
+        self.assertEqual(len(result.messages), 3)
+        self.assertEqual(result.messages[1]["role"], "assistant")
+        self.assertEqual(result.messages[1]["tool_calls"][0]["name"], "worker")
+        self.assertEqual(result.messages[1]["reasoning"], "我决定先干活")
+        self.assertEqual(result.messages[2]["role"], "tool")
+        self.assertEqual(result.messages[2]["tool_call_id"], "call_1")
+        self.assertIn("用户已停止本轮，此工具未执行", result.messages[2]["content"])
+        # 被停轮次的 usage 照常入账——钱花了要诚实记
+        self.assertEqual(result.usage,
+                         {"prompt_tokens": 5, "completion_tokens": 2})
+
+    def test_pause_at_checkpoint_b_synthesizes_too(self) -> None:
+        """暂停的合成消息文案不同（"已暂停"），配对语义一致。"""
+
+        model = ScriptedModel([
+            ModelReply(kind="tool_calls",
+                       tool_calls=[ToolCall("call_1", "worker", {})]),
+            ModelReply(kind="final", text="不该被看到"),
+        ])
+
+        result = run_agent("任务", model=model, registry=self.registry,
+                           control=_FlipsOnNthCheck(abort=False, pause=True))
+
+        self.assertEqual(result.status, "paused")
+        self.assertEqual(len(result.messages), 3)
+        self.assertIn("本轮已暂停，此工具未执行", result.messages[2]["content"])
+
+    def test_final_reply_committed_when_stop_arrives_mid_call(self) -> None:
+        """停止信号到达时模型回的已是 final：答案照常入账，status 报
+        aborted——用户点了按钮，界面不能被静默当成"无事发生"。"""
+
+        model = ScriptedModel([ModelReply(kind="final", text="答案已经想好了")])
+
+        result = run_agent("任务", model=model, registry=self.registry,
+                           control=_FlipsOnNthCheck(abort=True))
+
+        self.assertEqual(result.status, "aborted")
+        self.assertEqual(result.output, "答案已经想好了")
+        self.assertEqual(result.messages[-1]["role"], "assistant")
+        self.assertEqual(result.messages[-1]["content"], "答案已经想好了")
+
+    def test_no_control_runs_normally(self) -> None:
+        """不传 control：与旧行为完全一致（防接线写反）。"""
+
+        model = ScriptedModel([
+            ModelReply(kind="tool_calls",
+                       tool_calls=[ToolCall("call_1", "worker", {})]),
+            ModelReply(kind="final", text="正常收工"),
+        ])
+        result = run_agent("任务", model=model, registry=self.registry)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.output, "正常收工")
+        self.assertEqual(self.executed["n"], 1)
+
+
 class AgentHistoryTests(unittest.TestCase):
     """对话历史直接以消息列表传给模型（不再渲染成文本）。"""
 

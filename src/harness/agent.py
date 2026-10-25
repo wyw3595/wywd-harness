@@ -29,13 +29,35 @@ Harness 练习 03 ~ 08：Agent Loop、工具回灌、对话历史与结构化
 ============================================================
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, runtime_checkable
 from uuid import uuid4
 
 from src.harness.main import RunResult
 from src.harness.models import FakeModel, Model, ModelReply, ScriptedModel, ToolCall
 from src.harness.permissions import GovernedToolRunner, ToolRequest
 from src.harness.tools import Tool, ToolRegistry
+
+
+@runtime_checkable
+class TurnControl(Protocol):
+    """turn 的控制面（2026-09-27）：停止 / 暂停信号的只读端。
+
+    结构化协议：装配层给实现（sidecar 的适配器读 SessionProcess 的两个
+    Event——运行时被 close 摘走时 abort 按"已置"算，fail-closed），测试
+    给小对象 / lambda 包装。两个谓词必须便宜：循环每轮至多查两次。
+    """
+
+    def abort_requested(self) -> bool:
+        """用户请求了停止：早退、transcript 落账，「继续」可接着跑。"""
+        ...
+
+    def pause_requested(self) -> bool:
+        """用户请求了暂停：早退、transcript 落账，「继续」可接着跑。
+
+        与停止共用全部检查点和恢复路径，只差状态名与文案——暂停不是
+        失败，用户随时可能改主意，所以证据要比停止保留得更完整。
+        """
+        ...
 
 
 def run_agent(
@@ -47,6 +69,7 @@ def run_agent(
     on_event: Callable[[str, dict], None] | None = None,
     runner: GovernedToolRunner | None = None,
     externalize: Callable[[str, str], str] | None = None,
+    control: "TurnControl | None" = None,
 ) -> RunResult:
     """驱动模型最多 max_steps 轮，直到它给出最终回答。
 
@@ -76,6 +99,21 @@ def run_agent(
     保险丝：连续 max_steps 轮没等到最终回答 -> 返回 status="max_steps"
     的 RunResult，output 说明用了几轮、最后请求了哪些工具、以及可以
     续跑（messages 照常返回，调用方把它当 history 再发一句「继续」即可）。
+
+    停止 / 暂停钩子（2026-09-27）：传入 control（TurnControl）后，循环在
+    **两个检查点**探信号，命中即早退——停止 → status="aborted"，暂停 →
+    status="paused"；transcript 都照常落账，messages 照常返回，「继续」
+    即可接着跑：
+      - 检查点 A：每轮循环顶（模型调用前）——不发起新调用；
+      - 检查点 B：模型回复已到、工具尚未执行——**回复照常入账，每个未
+        执行的调用补一条合成 tool 消息**（"（用户已停止本轮，此工具未
+        执行）"）——这是业界同款（hermes-agent 中断即合成 "cancelled
+        by user interrupt"），保证每条 tool_call 都有配对结果、transcript
+        对 API 保持合法。不用"丢弃回复"的原因：那次调用买到的思考和
+        意图会蒸发，恢复后模型对"被用户反对过"毫不知情，很可能原样
+        再提一遍同样的调用；入账方案里模型亲眼看到"我想调 X，用户停了"。
+    被停轮次的 usage 照常入账（钱花了要诚实记）。诚实边界：正在阻塞的
+    模型调用 / 工具执行 / 审批等待打不断，停止最多等当前动作结束。
     """
 
     if model is None:
@@ -106,6 +144,28 @@ def run_agent(
             on_event(event, data)
 
     while step < max_steps:
+        # 检查点 A（停止 / 暂停钩子）：模型调用前。命中即收场——
+        # 不发起新调用。
+        if control is not None:
+            if control.abort_requested():
+                return RunResult(
+                    run_id=str(uuid4()),
+                    task=task,
+                    output=(f"用户已停止：完成 {step} 步，本轮到此为止；"
+                            "说「继续」可以接着做。"),
+                    status="aborted",
+                    messages=messages,
+                    usage=totals,
+                )
+            if control.pause_requested():
+                return RunResult(
+                    run_id=str(uuid4()),
+                    task=task,
+                    output=(f"已暂停：完成 {step} 步；说「继续」接着做。"),
+                    status="paused",
+                    messages=messages,
+                    usage=totals,
+                )
         emit("round_start", step=step)
         # 失败也是出口（练习 16）：模型层的异常（RealModel 重试耗尽等）不再
         # 炸穿调用方，而是落地成 status="failed" 的结果——失败是结果，
@@ -144,6 +204,21 @@ def run_agent(
             if getattr(reply, "reasoning", ""):
                 final_record["reasoning"] = reply.reasoning
             messages.append(final_record)
+            # 停止 / 暂停信号在这次模型调用期间到达、而模型回的已经是
+            # final：答案完整保留（照常入账），status 仍报 aborted/paused
+            # ——用户点了按钮，界面不能被静默当成"无事发生"（意图优先于
+            # 巧合）；output 里就是那句已完成的回答。
+            if control is not None and (control.abort_requested()
+                                        or control.pause_requested()):
+                stopped = control.abort_requested()
+                return RunResult(
+                    run_id=str(uuid4()),
+                    task=task,
+                    output=reply.text,
+                    status="aborted" if stopped else "paused",
+                    messages=messages,
+                    usage=totals,
+                )
             # s01 整合：provider 以 finish_reason="length" 掐断输出时
             # （reply.truncated），沉默地当成 completed 是骗调用方——
             # 显式承认"答案不完整"，RunResult 才诚实。一行三元，
@@ -158,8 +233,9 @@ def run_agent(
                 usage=totals,
             )
 
-        # 工具调用轮：先把调用清单存入历史（这是我们的方言，
-        # 练习 09 的 RealModel 负责把它翻译成 wire 格式）。
+        # 到这里 reply.kind 必是 tool_calls（final 已在上面返回）。
+        # 先把调用清单存入历史（这是我们的方言，练习 09 的 RealModel
+        # 负责把它翻译成 wire 格式）。
         # reasoning 同上：**决定调工具之前**的推理同样属于思考链，
         # 一起落盘（否则历史里只剩"调了什么"，看不出"为什么调"）。
         call_record = {
@@ -176,6 +252,39 @@ def run_agent(
         }
         if getattr(reply, "reasoning", ""):
             call_record["reasoning"] = reply.reasoning
+
+        # 检查点 B（停止 / 暂停钩子）：模型回复已到、工具尚未执行。
+        # 处理动作 = **入账 + 补齐配对**（2026-09-27 修订，业界同款：
+        # hermes-agent 中断即给每个未启动的调用合成 "cancelled by user
+        # interrupt"）：assistant 消息带 reasoning / 工具清单照常落账，
+        # 每个未执行的调用补一条合成 tool 消息——内容如实写"未执行"，
+        # 绝不编造结果（证据 = 发生过的事实，在 transcript 层的延伸）。
+        # 配对结构完整 → 对 API 合法；「继续」恢复时模型亲眼看到
+        # "我想调 X，用户停了"，会调整思路而不是原样再提一遍。
+        if control is not None and (control.abort_requested()
+                                    or control.pause_requested()):
+            stopped = control.abort_requested()
+            messages.append(call_record)
+            for call in reply.tool_calls:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "content": ("（用户已停止本轮，此工具未执行）" if stopped
+                                else "（本轮已暂停，此工具未执行）"),
+                })
+            names = [call.name for call in reply.tool_calls] or ["?"]
+            return RunResult(
+                run_id=str(uuid4()),
+                task=task,
+                output=(f"用户已停止：模型刚请求调用 {names}，未执行；"
+                        "说「继续」可以让它重新决定。" if stopped else
+                        f"已暂停：模型刚请求调用 {names}，未执行；"
+                        "说「继续」接着做。"),
+                status="aborted" if stopped else "paused",
+                messages=messages,
+                usage=totals,
+            )
+
         messages.append(call_record)
 
         for call in reply.tool_calls:

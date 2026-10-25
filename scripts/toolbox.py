@@ -59,7 +59,7 @@ from src.harness.std_tools import (
     run_bash_background,
     tree_dir,
 )
-from src.harness.skills import SKILLS_DIR_NAME, SkillError, SkillIndex
+from src.harness.skills import SKILLS_DIR_NAME, SkillError, SkillIndex, skill_marker
 from src.harness.tools import Tool, ToolRegistry
 from src.harness.user_memory import (
     NO_USER_MEMORY_PLACEHOLDER,
@@ -496,9 +496,13 @@ def build_deferred_tools(root_: Path) -> list[Tool]:
         """
 
         try:
-            return build_skill_index(root_).load(name)
+            body = build_skill_index(root_).load(name)
         except SkillError as error:
             return f"没取到：{error}"
+        # 标记头与 sidecar._inject_skills 同源（skill_marker）：这份正文
+        # 随 tool 消息进 transcript，后续轮次触发词再命中时，去重靠它
+        # 认出"模型已经看得到了"，不再注入第二份。
+        return f"{skill_marker(name)}\n\n{body}"
 
     return [
         Tool(

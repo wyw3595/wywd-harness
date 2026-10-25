@@ -45,6 +45,8 @@ class FakeShell:
         self._rows = rows
         self.sent: list[tuple[str, str]] = []
         self.submitted: list[tuple[str, str]] = []
+        self.stopped: list[str] = []
+        self.paused: list[str] = []
         self.ops: list[tuple[str, str]] = []
         self.zip_existed: bool | None = None   # set_workspace 那刻 zip 在不在盘上
 
@@ -81,6 +83,18 @@ class FakeShell:
         self.submitted.append((sid, message))
         return {"sessionId": sid, "status": "started",
                 "turnId": f"turn-{len(self.submitted)}"}
+
+    def stop_turn(self, sid: str) -> dict:
+        """停止受理（2026-09-27）：回执原样透传给 web 层。"""
+
+        self.stopped.append(sid)
+        return {"sessionId": sid, "status": "stop_requested"}
+
+    def pause_turn(self, sid: str) -> dict:
+        """暂停受理（2026-09-27）：回执原样透传给 web 层。"""
+
+        self.paused.append(sid)
+        return {"sessionId": sid, "status": "pause_requested"}
 
     def status(self) -> dict:
         return {"sessions": len(self._rows), "handlers": 6,
@@ -555,6 +569,24 @@ class SendTests(unittest.TestCase):
         app = WebApp(shell=FakeShell([]))
         self.assertIn("error", app.send("sess_0003", "   "))
 
+    def test_stop_forwards_sid_to_shell(self) -> None:
+        """停止转发（2026-09-27）：sid 交给壳，回执透传。"""
+
+        shell = FakeShell([])
+        app = WebApp(shell=shell)
+        result = app.stop("sess_0003")
+        self.assertEqual(result["status"], "stop_requested")
+        self.assertEqual(shell.stopped, ["sess_0003"])
+
+    def test_pause_forwards_sid_to_shell(self) -> None:
+        """暂停转发（2026-09-27）：sid 交给壳，回执透传。"""
+
+        shell = FakeShell([])
+        app = WebApp(shell=shell)
+        result = app.pause("sess_0003")
+        self.assertEqual(result["status"], "pause_requested")
+        self.assertEqual(shell.paused, ["sess_0003"])
+
 
 class EventRingTests(unittest.TestCase):
     def test_append_after_only_returns_newer(self) -> None:
@@ -949,6 +981,24 @@ class WorkspaceHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("error", payload)
         self.assertEqual(self.shell.submitted, [])
+
+    def test_post_stop_returns_202_when_accepted(self) -> None:
+        """停止受理（2026-09-27）：202 + stop_requested；sid 到达壳层。"""
+
+        status, payload = self._post("/api/sessions/sess_0001/stop", {})
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "stop_requested")
+        self.assertEqual(payload["sessionId"], "sess_0001")
+        self.assertEqual(self.shell.stopped, ["sess_0001"])
+
+    def test_post_pause_returns_202_when_accepted(self) -> None:
+        """暂停受理（2026-09-27）：202 + pause_requested；sid 到达壳层。"""
+
+        status, payload = self._post("/api/sessions/sess_0001/pause", {})
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "pause_requested")
+        self.assertEqual(payload["sessionId"], "sess_0001")
+        self.assertEqual(self.shell.paused, ["sess_0001"])
 
     def test_get_workspace(self) -> None:
         resp = self.client.get("/api/workspace")

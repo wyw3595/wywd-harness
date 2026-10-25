@@ -18,11 +18,13 @@ import {
   costTitle,
   createSession,
   notify,
+  pauseTurn,
   refreshSessions,
   runAction,
   selectSession,
   send,
   state,
+  stopTurn,
   toast,
 } from "./store.js";
 import { filterRows, toggleDrawer, toggleSidebar, ui } from "./ui.js";
@@ -371,7 +373,7 @@ export const ChatArea = {
 
     return { state, ui, canSend, costLine, costTitle, draft, box, inputEl,
              rendered, atBottom, onScroll, toBottom, autoGrow, submit,
-             toggleDrawer, onLiveToggle };
+             stopTurn, pauseTurn, toggleDrawer, onLiveToggle };
   },
 
   template: `
@@ -519,6 +521,14 @@ export const ChatArea = {
                     placeholder="给 agent 布置任务" aria-label="输入消息"
                     :disabled="!canSend" @input="autoGrow"
                     @keydown.enter.exact.prevent="submit"></textarea>
+          <button v-if="state.posting" type="button" id="btn-pause"
+                  :disabled="state.pausing"
+                  :title="state.pausing ? '暂停中…（等当前动作结束）' : '暂停本轮'"
+                  aria-label="暂停本轮" @click="pauseTurn">&#9724;&#65038;</button>
+          <button v-if="state.posting" type="button" id="btn-stop"
+                  :disabled="state.stopping"
+                  :title="state.stopping ? '停止中…（等当前动作结束）' : '停止本轮'"
+                  aria-label="停止本轮" @click="stopTurn">&#9632;</button>
           <button id="btn-send" type="button" :disabled="!canSend"
                   title="发送（Enter）" aria-label="发送" @click="submit">&#8593;</button>
         </div>

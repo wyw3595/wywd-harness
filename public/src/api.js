@@ -59,6 +59,21 @@ export function sendMessage(sid, message) {
   return post(messagesPath(sid), { message });
 }
 
+// ── 停止在跑的 turn（2026-09-27）─────────────────────────
+
+/** 受理即回（{"status":"stop_requested"}）——turn 在后端 run_agent 的
+    循环检查点收场（最迟等完当前的模型调用 / 工具 / 审批），结局由
+    SSE 的 turn_end（status=aborted）送达，不是本调用的职责。 */
+export function stopTurn(sid) {
+  return post(`/api/sessions/${encodeURIComponent(sid)}/stop`, {});
+}
+
+/** 暂停：与停止同一条纪律（2026-09-27），受理即回，结局走 SSE
+    （status=paused）。「继续」即恢复。 */
+export function pauseTurn(sid) {
+  return post(`/api/sessions/${encodeURIComponent(sid)}/pause`, {});
+}
+
 // ── 事件环一次性读取（GET /api/events）──────────────────
 
 /** 从头翻旧账的入口：打开会话时按 sessionId 找最近一条 turn_end，

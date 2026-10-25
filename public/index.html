@@ -416,6 +416,12 @@
     background:var(--ink);color:var(--ink-fg);cursor:pointer;font-size:15px;
     line-height:1;display:inline-flex;align-items:center;justify-content:center}
   #btn-send:disabled{opacity:.28;cursor:not-allowed}
+  /* 停止 / 暂停钮（2026-09-27）：posting 期间出现在发送钮左侧，同形态不同色 */
+  #btn-stop,#btn-pause{flex:0 0 auto;width:32px;height:32px;border-radius:50%;
+    border:0;background:transparent;color:var(--tx2);cursor:pointer;
+    font-size:12px;line-height:1;display:inline-flex;align-items:center;
+    justify-content:center}
+  #btn-stop:disabled,#btn-pause:disabled{opacity:.4;cursor:wait}
   .cp-hint{max-width:var(--col);margin:6px auto 0;font-size:11px;
     color:var(--tx3);text-align:center}
 

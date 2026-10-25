@@ -854,5 +854,49 @@ class BashToolTests(unittest.TestCase):
         self.assertIn("e2e-ok", result.output)
 
 
+class LoadSkillToolTests(unittest.TestCase):
+    """load_skill 延迟工具（装配层，s16）：正文带统一标记头，未知技能给人话。
+
+    项目级技能目录建在临时 root（{root}/.workbuddy/skills）——**不碰**
+    真实的 ~/.workbuddy/skills。技能名用独占前缀：同名时项目级覆盖用户级，
+    撞上开发者机器上的真实技能会让断言依赖用户环境。
+    """
+
+    def _make_tools(self, root: Path) -> dict:
+        from scripts.toolbox import build_deferred_tools
+
+        skill_dir = root / ".workbuddy" / "skills" / "demo-load-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "title: demo-load-skill\n"
+            "summary: 演示加载\n"
+            "read_when:\n  - 演示加载\n"
+            "---\n\n正文：第一步、第二步。\n",
+            encoding="utf-8",
+        )
+        return {tool.name: tool for tool in build_deferred_tools(root)}
+
+    def test_returns_marker_plus_body(self) -> None:
+        from src.harness.skills import skill_marker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = self._make_tools(Path(tmp))["load_skill"].handler
+            result = handler(name="demo-load-skill")
+
+        # 标记头是去重的锚点：这份正文随 tool 消息进 transcript，后续轮次
+        # 触发词再命中时 _inject_skills 靠它认出"模型已经看得到了"。
+        self.assertTrue(result.startswith(skill_marker("demo-load-skill")))
+        self.assertIn("正文：第一步、第二步。", result)
+
+    def test_unknown_skill_returns_actionable_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = self._make_tools(Path(tmp))["load_skill"].handler
+            result = handler(name="no-such-skill")
+
+        self.assertTrue(result.startswith("没取到："))
+        self.assertIn("no-such-skill", result)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -42,6 +42,8 @@ export const state = reactive({
   listLoading: true,  // 清单在途（2026-09-23：区分"还没拉到"和"真的没有"——
                       // turn 阻塞期间清单 GET 排队，不能显示"还没有会话"撒谎）
   posting: false,     // 正在等一轮 turn 结束
+  stopping: false,    // 已请求停止、等 turn 收场（按钮变"停止中…"）
+  pausing: false,     // 已请求暂停、等 turn 收场（按钮变"暂停中…"）
   locked: false,      // 当前会话被关闭：历史还能看，但不能再发
   streamUp: null,     // SSE 状态：null=还没连过 / true=连着 / false=断了
 });
@@ -360,6 +362,8 @@ export async function send(text) {
   if (!(await ensureLive(state.sid))) return;
 
   state.posting = true;
+  state.stopping = false;
+  state.pausing = false;
   state.live = [];
   state.notice = null;
   seenApprovals.clear();
@@ -403,6 +407,43 @@ export async function send(text) {
     // EventSource 会自动重连续传（Last-Event-ID），多数情况照常收到。
     state.notice = { level: "warn",
       text: "事件流没连上（正在重连）——结局可能延迟到达，长时间没动静请刷新页面。" };
+  }
+}
+
+/** 请求停止在跑的 turn（2026-09-27）。
+
+    受理即回——turn 在后端 run_agent 的循环检查点收场（最迟等完当前的
+    模型调用 / 工具 / 审批），真正收尾由 handleTurnEnd 做：stopping 旗
+    在那里落。这里只负责把按钮变成"停止中…"并诚实转述被拒。 */
+export async function stopTurn() {
+  if (!state.posting || state.stopping) return;
+  state.stopping = true;
+  try {
+    const res = await api.stopTurn(state.sid);
+    if (res && res.error) {
+      state.stopping = false;
+      state.notice = { level: "error", text: res.error };
+    }
+  } catch (err) {
+    state.stopping = false;
+    state.notice = { level: "error", text: "停止请求没送到后端" };
+  }
+}
+
+/** 请求暂停在跑的 turn（2026-09-27）：与 stopTurn 同一条纪律——受理
+    即回，turn 在后端循环检查点收场，handleTurnEnd 落 pausing 旗。 */
+export async function pauseTurn() {
+  if (!state.posting || state.pausing) return;
+  state.pausing = true;
+  try {
+    const res = await api.pauseTurn(state.sid);
+    if (res && res.error) {
+      state.pausing = false;
+      state.notice = { level: "error", text: res.error };
+    }
+  } catch (err) {
+    state.pausing = false;
+    state.notice = { level: "error", text: "暂停请求没送到后端" };
   }
 }
 
@@ -599,9 +640,21 @@ function handleTurnEnd(ev) {
   if (ev.error) {
     state.notice = { level: "error", text: ev.error };
     pushLive("warn", "⚠︎ " + ev.error);
+  } else if (ev.status === "aborted") {
+    // 主动停止（2026-09-27）：不是失败——历史照常落账，说「继续」接着跑。
+    state.notice = { level: "warn", text: "本轮已停止；说「继续」可以接着做。" };
+    pushLive("warn", "■ 本轮已停止");
+    if (ev.output) pushLive("out", ev.output);
+  } else if (ev.status === "paused") {
+    // 主动暂停（2026-09-27）：与停止共用恢复路径——「继续」接着做。
+    state.notice = { level: "warn", text: "本轮已暂停；说「继续」可以接着做。" };
+    pushLive("warn", "⏸︎ 本轮已暂停");
+    if (ev.output) pushLive("out", ev.output);
   } else {
     noteOutcome(ev);
   }
+  state.stopping = false;
+  state.pausing = false;
   finishPosting();
   refreshSessions();
   // 每轮 token 会让成本表变，顺手刷；抽屉开着就一起把日志带了

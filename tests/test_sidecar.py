@@ -23,6 +23,7 @@ from src.harness.sidecar import (
     RPCConnection,
     SidecarServer,
 )
+from src.harness.skills import SkillIndex
 from src.harness.tools import Tool, ToolRegistry
 
 
@@ -955,6 +956,98 @@ class TurnBackgroundingTests(unittest.TestCase):
         self.assertTrue(mids)
         self.assertEqual({e.get("sessionId") for e in mids}, {sid})
 
+    def test_stop_mid_turn_reports_aborted(self) -> None:
+        """agent/stop：协作式停止——工具跑完、下一个检查点收场。
+
+        turn_end status=aborted（不是 failed：停止不是失败）；停止前
+        完成的步骤照常落账（transcript 里有工具结果）。
+        """
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_handler() -> str:
+            entered.set()
+            release.wait(timeout=5)
+            return "放行"
+
+        server = self._server_with_tool(slow_handler)
+        sid = server._handle_session_create({})["sessionId"]
+        events = self._collect_events(server)
+        server._model = self._script(1, "不该被看到")
+
+        resp = server._handle_agent_send({"sessionId": sid,
+                                          "message": "跑到一半",
+                                          "turnId": "t-1"})
+        self.assertEqual(resp["status"], "started")
+        self.assertTrue(entered.wait(timeout=5))
+
+        stop = server._handle_agent_stop({"sessionId": sid})
+        self.assertEqual(stop["status"], "stop_requested")
+
+        release.set()
+        ends = self._wait_turn_ends(events, 1)
+        self.assertEqual(ends[0]["status"], "aborted")
+        self.assertEqual(ends[0]["turnId"], resp["turnId"])
+        self.assertIn("用户已停止", ends[0]["output"])
+        record = server._manager.store.load(sid)
+        self.assertIn("放行", str(record.messages))
+
+    def test_pause_mid_turn_reports_paused(self) -> None:
+        """agent/pause：与停止共用检查点，status=paused（不是失败）。
+
+        停止前完成的步骤照常落账；「继续」即恢复（恢复路径与 max_steps
+        同款，已由既有测试覆盖，这里钉暂停本身的接线）。
+        """
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_handler() -> str:
+            entered.set()
+            release.wait(timeout=5)
+            return "放行"
+
+        server = self._server_with_tool(slow_handler)
+        sid = server._handle_session_create({})["sessionId"]
+        events = self._collect_events(server)
+        server._model = self._script(1, "不该被看到")
+
+        resp = server._handle_agent_send({"sessionId": sid,
+                                          "message": "跑到一半",
+                                          "turnId": "t-1"})
+        self.assertEqual(resp["status"], "started")
+        self.assertTrue(entered.wait(timeout=5))
+
+        paused = server._handle_agent_pause({"sessionId": sid})
+        self.assertEqual(paused["status"], "pause_requested")
+
+        release.set()
+        ends = self._wait_turn_ends(events, 1)
+        self.assertEqual(ends[0]["status"], "paused")
+        self.assertEqual(ends[0]["turnId"], resp["turnId"])
+        self.assertIn("已暂停", ends[0]["output"])
+        record = server._manager.store.load(sid)
+        self.assertIn("放行", str(record.messages))
+
+    def test_pause_without_running_turn_is_honest(self) -> None:
+        """暂停不了没在跑的东西：人话报错（与停止同一口径）。"""
+
+        server = self._server_with_tool(lambda: "x")
+        sid = server._handle_session_create({})["sessionId"]
+        resp = server._handle_agent_pause({"sessionId": sid})
+        self.assertIn("error", resp)
+        self.assertIn("没有在跑的 turn", resp["error"])
+
+    def test_stop_without_running_turn_is_honest(self) -> None:
+        """停不了没在跑的东西：人话报错，不是静默成功让用户干等。"""
+
+        server = self._server_with_tool(lambda: "x")
+        sid = server._handle_session_create({})["sessionId"]
+        resp = server._handle_agent_stop({"sessionId": sid})
+        self.assertIn("error", resp)
+        self.assertIn("没有在跑的 turn", resp["error"])
+
     def test_close_mid_turn_reports_failed_and_discards_result(self) -> None:
         """turn 跑到一半 session/close：晚到结果拒收（transcript 不落账），
         turn_end 如实报 failed——不装作无事发生，也不陪会话一起挂死。"""
@@ -1413,6 +1506,93 @@ class CompactionTranscriptTests(unittest.TestCase):
         after_second = store.load(sid).messages
 
         self.assertEqual(after_second[:len(after_first)], after_first)
+
+
+class InjectSkillsTests(unittest.TestCase):
+    """_inject_skills 的展开与去重（s16）。
+
+    不起连接线程，直接构造 SidecarServer 对着 _inject_skills 打表。
+    核心契约：**去重扫全视图**——技能正文有两个入口（触发词自动展开的
+    system 消息 / load_skill 工具落进 transcript 的 tool 消息），哪个
+    入口来的都算"模型已经看得到"，不再注入第二份；而正文一旦被压缩
+    出视图，重新注入是正确行为——去重的范围是"本轮视图"，不跨轮记账。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        user_dir = Path(self.tmp.name) / "skills"
+        self._write_skill(user_dir, "git-commit", summary="提交规范",
+                          triggers=("提交", "commit"))
+        self.server = SidecarServer(
+            model=None, registry=ToolRegistry(),
+            policy=build_default_policy(),
+            skill_index=SkillIndex(user_dir=user_dir),
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _write_skill(directory: Path, folder: str, *, summary: str,
+                     triggers: tuple[str, ...]) -> None:
+        lines = ["---", f"title: {folder}", f"summary: {summary}", "read_when:"]
+        lines.extend(f"  - {item}" for item in triggers)
+        path = directory / folder / "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n---\n\n正文：一次一件事。\n",
+                        encoding="utf-8")
+
+    def _marker_count(self, view: list[dict], name: str = "git-commit") -> int:
+        return sum(str(item.get("content", "")).count(f"# 技能：{name}")
+                   for item in view)
+
+    def test_hit_expands_body_as_system_message(self) -> None:
+        out = self.server._inject_skills(
+            [{"role": "system", "content": "seed"}], "帮我提交一下")
+
+        injected = [m for m in out if m["role"] == "system"
+                    and "# 技能：git-commit" in m["content"]]
+        self.assertEqual(len(injected), 1)
+        self.assertIn("正文：一次一件事。", injected[0]["content"])
+
+    def test_miss_returns_view_unchanged(self) -> None:
+        view = [{"role": "system", "content": "seed"}]
+        self.assertEqual(self.server._inject_skills(view, "今天天气不错"), view)
+
+    def test_tool_loaded_body_is_not_reinjected(self) -> None:
+        # 上一轮模型用 load_skill 加载过：正文随 tool 消息留在 transcript，
+        # 标记头跟着出现在本轮视图——触发词再命中也不注入第二份。
+        # 这是去重从"只扫 system"扩到"扫全视图"的理由：只扫 system 时，
+        # 这条路径加载过的技能会被再注入一遍，同一份正文进上下文两次。
+        view = [
+            {"role": "system", "content": "seed"},
+            {"role": "user", "content": "帮我提交一下"},
+            {"role": "tool", "tool_call_id": "c1",
+             "content": "工具 DeferExecuteTool 返回："
+                        "# 技能：git-commit\n\n正文：一次一件事。"},
+        ]
+        out = self.server._inject_skills(view, "再帮我提交一次")
+        self.assertEqual(self._marker_count(out), 1)
+
+    def test_system_injected_body_is_not_reinjected(self) -> None:
+        view = [{"role": "system",
+                 "content": "# 技能：git-commit（命中触发词后自动展开）"
+                            "\n\n正文：一次一件事。"}]
+        out = self.server._inject_skills(view, "帮我提交")
+        self.assertEqual(self._marker_count(out), 1)
+
+    def test_body_compacted_out_is_reinjected(self) -> None:
+        # 视图里没有正文（上一轮工具加载的已被压缩掉）→ 模型真的看不见了，
+        # 重新注入是对的。去重看"本轮视图"说话，不跨轮记账。
+        out = self.server._inject_skills(
+            [{"role": "system", "content": "seed"}], "帮我提交")
+        self.assertEqual(self._marker_count(out), 1)
+
+    def test_no_skill_index_is_noop(self) -> None:
+        bare = SidecarServer(model=None, registry=ToolRegistry(),
+                             policy=build_default_policy())
+        view = [{"role": "system", "content": "seed"}]
+        self.assertEqual(bare._inject_skills(view, "帮我提交"), view)
 
 
 if __name__ == "__main__":

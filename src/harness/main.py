@@ -39,7 +39,10 @@ class RunResult:
     # 练习 16 起 "failed" 也是合法结局：契约先承认失败，循环才有值可写。
     # s01 整合：再加 "truncated"——provider 截断输出，沉默地当完整答案
     # 是骗用户；显式承认截断，才是诚实的完成。
-    status: Literal["completed", "max_steps", "failed", "truncated"] = "completed"
+    # 2026-09-27：再加 "aborted"——用户主动停止，协作式早退；transcript
+    # 照常落账（"被停止"也是发生过的事实），「继续」可接着跑。
+    status: Literal["completed", "max_steps", "failed", "truncated",
+                    "aborted", "paused"] = "completed"
     messages: list[dict] = field(default_factory=list)
     # 练习 18：本次运行累计的 token 用量（跨轮求和），由 run_agent 填写
     # ——成本从"听说很贵"变成看得见的数字。

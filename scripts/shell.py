@@ -410,6 +410,27 @@ class SidecarShell:
                               "output": "", "usage": {},
                               "error": "sidecar 连接中断"})
 
+    def stop_turn(self, session_id: str) -> dict:
+        """请求停止一个在跑的 turn（协作式，2026-09-27）。
+
+        受理即返回（{"status":"stop_requested"}）——turn 在 run_agent 的
+        循环检查点收场，结局由 turn_end 事件广播给前端，不是本调用的
+        职责。没有在跑的 turn 时 sidecar 回 {"error"} 人话。
+        """
+
+        return self._result(self._client.call("agent/stop",
+            {"sessionId": session_id}))
+
+    def pause_turn(self, session_id: str) -> dict:
+        """请求暂停一个在跑的 turn（协作式，2026-09-27）。
+
+        与 stop_turn 同一条纪律：受理即回，结局走 turn_end（status=
+        paused）。「继续」即恢复。
+        """
+
+        return self._result(self._client.call("agent/pause",
+            {"sessionId": session_id}))
+
     def submit_to(self, session_id: str, message: str) -> dict:
         """提交一轮但**不等结局**（并发第 3 步：web 的 202 契约）。
 

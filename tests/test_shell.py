@@ -57,6 +57,12 @@ class FakeClient:
             result = self.send_result or {
                 "output": f"echo:{(params or {}).get('message', '')}",
                 "status": "completed"}
+        elif method == "agent/stop":
+            result = {"sessionId": (params or {}).get("sessionId"),
+                      "status": "stop_requested"}
+        elif method == "agent/pause":
+            result = {"sessionId": (params or {}).get("sessionId"),
+                      "status": "pause_requested"}
         else:
             result = {}
         return {"jsonrpc": "2.0", "result": result, "id": self._id}
@@ -373,6 +379,26 @@ class SidecarShellTests(unittest.TestCase):
         t2.join()
         self.assertEqual(outcomes["a"]["output"], "echo:甲")
         self.assertEqual(outcomes["b"]["output"], "echo:乙")
+
+    def test_stop_turn_forwards_session_id(self) -> None:
+        """停止转发（2026-09-27）：sid 原样带给 sidecar，受理回执透传。"""
+
+        shell, client, _ = self._make()
+        shell.start()
+        result = shell.stop_turn("sess_x")
+        self.assertEqual(client.calls[-1],
+                         ("agent/stop", {"sessionId": "sess_x"}))
+        self.assertEqual(result["status"], "stop_requested")
+
+    def test_pause_turn_forwards_session_id(self) -> None:
+        """暂停转发（2026-09-27）：与停止同一条线，只是方法名不同。"""
+
+        shell, client, _ = self._make()
+        shell.start()
+        result = shell.pause_turn("sess_y")
+        self.assertEqual(client.calls[-1],
+                         ("agent/pause", {"sessionId": "sess_y"}))
+        self.assertEqual(result["status"], "pause_requested")
 
     def test_submit_to_returns_started_without_waiting(self) -> None:
         """202 契约（并发第 3 步）：提交即回 started + turnId，不等结局。

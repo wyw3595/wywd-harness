@@ -264,6 +264,7 @@ class SessionProcess:
         self._state_lock = threading.RLock()       # 保护 record 的读改写
         self._turn_lock = threading.Lock()         # 一个会话同时最多一个 turn
         self._abort_requested = threading.Event()  # 协作式中断信号
+        self._pause_requested = threading.Event()  # 协作式暂停信号（2026-09-27）
         # 空闲回收的账面：最后一次"被用过"的时刻（Manager.reap_idle 读它）。
         # 为什么记在 Process 上而不是 Record 里：它是**运行时**的属性——
         # resume 之后是一个全新的运行时，账也该从头记；而 Record 要能进
@@ -375,6 +376,7 @@ class SessionProcess:
                 raise SessionLifecycleError(
                     f"session {self.id} cannot accept input while {self.status}")
             self._abort_requested.clear()  # 上一轮的 abort 不传染
+            self._pause_requested.clear()  # 上一轮的 pause 同理
             self.touch()                   # 空闲回收的账面：这一轮算"用过"
             # 第一句话顶掉默认标题（UI 列表的辨识度来源）：只动还是默认
             # 值的记录——用户/创建方显式起过名的（create 传 title）不碰。
@@ -402,12 +404,31 @@ class SessionProcess:
     def abort(self) -> None:
         """请求协作式中断：只置信号，不删记录、不动其他资源。
 
-        教材的诚实边界照抄：同步调用里 abort 打不断正在阻塞的请求，
-        只能在循环边界生效。我们 run_agent 的"每轮开头查一次信号"
-        留到 s07-b 接线时再讨论；本课 abort 的实际效力 = close 前
-        先礼让一次（见 close）。
+        诚实边界照旧：正在阻塞的模型调用 / 工具 / 审批打不断，信号在
+        run_agent 的循环检查点生效（2026-09-27 停止接线：should_stop
+        谓词读下面的 abort_requested）。
         """
         self._abort_requested.set()
+
+    def abort_requested(self) -> bool:
+        """停止信号是否已置位（run_agent 的 should_stop 谓词读这里）。"""
+
+        return self._abort_requested.is_set()
+
+    def request_pause(self) -> None:
+        """请求协作式暂停：只置信号，与 abort 同一条纪律。
+
+        与停止的分工：暂停早退后 transcript 落账、状态回 IDLE，说
+        「继续」接着跑——run_agent 在同一批检查点读两个信号，只差
+        状态名与文案。诚实边界相同：当前动作打不断。
+        """
+
+        self._pause_requested.set()
+
+    def pause_requested(self) -> bool:
+        """暂停信号是否已置位（run_agent 的控制谓词读这里）。"""
+
+        return self._pause_requested.is_set()
 
     def close(self) -> None:
         """释放运行时资源，保留逻辑记录。幂等：重复 close 直接返回。"""

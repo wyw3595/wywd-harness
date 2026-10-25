@@ -388,6 +388,22 @@ def _read_skill(skill_file: Path, scope: str) -> Skill:
 # 四、索引：建目录、匹配触发词、按需加载正文
 # ═══════════════════════════════════════════════════════════════
 
+def skill_marker(name: str) -> str:
+    """技能正文的**统一标记头**。正文有两个入口，标记只此一处：
+
+      - sidecar._inject_skills：触发词命中，追加一条 system 消息；
+      - scripts/toolbox 的 load_skill：模型主动加载，正文随 tool 消息
+        进 transcript。
+
+    两边都用它打头，`_inject_skills` 的去重才能在**全视图**里认出
+    "这份正文模型已经看得到了"——字符串散在两处迟早漂移，漂移的
+    后果是同一份正文进上下文两遍。去重是子串匹配，标记后面的
+    说明文字（"命中触发词后自动展开"等）不影响判定。
+    """
+
+    return f"# 技能：{name}"
+
+
 class SkillIndex:
     """两级技能目录的索引。**只列目录，正文等用到再读。**"""
 
@@ -501,7 +517,7 @@ class SkillIndex:
         if not hits:
             return ""
         blocks = [
-            f"# 技能：{skill.name}（命中触发词后自动展开）\n\n{self.load(skill.name)}"
+            f"{skill_marker(skill.name)}（命中触发词后自动展开）\n\n{self.load(skill.name)}"
             for skill in hits
         ]
         return "\n\n---\n\n".join(blocks)

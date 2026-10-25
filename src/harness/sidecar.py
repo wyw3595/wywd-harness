@@ -77,7 +77,7 @@ from src.harness.session import (
     SessionState,
     SessionStore,
 )
-from src.harness.skills import SkillIndex
+from src.harness.skills import SkillIndex, skill_marker
 from src.harness.tools import ToolRegistry
 
 # 工作区运行件工厂（s11 上传目录）：由装配层注入，harness 不认识 Workspace。
@@ -86,6 +86,29 @@ from src.harness.tools import ToolRegistry
 # harness 只负责原样转交；失败**必须翻成 ValueError / OSError 抛出**
 # （RPC 层只有这一条错误通道，与 session 四操作的约定一致）。
 WorkspaceRuntimeBuilder = Callable[[dict], tuple]
+
+
+class _SessionTurnControl:
+    """TurnControl 的 sidecar 端实现（2026-09-27）：读 SessionProcess 的
+    停止 / 暂停两个 Event。
+
+    每次检查查一次 manager 字典（便宜）；运行时没了 = close 把它摘走，
+    abort 按"已置"算——fail-closed：turn 不陪一个已死的会话跑完全程。
+    pause 则要求运行时还在（会话都没了，暂停没有意义，且下一轮
+    run_turn 开头本来就会清信号）。
+    """
+
+    def __init__(self, manager: SessionManager, sid: str) -> None:
+        self._manager = manager
+        self._sid = sid
+
+    def abort_requested(self) -> bool:
+        runtime = self._manager.get_session(self._sid)
+        return runtime is None or runtime.abort_requested()
+
+    def pause_requested(self) -> bool:
+        runtime = self._manager.get_session(self._sid)
+        return runtime is not None and runtime.pause_requested()
 
 
 def _resolve_turn_workers() -> int:
@@ -410,25 +433,39 @@ class SidecarServer:
         self.rpc_handlers["session/forget"] = self._handle_session_forget
         self.rpc_handlers["session/messages"] = self._handle_session_messages
         self.rpc_handlers["agent/send"] = self._handle_agent_send
+        # 停止（2026-09-27）：协作式——置 abort 信号立刻返回，turn 在
+        # run_agent 的循环检查点收场，结局走 turn_end（status=aborted）。
+        self.rpc_handlers["agent/stop"] = self._handle_agent_stop
+        # 暂停（2026-09-27）：与停止共用同一批检查点，只差状态名与文案。
+        self.rpc_handlers["agent/pause"] = self._handle_agent_pause
         self.rpc_handlers["tool/list"] = self._handle_tool_list
         # s11：工作区（上传目录）——换沙箱 + 读当前。
         self.rpc_handlers["workspace/set"] = self._handle_workspace_set
         self.rpc_handlers["workspace/get"] = self._handle_workspace_get
 
     def _inject_skills(self, view: list[dict], message: str) -> list[dict]:
-        """把命中触发词的技能**正文**追加进本轮视图（已注入过的跳过）。
+        """把命中触发词的技能**正文**追加进本轮视图（正文已在视图里就跳过）。
 
         分工：**目录**由装配层放进 history_seed（常驻、便宜）；**正文**在这里
         按需展开（贵、只在命中时）。
 
-        两个刻意的取舍：
+        去重扫的是**全视图**，不只 system 消息：技能正文有第二个入口——
+        模型主动调 load_skill 工具，那份正文随 **tool** 消息进了 transcript
+        （会落盘、会出现在后续轮次的视图里）。只扫 system 的话，这条路径
+        加载过的技能会被触发词再注入一遍，同一份正文进上下文两次。
+        标记头是 skill_marker（单一真源），两个入口共用，子串匹配认得出
+        任何角色消息里的正文。
+
+        刻意的取舍：
+        - **去重的范围是"本轮视图"而不是"全部历史"**：正文若已被 compact
+          压出视图，模型就真的看不见了，此时重新注入是**正确**行为——
+          所以不维护"已加载集合"那类跨轮状态，看视图说话；
         - **重复命中就跳过**：同一个技能在长对话里可能被命中很多次，每次都追加
           就是白烧 token，而"再提醒一遍"的收益几乎为零——上文里已经有它了；
-        - **注入的正文会进 transcript**（因为它是本轮 messages 的一部分）。
-          这是**有意**的：重放会话时能看到"当时凭什么那么做"，可审计的价值
-          高于那点存储。老化的副本交给 compact 的 L1/L3 处理。
-
-        任何异常都**不影响本轮**：技能是锦上添花，不是关键路径。
+        - 自动注入的正文**不落盘**（它是本轮 view 的尾巴，appended 切片
+          天然把它排除）——每轮按需重生，本来就不该进证据。load_skill
+          那条路恰好相反：tool 消息是模型动作的记录，照常落盘可审计。
+        - 任何异常都**不影响本轮**：技能是锦上添花，不是关键路径。
         """
 
         if self._skill_index is None:
@@ -440,10 +477,9 @@ class SidecarServer:
             print(f"[sidecar] 技能匹配失败（不影响本轮）：{error}")
             return view
 
-        existing = "\n".join(str(item.get("content", ""))
-                             for item in view if item.get("role") == "system")
+        existing = "\n".join(str(item.get("content", "")) for item in view)
         for skill in hits:
-            marker = f"# 技能：{skill.name}"
+            marker = skill_marker(skill.name)
             if marker in existing:
                 continue
             try:
@@ -504,6 +540,7 @@ class SidecarServer:
                 base = self._on_event
                 if base is not None:
                     base(event, {**data, "sessionId": sid})
+
             result = run_agent(
                 message, model=self._model,
                 registry=registry if registry is not None else self._registry,
@@ -511,7 +548,9 @@ class SidecarServer:
                 max_steps=self._max_steps,
                 externalize=self._externalize,   # s13：超阈值输出换到磁盘
                 on_event=_stamped if sid else self._on_event,
-                runner=runner if runner is not None else self._runner)
+                runner=runner if runner is not None else self._runner,
+                control=(_SessionTurnControl(self._manager, sid)
+                         if sid else None))
             # 记账走**线程本地**（第 2 步起 turn 在执行器线程跑，可能并行）：
             # 每个线程只看得到自己这轮的 status/usage，同线程的调用方
             # （_run_turn_task）在 run_turn 返回后立刻读——并行不串台。
@@ -642,6 +681,10 @@ class SidecarServer:
                 except Exception as error:
                     self._send({"jsonrpc":"2.0",
                         "error":{"code":-32603,"message":str(error)},"id":req_id})
+                finally:
+                    # agent/send 的 started 帧已上线（哪怕走的是 error 分支）
+                    # ——放行执行器。别的请求没有 gate，这是空操作。
+                    self._release_started_gate()
             else:
                 self._send({"jsonrpc":"2.0",
                     "error":{"code":-32601,"message":f"Method not found: {method}"},
@@ -981,18 +1024,45 @@ class SidecarServer:
                               "（已关闭的点\"复活\"后可以继续对话）")}
         if runtime.status != SessionState.IDLE:
             return {"error": f"会话 {sid} 正在跑上一轮，等它结束再发"}
-        self._executor.submit(self._run_turn_task, sid, text, runtime, turn_id)
+        # started 帧必须**先于一切 turn 事件**上线——这是后台化的隐性契约，
+        # 不钉住就会错位：submit 一返回，执行器线程就可能已经把整个 turn
+        # 跑完（离线模型微秒级），事件流先于 started 出现在线上。按序收
+        # 结果的客户端会把 started 当成**下一个请求**的响应，此后所有
+        # 响应整体错位一格（实测：test_session_resume_continues_history
+        # 的 resume 拿到的是 close 的结果，KeyError: generation）。
+        # 修法：执行器拿着 gate 等主循环把 started 帧发完再开跑——
+        # 发布点在 handle_connection 的 finally（_release_started_gate）。
+        gate = threading.Event()
+        self._started_gate = gate
+        self._executor.submit(self._run_turn_task, sid, text, runtime,
+                              turn_id, gate)
         self._log(f"turn submitted: {sid} (turnId={turn_id[:8]})")
         return {"sessionId": sid, "status": "started", "turnId": turn_id}
 
+    def _release_started_gate(self) -> None:
+        """started 帧已上线（或响应已失败）——放行执行器。无 gate 是空操作。"""
+
+        gate = getattr(self, "_started_gate", None)
+        if gate is not None:
+            self._started_gate = None
+            gate.set()
+
     def _run_turn_task(self, sid: str, text: str,
-                       runtime: SessionProcess, turn_id: str) -> None:
+                       runtime: SessionProcess, turn_id: str,
+                       started_gate: threading.Event | None = None) -> None:
         """执行器线程里跑一个 turn，结束时广播 turn_end（壳等它收结果）。
 
         三种结局都如实上报：正常完成（status 来自 run_agent 的诚实汇报）、
         被状态机拒绝（并发 turn / close 竞态——SessionLifecycleError）、
         内部异常。连接已死时事件静默丢弃（_emit_event 兜住），turn 照常收尾。
         """
+        # 等 started 帧上线（防乱序）。正常情况主循环发完响应立刻 set；
+        # 5 秒超时是 fail-open——响应丢了 turn 也不能陪着挂死。
+        # **只挂在 RPC 连接上才需要等**：直调 handler 的路径（测试等）
+        # 没有 socket，"响应先行"无从谈起，gate 视为已放开。
+        if (started_gate is not None and self._conn is not None
+                and not started_gate.wait(timeout=5.0)):
+            self._log("started 帧超时未上线，turn 照常开跑")
         self._emit_event("turn_start", {"sessionId": sid, "turnId": turn_id})
         try:
             output = runtime.run_turn(text)
@@ -1012,6 +1082,39 @@ class SidecarServer:
                                           "status": "failed", "output": "",
                                           "usage": {},
                                           "error": f"turn 内部异常：{exc}"})
+
+    def _handle_agent_stop(self, params: dict) -> dict:
+        """停止一个在跑的 turn（协作式，2026-09-27）。
+
+        置 abort 信号**立刻返回**——turn 在 run_agent 的下一个检查点
+        收场（最迟等完当前的模型调用 / 工具 / 审批），结局由 turn_end
+        事件广播（status=aborted），不是本响应的职责。没有在跑的 turn
+        回人话：用户点了停止却石沉大海，比报错更糟。
+        """
+        sid = str(params.get("sessionId") or "").strip()
+        runtime = self._manager.get_session(sid) if sid else None
+        if runtime is None or runtime.status != SessionState.RUNNING:
+            return {"error": (f"会话 {sid or '（未指定）'} 没有在跑的 turn"
+                              "——停不了没在跑的东西")}
+        runtime.abort()
+        self._log(f"stop requested: {sid}")
+        return {"sessionId": sid, "status": "stop_requested"}
+
+    def _handle_agent_pause(self, params: dict) -> dict:
+        """暂停一个在跑的 turn（协作式，2026-09-27）。
+
+        与停止共用同一批检查点，只差状态名与文案（paused，不是失败）。
+        置信号立刻返回；turn 在下一个检查点收场（最迟等完当前的模型
+        调用 / 工具 / 审批），结局走 turn_end 事件。「继续」即恢复。
+        """
+        sid = str(params.get("sessionId") or "").strip()
+        runtime = self._manager.get_session(sid) if sid else None
+        if runtime is None or runtime.status != SessionState.RUNNING:
+            return {"error": (f"会话 {sid or '（未指定）'} 没有在跑的 turn"
+                              "——暂停不了没在跑的东西")}
+        runtime.request_pause()
+        self._log(f"pause requested: {sid}")
+        return {"sessionId": sid, "status": "pause_requested"}
 
 
 # ═══════════════════════════════════════════════════════════════
