@@ -57,7 +57,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # 迁移账本：(版本, 建表 SQL)。每个版本一个事务；已应用的跳过。
 # 加表/加列 = 追加条目，不改历史——迁移的可重放性全靠这个纪律。
@@ -92,6 +92,34 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON usage_tracking(session_id);
         CREATE INDEX IF NOT EXISTS idx_tool_usage_session
             ON tool_usage(session_id);
+    """),
+    # s22 自动化调度：定义（软删除）+ 运行时状态 + 执行历史。
+    (2, """
+        CREATE TABLE IF NOT EXISTS automations (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            prompt          TEXT NOT NULL,
+            schedule_type   TEXT NOT NULL,
+            rrule           TEXT,
+            scheduled_at    TEXT,
+            status          TEXT NOT NULL DEFAULT 'ACTIVE',
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS automation_runtime_state (
+            automation_id   TEXT PRIMARY KEY REFERENCES automations(id),
+            last_run        TEXT,
+            next_run        TEXT,
+            last_status     TEXT
+        );
+        CREATE TABLE IF NOT EXISTS automation_runs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            automation_id   TEXT NOT NULL REFERENCES automations(id),
+            started_at      TEXT NOT NULL,
+            completed_at    TEXT,
+            status          TEXT NOT NULL,
+            output          TEXT
+        );
     """),
 ]
 
@@ -256,6 +284,88 @@ class HarnessDB:
                 "LIMIT ?", (int(limit),)).fetchall()
         return [{"tool_name": row["tool_name"], "calls": row["calls"]}
                 for row in rows]
+
+    # ── s22 自动化：定义（软删除）× 运行时状态 × 执行历史 ───────
+
+    def create_automation(self, auto: dict) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO automations "
+                "(id, name, prompt, schedule_type, rrule, scheduled_at, "
+                " status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (auto["id"], auto["name"], auto["prompt"],
+                 auto["schedule_type"], auto.get("rrule"),
+                 auto.get("scheduled_at"), auto.get("status", "ACTIVE"),
+                 _now_iso(), _now_iso()))
+
+    def list_automations(self, include_deleted: bool = False) -> list[dict]:
+        query = ("SELECT a.*, r.last_run, r.next_run, r.last_status "
+                 "FROM automations a "
+                 "LEFT JOIN automation_runtime_state r "
+                 "ON a.id = r.automation_id")
+        if not include_deleted:
+            query += " WHERE a.status != 'deleted'"
+        query += " ORDER BY a.created_at ASC"
+        with self._lock:
+            return [dict(row) for row in self._conn.execute(query)]
+
+    def set_automation_status(self, auto_id: str, status: str) -> None:
+        """状态迁移：ACTIVE/PAUSED 互切、deleted 是软删除（行保留）。"""
+
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE automations SET status=?, updated_at=? WHERE id=?",
+                (status, _now_iso(), auto_id))
+
+    def due_automations(self, now_iso: str) -> list[dict]:
+        """到期的 ACTIVE 自动化：next_run 非空且 ≤ now。
+
+        next_run 在 create 时就填好（once=scheduled_at，recurring=首次
+        时刻）；once 跑完置 NULL 且转 PAUSED——next_run 为空的要么跑完
+        要么没初始化，都不该到期。错过的不补：到期只跑一次，下一次
+        由执行时刻重算（scheduler 的 anchor-on-run 语义）。
+        """
+
+        return [a for a in self.list_automations()
+                if a["status"] == "ACTIVE"
+                and a["next_run"] is not None
+                and a["next_run"] <= now_iso]
+
+    def upsert_runtime_state(self, auto_id: str,
+                             last_run: str, next_run: Optional[str],
+                             last_status: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO automation_runtime_state "
+                "(automation_id, last_run, next_run, last_status) "
+                "VALUES (?,?,?,?)",
+                (auto_id, last_run, next_run, last_status))
+
+    def record_run_start(self, auto_id: str, started_at: str) -> int:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO automation_runs "
+                "(automation_id, started_at, status) "
+                "VALUES (?,?,'running')", (auto_id, started_at))
+            return int(cursor.lastrowid)
+
+    def record_run_end(self, run_id: int, completed_at: str,
+                       status: str, output: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE automation_runs SET completed_at=?, status=?, "
+                "output=? WHERE id=?",
+                (completed_at, status, output[:2000], run_id))
+
+    def automation_history(self, auto_id: str,
+                           limit: int = 10) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, started_at, completed_at, status, output "
+                "FROM automation_runs WHERE automation_id=? "
+                "ORDER BY id DESC LIMIT ?",
+                (auto_id, int(limit))).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         self._conn.close()

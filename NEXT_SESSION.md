@@ -2983,3 +2983,46 @@ skip）**，README 已跟上。改动未提交，等用户发话。
 - s22 自动化调度（automations 三张表的迁移条目已备好）；
 - s23 审计沙盒 → s24 综合收官；
 - stats 面板进 UI（运维抽屉加一块，数据源 stats/summary）。
+
+# 2026-10-25（七续）：s22 自动化调度——到点自动跑，不需要人推
+
+用户"提交继续"后：s21 落 26f3fbe，顺位做 s22。
+
+## 一、新文件与接线
+
+- `sqlite_store.py` 迁移 v2：automations（软删除）/automation_runtime_state
+  /automation_runs 三张表 + CRUD/到期查询/run 历史——s21 备好的迁移
+  框架第一次兑现：加表就是加一个条目，SCHEMA_VERSION 升 2。
+- `src/harness/automations.py`（内核）：parse_rrule（FREQ 白名单 +
+  INTERVAL≥1，构造期炸）/next_run（教学子集：MONTHLY=30 天、
+  YEARLY=365 天）；`AutomationScheduler.tick()`——runner/clock 全注入
+  （测试用假时钟跑到任意时间点），失败也是历史不是异常。
+- sidecar：automation/create|list|delete（软删除）三个 RPC；
+  `_run_automation` 隔离会话执行（新建会话→run_turn→关闭，转录即
+  证据，哪次任务干了什么事后可查）；tick 线程由
+  WYWD_AUTOMATION_TICK 门控（默认 0 = 不起线程，RPC 常在、测试手动
+  tick）——调度线程必须兜住一切异常（崩了等于所有任务停摆）。
+
+## 二、关键取舍
+
+- **错过不补**：recurring 的下一次从**执行时刻**起算——停机两天重启
+  后补跑 48 个日报是灾难。测试钉死（错过 2 天只跑 1 次）。
+- **自动化过审批闸门与手动同路**：隔离会话用同一套 registry/policy/
+  approver——无人值守时审批等不到人，超时 BLOCKED、如实入转录
+  （教材："自动化绕过权限系统，风险比手动更高"）。
+
+## 三、本次踩的坑
+
+- due 判定首版写成"once 看 next_run 是否为空"——但 create 路径会把
+  next_run 填成 scheduled_at，两边设计矛盾，sidecar 集成测试当场抓到。
+  统一成"next_run 非空且 ≤ now 即到期"（create 必种初始状态；once
+  跑完置 NULL+PAUSED 不再到期）。教训：**契约两边（写入方与查询方）
+  要对着同一张状态图设计**。
+
+## 四、验收
+
+新 `tests/test_automations.py` 8 条：RRULE 合法/非法、once 跑完转
+PAUSED、recurring 锚定执行时刻（错过不补）、失败入历史、软删除/
+PAUSED 不到期、sidecar 全链（create→手动 tick→真实 run_turn→历史→
+软删除两态）、坏参数人话。全量 **845 条 OK（含 2 skip）**。改动未
+提交。教材只剩 s23 审计沙盒、s24 收官。

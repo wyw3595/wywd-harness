@@ -63,6 +63,13 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from src.harness.agent import run_agent
+from src.harness.automations import (
+    AutomationError,
+    AutomationScheduler,
+    new_automation_id,
+    next_run,
+    parse_rrule,
+)
 from src.harness.compact import (
     COMPACT_THRESHOLD_TOKENS,
     compact,
@@ -287,6 +294,7 @@ class SidecarServer:
         skill_index: Optional[SkillIndex] = None,
         expert_index: Optional["ExpertIndex"] = None,
         metrics_db: Optional["HarnessDB"] = None,
+        automation_interval: float = 0.0,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -336,6 +344,15 @@ class SidecarServer:
         # 投影——会话元数据镜像 + 用量/工具账；真相在 JSONL，这里只管
         # 查询面（SUM/GROUP BY 不用重放转录）。
         self._metrics_db = metrics_db
+        # s22 自动化调度：有统计库就能调度（状态全在 SQLite）；
+        # interval>0 才起 tick 线程（默认 0 = 只留 RPC，测试手动 tick）。
+        self._scheduler = (AutomationScheduler(metrics_db,
+                                               self._run_automation)
+                           if metrics_db is not None else None)
+        if self._scheduler is not None and automation_interval > 0:
+            threading.Thread(target=self._automation_loop,
+                             args=(automation_interval,),
+                             daemon=True, name="automation-tick").start()
         self._history_seed = history_seed or (lambda: [])
         self.ring_buffer = RingBuffer()
         # s09：持久化注入 + 启动清账。
@@ -447,6 +464,10 @@ class SidecarServer:
         self.rpc_handlers["expert/list"] = self._handle_expert_list
         # s21 统计：SQLite 索引层的查询面（用量/工具排行）。
         self.rpc_handlers["stats/summary"] = self._handle_stats_summary
+        # s22 自动化：create/list/delete（软）；执行由 tick 驱动。
+        self.rpc_handlers["automation/create"] = self._handle_automation_create
+        self.rpc_handlers["automation/list"] = self._handle_automation_list
+        self.rpc_handlers["automation/delete"] = self._handle_automation_delete
         # s07-b 四操作路由（老 session/destroy"一删全没"已退役）
         self.rpc_handlers["session/close"] = self._handle_session_close
         self.rpc_handlers["session/resume"] = self._handle_session_resume
@@ -945,6 +966,92 @@ class SidecarServer:
         if month:
             summary["monthly"] = self._metrics_db.usage_summary(month)
         return summary
+
+    # ── s22 自动化调度 ────────────────────────────────────────
+
+    def _automation_loop(self, interval: float) -> None:
+        """tick 线程：睡 interval 秒 → tick 一次。单次失败只记日志——
+        调度线程崩了等于所有自动任务停摆，必须兜住一切异常。"""
+
+        import time as _time
+        while True:
+            _time.sleep(interval)
+            try:
+                self._scheduler.tick()
+            except Exception as exc:
+                self._log(f"automation tick failed: {exc}")
+
+    def _run_automation(self, spec: dict) -> str:
+        """隔离会话执行：新建会话跑 prompt，跑完关闭——不复用任何
+        用户会话，转录即证据（哪次自动任务干了什么，事后可查）。"""
+
+        sid = self._manager.create_session(
+            cwd=self._default_session_cwd, mode="craft",
+            title=f"自动任务:{spec['name']}")
+        runtime = self._manager.get_session(sid)
+        runtime.record.messages = self._history_seed()
+        self._manager.store.save(runtime.record)
+        self._metrics_upsert_session(sid)
+        try:
+            return runtime.run_turn(spec["prompt"])
+        finally:
+            self._manager.close_session(sid)
+
+    def _handle_automation_create(self, params: dict) -> dict:
+        """注册自动化：once 给 scheduled_at，recurring 给合法 RRULE。"""
+
+        if self._scheduler is None:
+            return {"error": "这个装配没有启用自动化调度（无统计库）"}
+        name = str(params.get("name") or "").strip()
+        prompt = str(params.get("prompt") or "").strip()
+        schedule_type = str(params.get("schedule_type") or "").strip()
+        if not name or not prompt:
+            return {"error": "name 与 prompt 都不能为空"}
+        if schedule_type not in ("once", "recurring"):
+            return {"error": "schedule_type 只支持 once / recurring"}
+        rrule = str(params.get("rrule") or "").strip() or None
+        scheduled_at = str(params.get("scheduled_at") or "").strip() or None
+        from datetime import datetime, timezone
+        if schedule_type == "recurring":
+            try:
+                parse_rrule(rrule or "")
+                upcoming = next_run(
+                    rrule, datetime.now(timezone.utc))
+            except AutomationError as error:
+                return {"error": f"rrule 不合法：{error}"}
+            upcoming_iso = upcoming.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            if not scheduled_at:
+                return {"error": "once 类型必须给 scheduled_at（ISO 时间）"}
+            upcoming_iso = scheduled_at
+        auto_id = new_automation_id()
+        self._metrics_db.create_automation({
+            "id": auto_id, "name": name, "prompt": prompt,
+            "schedule_type": schedule_type, "rrule": rrule,
+            "scheduled_at": scheduled_at, "status": "ACTIVE",
+        })
+        self._metrics_db.upsert_runtime_state(
+            auto_id, None, upcoming_iso, None)
+        self._log(f"automation created: {auto_id} ({schedule_type})")
+        return {"automationId": auto_id, "nextRun": upcoming_iso}
+
+    def _handle_automation_list(self, params: dict) -> dict:
+        if self._scheduler is None:
+            return {"automations": []}
+        return {"automations": self._metrics_db.list_automations(
+            include_deleted=bool(params.get("includeDeleted")))}
+
+    def _handle_automation_delete(self, params: dict) -> dict:
+        """软删除（NEVER DELETE FROM）——行保留，可恢复。"""
+
+        if self._scheduler is None:
+            return {"error": "这个装配没有启用自动化调度（无统计库）"}
+        auto_id = str(params.get("automationId") or "").strip()
+        if not auto_id:
+            return {"error": "automationId 不能为空"}
+        self._metrics_db.set_automation_status(auto_id, "deleted")
+        self._log(f"automation soft-deleted: {auto_id}")
+        return {"status": "ok"}
 
     def _handle_session_list(self, params: dict) -> dict:
         """会话清单：Record.summary() + live 标志（s07 的 UI 安全视图）。

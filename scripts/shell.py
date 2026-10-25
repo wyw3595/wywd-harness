@@ -115,6 +115,18 @@ def _workspace_runtime(params: dict) -> tuple:
             build_policy_for(workspace, mcp_manager=mcp_manager), info)
 
 
+def _automation_interval() -> float:
+    """自动化 tick 间隔（秒）。`WYWD_AUTOMATION_TICK` 没设 / 非正数 = 不
+    启 tick 线程（RPC 仍可用，测试手动 tick）。"""
+
+    raw = (os.environ.get("WYWD_AUTOMATION_TICK") or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.0
+    return value if value > 0 else 0.0
+
+
 def _idle_reap_seconds() -> float:
     """空闲回收阈值（秒）。`WYWD_IDLE_REAP_SECONDS` 没设 / 非正数 = 不回收。
 
@@ -193,6 +205,9 @@ def _sidecar_process(sock: socket.socket) -> None:
         model=build_model_router(),
         registry=build_registry_for(default_workspace, mcp_manager=mcp_manager),
         policy=build_policy_for(default_workspace, mcp_manager=mcp_manager),
+        # s22：自动化 tick 线程（WYWD_AUTOMATION_TICK 秒；默认 0 = 不起
+        # 线程，RPC 常在，测试手动 tick）。
+        automation_interval=_automation_interval(),
         # s10：工具目录 + 工作区记忆（空记忆时与旧行为一致）。
         # s11：用户记忆（跨项目）。s16：技能**目录**（正文按需展开）。
         # s17：MCP 连接器目录（无连接器时整段 inactive，零开销）。
