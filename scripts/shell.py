@@ -48,6 +48,7 @@ if _PROJECT_ROOT not in _env_paths:
 from scripts.electron_shell import choose_model
 from scripts.toolbox import (
     build_history_seed,
+    build_mcp_manager,
     build_model_router,
     build_policy_for,
     build_registry_for,
@@ -105,7 +106,11 @@ def _workspace_runtime(params: dict) -> tuple:
         "root": str(workspace.root),
         "source": raw,
     }
-    return build_registry_for(workspace), build_policy_for(workspace), info
+    # s17：MCP 连接器跟着工作区走——每个工作区自己的 mcp.json、
+    # 自己的信任文件。没有配置 = manager None，registry/policy 零变化。
+    mcp_manager = build_mcp_manager(workspace.root)
+    return (build_registry_for(workspace, mcp_manager=mcp_manager),
+            build_policy_for(workspace, mcp_manager=mcp_manager), info)
 
 
 def _idle_reap_seconds() -> float:
@@ -176,16 +181,21 @@ def _sidecar_process(sock: socket.socket) -> None:
     # 必须是同一份视图，否则"列出来的"和"能加载的"可能对不上。
     # 代价：运行中新增/修改技能不会被察觉（要重启服务，或手动 reload()）。
     skills = build_skill_index()
+    # s17：默认工作区的 MCP 连接器（.sandbox 没有 mcp.json = None，
+    # 与改造前完全一致）。
+    mcp_manager = build_mcp_manager(default_workspace.root)
     server = SidecarServer(
         model=build_model_router(),
-        registry=build_registry_for(default_workspace),
-        policy=build_policy_for(default_workspace),
+        registry=build_registry_for(default_workspace, mcp_manager=mcp_manager),
+        policy=build_policy_for(default_workspace, mcp_manager=mcp_manager),
         # s10：工具目录 + 工作区记忆（空记忆时与旧行为一致）。
         # s11：用户记忆（跨项目）。s16：技能**目录**（正文按需展开）。
+        # s17：MCP 连接器目录（无连接器时整段 inactive，零开销）。
         history_seed=lambda: build_history_seed(
             max_steps=max_steps,
             user_memory=build_user_memory(),
-            skill_index=skills),
+            skill_index=skills,
+            mcp_manager=mcp_manager),
         store=JsonlSessionStore(root=Path(_PROJECT_ROOT) / ".sessions"),
         runtime_builder=_workspace_runtime,   # s11：上传目录 / 换沙箱
         initial_workspace={"kind": "default", "root": str(default_workspace.root)},

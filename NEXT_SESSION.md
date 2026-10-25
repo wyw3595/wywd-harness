@@ -2690,3 +2690,71 @@ README 已跟上。s12 + s15 的改动都在工作区**未提交**（等用户�
 结论：s12/s15 在真实浏览器全链路可用；smoke 的 2 个存量红项已归因
 登记。环境坑再记一条：Git Bash 后台跑 web_app，stdout 缓冲导致日志
 文件看着是空的——判活用 curl，别看日志（老坑重现）。
+
+# 2026-10-25（再续）：s17 MCP 连接器——两道门 × 真轨道
+
+用户指示"提交代码做下一步"后按教材顺位做 s17（s12/s15/s16 已毕，
+s17 是下一章）。先提交 fb10626（s15+s12，745 绿）。
+
+## 一、新文件与接线
+
+- `src/harness/mcp.py`（内核，纯标准库）：
+  - `MCPServer` 协议（tools_list / tools_call——协议与实现分离，同
+    Model 协议一个道理）+ `InProcessMCPServer`（进程内实现，测试与
+    教学；stdio 子进程是生产形态，sidecar 已示范 spawn + newline
+    JSON-RPC 模式，本课不实现、配置里声明 stdio 会大声报错）；
+  - 第一道门 `TrustStore`（用户手动信任，JSON 持久化，损坏文件
+    fail-closed 一个都不信）；
+  - 第二道门 `MCPPermissionGrant`（名单必须命名空间化全名 + 网络位
+    与门；`grant_from_config` 从 mcp.json 各连接器 grant 段合并）；
+  - `MCPConnector` 生命周期（disconnected → trusted → connected，
+    tools_list 失败回 disconnected 带人话原因）+ `ConnectorManager`
+    （可见性 = connected ∩ grant；dispatch 执行期复查 grant）。
+- `toolbox`：`build_mcp_manager`（{root}/.workbuddy/mcp.json，无配置
+  = None 零变化）、`build_mcp_tools`（可见即注册成**真延迟工具**——
+  骑 s03 的 ToolSearch/DeferExecute 轨道，不另造模拟）、
+  `build_policy_for` 前置 `mcp.requires_approval` ASK 规则（外呼要
+  人点头，同 bash 治理哲学）、seed 增 connector_status 低价值段
+  （教材片段表 #8，无连接器整段 inactive）。
+- `shell` 两处装配点（默认工作区 + _workspace_runtime）：连接器跟
+  工作区走，各自 mcp.json / 信任文件。
+- `permissions.PermissionPolicy` 增只读 `rules` 属性（装配层前置
+  规则的合法入口，决策仍只认内部有序列表）。
+
+## 二、与教材的差异（刻意的，写在 mcp.py 模块头）
+
+1. 不造 ToolSearch/DeferExecute 模拟——本项目 s03 起就有真的，MCP
+   工具直接骑（机制只保留一套）；
+2. grant 来源：教材是激活 Skill 的授权；本项目 Skill manifest 只能
+   收窄（s16），适配为 mcp.json 的项目级已审核声明——语义不变：
+   grant 只能收窄（连接器 advertise 3 个、grant 放行 2 个，secret
+   不可见）；
+3. 执行期双检：权限层 ASK 一检 + handler 撤权复查二检（TOCTOU 防线，
+   测试钉死：schema 已加载、撤权后照样拒）。
+
+## 三、本次踩的坑
+
+- **dispatch 归属解析**：第一版遍历各连接器工具清单找归属——未连接
+  的连接器清单是空的，"已授权、只是没连"被误报"未知工具"。测试抓住
+  后改为从名字解析归属（mcp__<连接器>__<工具>），文案能指引下一步
+  （没连就去连）。教训：错误文案也是接口。
+- fail-closed 的次序红利：grant 检查在最前，未知名字撞"名单外"门，
+  不泄露"这名字存在与否"——测试先按旧预期写错（期待"未知工具"），
+  对照语义后修的是测试不是代码：先查权再查存在，本身就是对的。
+
+## 四、验收
+
+新 `tests/test_mcp.py` 24 条：grant 契约（裸名/字符串/非布尔构造期
+炸）、信任持久化与损坏 fail-closed、生命周期与命名空间化（两个连接
+器同名工具不撞）、可见性交集、dispatch 各拒绝路径文案、真轨道端到端
+（ToolSearch 精确加载 → defer_execute → 服务端被调）、直呼名字被
+"先 ToolSearch"拦、撤权后拒、策略 ASK/DENY/内置工具不受影响、seed
+连接器段有/无两态。全量 **769 条 OK（含 2 skip）**，README 已跟上。
+改动未提交（等用户发话）。
+
+## 五、下一步候选（由用户定）
+
+- s18 专家系统（current_turn 权限层的生产者、整包领域知识）；
+- s19 可视化 / s20 结果呈现（trace.py 部分覆盖 s19）；
+- 真实 stdio MCP 连接器接入（spawn + JSON-RPC，sidecar 模式照搬）；
+- plan-and-execute 第 2 步。

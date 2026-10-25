@@ -34,6 +34,11 @@
   render（词法覆盖率 + 新近度可解释评分，total/覆盖率/新近度并列时按显式
   键破序）；`recall_memory` 工具按主题搜 daily log 全量原始证据，纯读不写回；
   跨用户 scope 防线在引擎；RecallResult 经桥接器进 s15 选择管线吃真分数。
+- **MCP 连接器**：外部工具经标准协议接入——MCPServer 协议（tools_list /
+  tools_call）、两道门（用户信任 TrustStore 持久化 + 项目级 grant 只能
+  收窄，网络位与门）、命名空间化 `mcp__连接器__工具`、可见即注册成
+  **真延迟工具**骑 ToolSearch / DeferExecute 轨道；执行期双检（权限层
+  ASK + handler 撤权复查）防 TOCTOU；无 mcp.json 的默认工作区零开销。
 - **技能系统**：SKILL.md 先列目录、触发词命中再展开全文；manifest 只能收窄权限。
 - **提示词组装**：记忆候选选择管线（scope 门 → 置信度门 → 权限三层 →
   精确去重 → 冲突裁决 → top-k/双预算装箱，每条候选一个稳定原因码）+
@@ -64,6 +69,7 @@ src/harness/        内核（不认识任何 UI 和具体模型）
   artifact.py         工具输出外化
   prompt_assembly.py  记忆候选选择管线 + 提示片段规划器（两层预算）
   recall.py           历史召回链（normalize / score / stable rank / render）
+  mcp.py              MCP 连接器（信任 / grant / 命名空间化 / dispatch）
   session.py          SessionRecord / SessionProcess / SessionManager
   jsonl_store.py      JSONL 证据持久化
   sidecar.py          Sidecar 服务端 + RPC 客户端（读线程 + Future）
@@ -81,7 +87,7 @@ scripts/            壳层与入口
   native_dialog.py    系统目录选择框（降级机制）
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              745 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              769 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始

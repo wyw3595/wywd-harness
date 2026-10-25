@@ -137,6 +137,16 @@ class PermissionPolicy:
     def __init__(self, rules: Sequence[PermissionRule]) -> None:
         self._rules = list(rules)  # 防御性复制:外部改列表不影响策略
 
+    @property
+    def rules(self) -> tuple[PermissionRule, ...]:
+        """规则清单的只读视图。
+
+        装配层按工作区**前置**规则用（s17 的 MCP ASK 规则）：决策仍
+        只认本类内部的有序列表，外部拿到的是副本改不动。
+        """
+
+        return tuple(self._rules)
+
     def decide(self, request: ToolRequest) -> PermissionDecision:
         """按顺序找第一条命中的规则;一条都不中 -> default.deny。"""
 

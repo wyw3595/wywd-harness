@@ -39,10 +39,18 @@ from src.harness.file_tools import (
     read_file,
     write_file,
 )
+from src.harness.mcp import (
+    ConnectorManager,
+    MCPServer,
+    TrustStore,
+    grant_from_config,
+)
 from src.harness.model_router import ModelRouter, ModelTier
 from src.harness.models import FakeModel
 from src.harness.permissions import (
+    PermissionAction,
     PermissionPolicy,
+    PermissionRule,
     WorkspaceScope,
     build_default_policy,
 )
@@ -712,6 +720,7 @@ def plan_history_seed(root=None, max_steps: int | None = None,
                       skill_index: "SkillIndex | None" = None,
                       budget_chars: int | None = DEFAULT_SEED_BUDGET_CHARS,
                       memory_policy: MemorySelectionPolicy | None = None,
+                      mcp_manager: "ConnectorManager | None" = None,
                       ) -> tuple[PromptPlan, dict[str, str]]:
     """s15：起步历史的可选片段交给规划器——顺序与预算由这一层统一决定。
 
@@ -777,13 +786,24 @@ def plan_history_seed(root=None, max_steps: int | None = None,
                 name="skills_directory", builder=lambda: directory,
                 priority=30, budget_priority=50, provenance="skills"))
 
+    # MCP 连接器目录（s17，教材片段表 #8）：低价值可选段——没有已
+    # 连接且已授权的工具时整段 inactive，不浪费一个 token。
+    if mcp_manager is not None and mcp_manager.visible_tools():
+        connector_context = mcp_manager.build_context()
+        contents["connector_status"] = connector_context
+        segments.append(PromptSegment(
+            name="connector_status", builder=lambda: connector_context,
+            priority=40, budget_priority=40, provenance="mcp"))
+
     plan = plan_prompt(segments, budget_chars=budget_chars)
     return plan, contents
 
 
 def build_history_seed(root=None, max_steps: int | None = None,
                        user_memory: "UserMemory | None" = None,
-                       skill_index: "SkillIndex | None" = None) -> list[dict]:
+                       skill_index: "SkillIndex | None" = None,
+                       mcp_manager: "ConnectorManager | None" = None,
+                       ) -> list[dict]:
     """sidecar 会话的起步历史：工具目录 system + 规划器收录的可选片段。
 
     每会话开局读一次（不是每 turn）：记忆在会话中途变化不会被察觉，
@@ -800,7 +820,8 @@ def build_history_seed(root=None, max_steps: int | None = None,
     seed = with_system([], max_steps)
     plan, contents = plan_history_seed(
         root=root, max_steps=max_steps,
-        user_memory=user_memory, skill_index=skill_index)
+        user_memory=user_memory, skill_index=skill_index,
+        mcp_manager=mcp_manager)
 
     # included_names 按 (priority, name) 排序——展示顺序由规划器说了算。
     for name in plan.included_names:
@@ -864,7 +885,85 @@ READ_TOOLS: frozenset[str] = frozenset({"fs_read", "fs_list"})
 WRITE_TOOLS: frozenset[str] = frozenset({"fs_write", "fs_edit"})
 
 
-def build_policy_for(workspace: Workspace) -> PermissionPolicy:
+def build_mcp_manager(root: Path,
+                      *,
+                      servers: "Mapping[str, MCPServer] | None" = None,
+                      trust_path: Path | None = None,
+                      ) -> "ConnectorManager | None":
+    """读 {root}/.workbuddy/mcp.json 建 MCP 连接器管理器（s17）。
+
+    没有 mcp.json → None：MCP 是"配置了才有"的能力，默认工作区零
+    变化（注册表/策略/seed 都不需要知道自己"支持 MCP"）。有配置但
+    声明 stdio → 大声报错：装作连上了比不支持更糟（教学边界，见
+    mcp.py 模块头）。grant 从配置合并——项目级已审核声明。
+    """
+
+    config_path = Path(root) / ".workbuddy" / "mcp.json"
+    if not config_path.exists():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    for name, entry in (config.get("mcpServers") or {}).items():
+        if (entry or {}).get("type", "inprocess") == "stdio":
+            raise ValueError(
+                f"连接器 {name!r} 声明了 stdio 传输——本课只支持 "
+                "inprocess（进程内）实现；stdio 子进程留待真实连接器生态接入")
+    return ConnectorManager(
+        config,
+        servers=servers,
+        trust_store=TrustStore(
+            trust_path or Path(root) / ".workbuddy" / "connector_trust.json"),
+        permission_grant=grant_from_config(config),
+    )
+
+
+def _mcp_handler(manager: ConnectorManager, registry: ToolRegistry,
+                 tool_name: str):
+    """MCP 工具的执行 handler：三道执行期闸（s17 fail-closed）。
+
+    1. grant 复查——权限层决策之后、外呼之前再查一次，"先加载、后
+       撤权、仍可执行"的 TOCTOU 缺口不在这边；
+    2. schema 已在本会话加载——模型直呼名字（绕过 ToolSearch 的
+       幻觉路径）也会被"先 ToolSearch"拦下，与 defer_execute 同一条
+       纪律（对 MCP 这条比内置延迟工具更要紧：它外呼外部服务）；
+    3. 参数校验由 defer_execute 的统一校验负责（本函数之上）。
+    """
+
+    def handler(**params):
+        if not manager.permission_grant.allows(tool_name):
+            return (f"Error [permission_denied]: {tool_name} "
+                    "的授权已被撤销——本会话不再放行")
+        if tool_name not in registry.get_loaded_names():
+            return (f"Error: 工具 {tool_name!r} 的 schema 尚未加载，"
+                    "请先调用 ToolSearch")
+        return manager.dispatch(tool_name, params)
+
+    return handler
+
+
+def build_mcp_tools(manager: ConnectorManager,
+                    registry: ToolRegistry) -> list[Tool]:
+    """把可见 MCP 工具注册成**真延迟工具**——骑 s03 的轨道，不另造。
+
+    schema 由连接器声明（inputSchema 手写覆盖，不走反射——handler 是
+    **params 闭包，反射不出服务端的参数形状）。可见集合是构造时刻的
+    快照：grant 之后收窄，靠 handler 的执行期复查兜住。
+    """
+
+    return [
+        Tool(
+            name=entry["name"],
+            description=entry["description"],
+            handler=_mcp_handler(manager, registry, entry["name"]),
+            input_schema=entry["input_schema"],
+            defer=True,
+        )
+        for entry in manager.visible_tools()
+    ]
+
+
+def build_policy_for(workspace: Workspace,
+                     mcp_manager: "ConnectorManager | None" = None,
+                     ) -> PermissionPolicy:
     """按工作区装配权限策略：决策层跟着会话的沙箱根走。
 
     scope 用的是 workspace.root——决策层（执行前预判）和执行层
@@ -874,12 +973,40 @@ def build_policy_for(workspace: Workspace) -> PermissionPolicy:
     密钥同样读不走）。
     """
 
-    return build_default_policy(
+    policy = build_default_policy(
         scope=WorkspaceScope(workspace.root, forbidden_parts=FORBIDDEN_PARTS),
         safe_tools=sorted(SAFE_TOOLS),
         read_tools=sorted(READ_TOOLS),
         write_tools=sorted(WRITE_TOOLS),
     )
+    if mcp_manager is None:
+        return policy
+    return _with_mcp_rule(policy, mcp_manager)
+
+
+def _with_mcp_rule(policy: PermissionPolicy,
+                   manager: ConnectorManager) -> PermissionPolicy:
+    """在既有策略**前面**插一条 MCP ASK 规则（s17）。
+
+    MCP 工具外呼外部服务：grant 审核的是"这个工具可以被谁看见"，
+    不是"每次外呼都不用问"——与 bash 同一条治理哲学（外呼要人点头，
+    一次一问）。没进 grant 的 mcp__ 工具不需要规则：default.deny
+    已经兜住。快照语义：名单取构造时刻的可见集合；之后的撤权由
+    handler 的执行期复查兜住（决策层与执行层各查一次，双保险）。
+    """
+
+    names = frozenset(manager.visible_names())
+    if not names:
+        return policy
+    mcp_ask = PermissionRule(
+        rule_id="mcp.requires_approval",
+        action=PermissionAction.ASK,
+        matches=lambda request: request.name in names,
+        explain=lambda request: (
+            f"MCP 工具 {request.name} 外呼外部服务"
+            "（grant 已审核其可见性，外呼本身仍需一次人工确认）"),
+    )
+    return PermissionPolicy([mcp_ask, *policy.rules])
 
 
 def build_policy() -> PermissionPolicy:
@@ -1042,12 +1169,16 @@ DEFER_EXECUTE_SCHEMA: dict = {
 }
 
 
-def build_registry_for(workspace: Workspace) -> ToolRegistry:
-    """按工作区现做一整套注册表：即时 + 延迟 + 桥接，全绑定该 root。
+def build_registry_for(workspace: Workspace,
+                       mcp_manager: "ConnectorManager | None" = None,
+                       ) -> ToolRegistry:
+    """按工作区现做一整套注册表：即时 + 延迟 + 桥接 + MCP，全绑定该 root。
 
     会话隔离的成立条件都收在这一个函数里：工具闭包吃沙箱根（两个
     build_*_tools 工厂）、桥接闭包捕获**本** registry 和**本**工作区
     的延迟工具名单——A 会话的注册表解析不到 B 会话的任何路径。
+    MCP 工具（s17）在 registry 建好后才构建注册：handler 闭包要
+    捕获这个 registry 做"schema 已加载"复查。
     """
 
     # 工厂参数的 root_ 命名规矩见模块 docstring——内层 fs_find /
@@ -1059,6 +1190,14 @@ def build_registry_for(workspace: Workspace) -> ToolRegistry:
     for tool in instant + deferred:
         registry.register(tool)
 
+    # MCP 工具（s17）：可见（connected ∩ grant）即注册成真延迟工具。
+    # 不传 manager（默认工作区没有 mcp.json）= 空列表，行为零变化。
+    mcp_tools: list[Tool] = []
+    if mcp_manager is not None:
+        mcp_tools = build_mcp_tools(mcp_manager, registry)
+        for tool in mcp_tools:
+            registry.register(tool)
+
     # 桥接工具：handler 闭包绑 registry——注册表即边界，循环无需特判。
     # 陷阱：lambda 参数名必须与 input_schema 的键逐字一致（queries/top_k、
     # toolName/params）。校验读的是 schema，execute 做 **kwargs 展开——
@@ -1069,7 +1208,9 @@ def build_registry_for(workspace: Workspace) -> ToolRegistry:
     # 延迟工具名单从**本工作区**的构建产物里取（而不是模块级
     # DEFERRED_TOOLS）：查询词的精确名判断必须与该会话实际注册的
     # 延迟工具一致，否则 A 会话会"命中"B 会话才有的工具名。
-    deferred_names = {tool.name for tool in deferred}
+    # MCP 工具名也在这——模型拿全名 ToolSearch 时走精确加载。
+    deferred_names = ({tool.name for tool in deferred}
+                      | {tool.name for tool in mcp_tools})
 
     def search_tools(
             queries: list[str] | None = None, top_k: int | None = None
