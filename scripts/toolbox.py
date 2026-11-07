@@ -1380,11 +1380,16 @@ def build_registry() -> ToolRegistry:
     return build_registry_for(DEFAULT_WORKSPACE)
 
 
-def build_model() -> RealModel:
+def build_model(registry: "ToolRegistry | None" = None) -> RealModel:
     """带工具说明书的真实模型。
 
     由 registry 的 model_schemas() 出目录——即时工具全量，延迟工具
     用目录摘要代替。schema 生成只发生在 tool_to_schema 一处（单一真源）。
+
+    传 registry = 用调用方收窄过的那份（reviewer 只读审查用）；不传 =
+    旧行为（项目根的全量注册表）。**必须传**，否则只读专家只是"执行层
+    摘了工具"，模型上下文里还看得到 bash——2026-11-07 reviewer 真机
+    踩到：bash 出现在工具列表里并真的被调用。
 
     `system_prompt=""`：**不要**那条极简兜底。历史第一条 system 已经是
     build_system_prompt() 的完整提示，两条叠在一起模型会两头看——实测它更听
@@ -1392,7 +1397,8 @@ def build_model() -> RealModel:
     "一步步来"，退化成一次一个工具。
     """
 
-    return RealModel(tools=build_registry().model_schemas(), system_prompt="")
+    schemas = (registry or build_registry()).model_schemas()
+    return RealModel(tools=schemas, system_prompt="")
 
 
 def build_model_router() -> ModelRouter:
