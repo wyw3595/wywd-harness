@@ -210,6 +210,36 @@ class JsonlSessionStoreTests(unittest.TestCase):
         self.assertFalse((Path(self.root) / "sess_0001.jsonl").exists())
         self.assertEqual([r.id for r in self.store.list()], ["sess_0002"])
 
+    def test_list_ignores_other_evidence_files(self) -> None:
+        """同目录的 audit.jsonl 不是会话——别把它当 transcript fold。
+
+        2026-10-26 真机重启抓到：s23 的审计链落在 .sessions/audit.jsonl，
+        旧的 glob("*.jsonl") 把它读成会话，缺 sequence 直接抛
+        TranscriptCorruptionError，服务起不来。会话命名空间是 sess_*。
+        """
+
+        self.store.create(_record("sess_0001"))
+        audit = Path(self.root) / "audit.jsonl"
+        audit.write_text(
+            json.dumps({"seq": 1, "hash": "x", "prev_hash": "0" * 64}) + "\n",
+            encoding="utf-8")
+        self.assertEqual([r.id for r in self.store.list()], ["sess_0001"])
+
+    def test_non_session_namespace_rejected(self) -> None:
+        """list() 只收 sess_*；create/load 也必须同口径。
+
+        2026-11-07 审查发现：旧实现只挡路径分隔符，`create(id="custom")`
+        能落 custom.jsonl，而 list() 只 glob sess_*——自己建的对象自己
+        看不见。id 在 _transcript 里焊死，读写删三个方向一致。
+        """
+
+        with self.assertRaises(SessionLifecycleError):
+            self.store.create(_record("custom"))
+        for bad in ("custom", "sess_abc", "sess_", "session-1"):
+            with self.assertRaises(SessionLifecycleError):
+                self.store.load(bad)
+        self.assertEqual(self.store.list(), [])
+
     def test_unsafe_session_id_rejected(self) -> None:
         """sid 进文件名 = 路径穿越面；store 是协议端口，必须自查。"""
 

@@ -207,13 +207,24 @@ class JsonlSessionStore(SessionStore):
         self._lock = threading.RLock()   # 串行化同一进程内的读写
 
     def _transcript(self, session_id: str) -> SessionTranscript:
-        """sid → 证据文件。sid 进文件名前必须过信任边界检查：
-        好人：Manager 生成的 sess_0001 式 id；坏人：../../etc/passwd 式
-        路径穿越（store 是协议端口，不能假设调用方都是 Manager）。
+        """sid → 证据文件。sid 进文件名前必须过两道信任边界：
+
+        1. **不许路径穿越**：Manager 生成的 sess_0001 是好人，
+           ../../etc/passwd 是坏人（store 是协议端口，不能假设调用方
+           都是 Manager）。
+        2. **必须是本 store 的命名空间**（2026-11-07）：list() 只收
+           sess_*.jsonl，若 create/load 还允许自定义名字，就会出现
+           "自己建的对象自己看不见"——审查实测：custom.jsonl 落盘、
+           list() 返回空。id 在这里一次性焊死，读、写、删三个方向
+           口径一致，list() 的过滤才是契约而不是补丁。
         """
         if "/" in session_id or "\\" in session_id \
                 or session_id in {".", ".."}:
             raise SessionLifecycleError(f"unsafe session id: {session_id!r}")
+        suffix = session_id[len("sess_"):] if session_id.startswith("sess_") else ""
+        if not (suffix.isascii() and suffix.isdigit()):
+            raise SessionLifecycleError(
+                f"session id 必须是 sess_<数字>：{session_id!r}")
         return SessionTranscript(self.root / f"{session_id}.jsonl", session_id)
 
     # ── 写路径：create / save ─────────────────────────────────
@@ -297,15 +308,23 @@ class JsonlSessionStore(SessionStore):
                 messages=self._persisted_messages(t))
 
     def list(self) -> list[SessionRecord]:
-        """扫目录列全部会话：glob *.jsonl，逐个 fold。
+        """扫目录列全部会话：glob sess_*.jsonl，逐个 fold。
 
         stem 是文件名去掉后缀（"sess_0001.jsonl" → "sess_0001"）——
         文件名即身份，倒着查回来。sorted 只为断言稳定（Windows 目录
         顺序不保证）。
+
+        **只收会话自己的命名空间**（2026-10-26 修）：.sessions/ 是证据
+        目录，同级还住着 audit.jsonl（s23 审计链）与 harness.db。旧版
+        glob("*.jsonl") 把审计链当会话 fold，重启时因缺 sequence 直接
+        抛 TranscriptCorruptionError——服务起不来（真机重启抓到，不是
+        理论风险）。会话 id 恒为 sess_<编号>（Manager 的编号盘点也按
+        这个前缀读），文件名即身份——按前缀过滤不是给某个文件开特例，
+        而是把"谁是本 store 的对象"写清楚。
         """
         with self._lock:
             records = []
-            for path in sorted(self.root.glob("*.jsonl")):
+            for path in sorted(self.root.glob("sess_*.jsonl")):
                 records.append(self.load(path.stem))   # stem = 去 .jsonl 的 id
             return records
 
