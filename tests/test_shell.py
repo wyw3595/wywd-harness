@@ -346,6 +346,26 @@ class SidecarShellTests(unittest.TestCase):
             shell.new_session()
         self.assertIn("磁盘满了", str(ctx.exception))
 
+    def test_new_session_forwards_expert_id(self) -> None:
+        """s18 专家激活：new_session("reviewer") 要把 expertId 透传给
+        session/create（reviewer CLI 靠这条通道激活只读人格）。
+
+        默认（空串）不带 expertId——老行为一个字段都不多。
+        """
+
+        shell, client, _ = self._make()
+        shell.start()
+
+        shell.new_session("reviewer")
+        method, params = client.calls[-1]
+        self.assertEqual(method, "session/create")
+        self.assertEqual(params.get("expertId"), "reviewer")
+
+        shell.new_session()
+        method, params = client.calls[-1]
+        self.assertEqual(method, "session/create")
+        self.assertNotIn("expertId", params)
+
     def test_send_allows_concurrent_calls(self) -> None:
         """双线程 send 各自拿到自己的结果（2026-09-26 新语义）。
 

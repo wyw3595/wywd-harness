@@ -614,8 +614,11 @@ class SidecarShell:
         return self._result(self._client.call("session/forget",
               {"sessionId": target}))
 
-    def _create_session_remote(self) -> str:
+    def _create_session_remote(self, expert_id: str = "") -> str:
         """让 sidecar 建个会话并取回 id。
+
+        expert_id 可选（s18）：非空时随 session/create 透传，sidecar 会把
+        专家人格写成一条 system 消息进转录。空串 = 不带专家（老行为）。
 
         失败抛 RuntimeError（带上 sidecar 的人话）而不是让 KeyError 穿透：
         `["result"]["sessionId"]` 在 error 响应上会炸穿 HTTP handler，
@@ -624,6 +627,8 @@ class SidecarShell:
         """
 
         params: dict = {"mode": "craft"}
+        if expert_id:
+            params["expertId"] = expert_id
         if self._cwd:
             params["cwd"] = self._cwd
         data = self._result(self._client.call("session/create", params))
@@ -645,8 +650,11 @@ class SidecarShell:
         self._sid = sid
         return sid
 
-    def new_session(self) -> str:
+    def new_session(self, expert_id: str = "") -> str:
         """另开一个新会话并切换为当前——旧的只 close（记录保留），不 forget。
+
+        expert_id（s18 可选）非空时让 sidecar 在建会话时激活专家；空串
+        维持老行为（无专家）。专家包只能收窄工具，不会多给能力。
 
         与 clear()（close→forget→create 全清）的区别：新建是"开个新的，
         旧的留档"；旧记录还要不要，留给用户用 /forget 决定。
@@ -655,7 +663,7 @@ class SidecarShell:
 
         if self._sid:
             self._client.call("session/close", {"sessionId": self._sid})
-        sid = self._create_session_remote()
+        sid = self._create_session_remote(expert_id)
         self._sid = sid
         return sid
 

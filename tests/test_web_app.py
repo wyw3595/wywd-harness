@@ -53,8 +53,8 @@ class FakeShell:
     def sessions(self) -> dict:
         return {"sessions": copy.deepcopy(self._rows)}
 
-    def new_session(self) -> str:
-        self.ops.append(("new_session", ""))
+    def new_session(self, expert_id: str = "") -> str:
+        self.ops.append(("new_session", expert_id))
         return "sess_0099"
 
     def close_session(self, sid: str = "") -> dict:
@@ -144,6 +144,17 @@ class WebAppActionsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["sessionId"], "sess_0099")
         self.assertEqual(self.shell.ops, [("new_session", "")])
+
+    def test_create_forwards_expert_id(self) -> None:
+        """s18 专家激活：create 带 expertId 时要透传到壳。
+
+        UI 还没有专家选择器（reviewer CLI 先走 API），但通道必须先打通；
+        假壳在这里充当"传参有没有丢"的见证者。
+        """
+
+        result = self.app.action("create", "", "reviewer")
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.shell.ops, [("new_session", "reviewer")])
 
     def test_close_resume_forget(self) -> None:
         close = self.app.action("close", "sess_0001")
@@ -235,7 +246,7 @@ class WebAppActionsTests(unittest.TestCase):
 
         shell = FakeShell([])
 
-        def boom() -> str:
+        def boom(expert_id: str = "") -> str:
             raise RuntimeError("sidecar 没给出新会话 id")
         shell.new_session = boom
         result = WebApp(shell=shell).action("create")

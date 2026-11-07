@@ -424,14 +424,19 @@ class WebApp:
 
         return self.shell.sessions()
 
-    def action(self, action: str, sid: str = "") -> dict:
+    def action(self, action: str, sid: str = "",
+               expert_id: str = "") -> dict:
         """清单外的四个动作：create / close / resume / forget（翻译约定
-        与既有终端/侧边栏一致：成功 {"ok": True, "detail": ...}）。"""
+        与既有终端/侧边栏一致：成功 {"ok": True, "detail": ...}）。
+
+        expert_id 只有 create 用（s18）：UI 还没有专家选择器，先让 API/
+        CLI 能把 reviewer 这类只读专家激活；空串 = 老行为。
+        """
 
         shell = self.shell
         if action == "create":
             try:
-                new_sid = shell.new_session()   # 关旧开新，旧记录保留
+                new_sid = shell.new_session(expert_id)   # 关旧开新，旧记录保留
             except Exception as exc:
                 # 建会话是硬失败（没有新 id 可用），但也不能让 handler 崩掉——
                 # 翻译成人话，前端摆一张"没能开始"的卡（＋ 按钮点了没反应最糟）
@@ -1035,7 +1040,8 @@ def create_app(web: Optional[WebApp] = None) -> FastAPI:
     def post_sessions(payload: dict = Depends(_json_body),
                       web: WebApp = Depends(get_web)) -> JSONResponse:
         return JSONResponse(web.action(payload.get("action", ""),
-                                       payload.get("sid", "")))
+                                       payload.get("sid", ""),
+                                       payload.get("expertId", "")))
 
     @app.post("/api/sessions/{sid}/messages")
     def post_message(sid: str, payload: dict = Depends(_json_body),
