@@ -122,7 +122,7 @@ scripts/            壳层与入口
   native_dialog.py    系统目录选择框（降级机制）
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              859 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              867 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始

@@ -3183,3 +3183,30 @@ README 计数跟上。对真实 `.sessions/` 只读验过：list 回来 5 个会
 - 未做：`scripts/review.py` CLI、评测集——都要先起服务 + 真 diff 才能验，
   留给下一轮（reviewer 会话要先在 UI 把工作区切到仓库根，专家/技能才可见）。
 
+# 2026-11-07（续）：reviewer CLI 首版 + 它抓到的第一个真 bug
+
+`scripts/review.py`：git diff → reviewer 专家包 → 只读审查 → 结论。
+
+- **只读不是靠提示词**：专家包的 `tools_config` 在 CLI 里真的落到注册表
+  （`select_tools` 摘掉 bash/fs_write/fs_edit/memory_write），审批一律拒绝；
+  输出只写 `--out` 指定的文件。
+- **修 build_model 的盲区**：`build_model()` 原来无参、固定用项目根全量
+  注册表——所以第一次跑时模型上下文里还有 bash（真机上真的调了）。
+  现在 `build_model(registry=...)` 用收窄后的 schema；CLI 传 filtered。
+- **停不下来就强制定稿**：deepseek-chat 对"最多读 3 个文件"执行力很差
+  （65 行 diff 读了 20 轮），所以 max_steps=8，用尽后用已读到的
+  `result.messages` 做一次无工具调用，只逼结论。真机跑通：8 轮 +
+  强制定稿，111K/5K tokens。
+- **首跑抓到真 bug（major）**：`list()` 的 `sess_*.jsonl` glob 与
+  `_transcript()` 的 `sess_<数字>` 校验是两套口径——磁盘上只要有
+  `sess_abc.jsonl`（旧版本允许 create 的名字），list() 就会 load 它 →
+  SessionLifecycleError → **整个会话列表起不来**，和 audit.jsonl 崩溃
+  同一类问题换了个触发源。修：抽 `_is_session_id()` 单一判定，glob 循环
+  里不匹配就跳过；回归测试 `test_list_skips_stems_that_are_not_session_ids`。
+- 另外它复述了两条 P3（相对 PYTHONPATH 按进程 cwd 解析、PYTHONHOME
+  无条件剥）——与人工审查一致，说明提示词+技能能稳定命中共识问题。
+
+测试 +8（7 条 CLI 离线 + 1 条 list 跳过），全量 **867 条 OK（含 2 skip）**。
+`reviewer.json` / code-review 技能都在 `.workbuddy/`（已 ignore），属于本地
+配置，不入库；缺了 CLI 会报人话并退出。改动未提交。
+
