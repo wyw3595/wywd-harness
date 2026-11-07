@@ -3070,3 +3070,116 @@ s22 落 ab21cf4、s23 落 15e5bf2（各自独立中间态全绿）。s24 是收�
 而非 dict、MemorySource 而非裸 dict、usage 字段漏给）。全量 **853 条
 OK**。教材 24 章全部走完：s01-s24 机制全覆盖（s05 桌面壳按本项目
 架构适配为 sidecar IPC 课）。改动未提交。
+
+# 2026-10-25（十续）：present_files 前端打磨
+
+s24 落 e9b6dcb 后，用户点名打磨交付卡片。改动（纯前端三文件）：
+
+- store.js：头行的一句话说明（"交付 N 个文件：xxx"）不再丢——
+  正则取出当卡片行副标题；
+- components.js：卡片从 div 升级为 `<a>`——URL 卡可点（新标签 +
+  noopener noreferrer，文件卡 href=undefined 无链接）；主交付从
+  小 ★ 升级为墨底白字徽标"★ 主交付" + 整卡提格；缺失文件图标
+  换 ⚠；
+- index.html：单色系打磨（主交付墨边+面板底、悬浮边框反馈、
+  过渡动画、名称加粗、间距对齐）。
+
+真实浏览器验证通过（真 DeepSeek：fs_write 写 summary.md →
+present_files 交付 summary.md + 故意的 ghost.md）：主交付徽标/红边
+"未找到"/说明副标题/文件卡无 href 全部核对，截图留证。853 条
+Python 测试不受影响。改动未提交。
+
+# 2026-10-26：present_files 卡片复验 + 重启崩溃修复（s09 会话目录 × s23 审计链）
+
+上一轮前端打磨未提交，用户问"弄好了没"——补一次可复跑的复验，顺手摸到一个真崩。
+
+## 一、前端复验（有清单，不是"我看过了"）
+
+`node --check` 九个前端模块全过。另写 `.sandbox/fe-card-check/verify.cjs`：
+无头 Chromium + stub 服务（托管 `public/` + 真 EventSource 流），把
+**2026-10-25 真 DeepSeek 的 present_files 原文**（从 `sess_0230.jsonl` 的 tool
+消息取出，summary.md + 故意的 ghost.md）作为 tool_end 推给页面，走
+`store.handleEvent` → Vue 的**真代码路径**，27 项断言全过：三卡都是 `<a>`、
+文件卡无 href、URL 卡 `_blank` + noopener noreferrer、主交付墨底徽标
+"★ 主交付" + 整卡提格、缺失文件 ⚠ + 红边 + "未找到"、头行说明变副标题
+（真 payload 的"本次实验产出"提出来了）、`[files]` 原文不漏。截图
+`.fe-card-check-work/cards.png`。
+
+## 二、真 bug：重启起不来（s23 与 s09 撞目录）
+
+按 README 起服务立刻炸：`TranscriptCorruptionError: expected sequence 1, got None`。
+根因：s23 的审计链落在 `.sessions/audit.jsonl`，而 `JsonlSessionStore.list()`
+glob `*.jsonl` 把它当会话 fold——审计条目只有 `seq`、没有 transcript 的
+`sequence`。**只要跑过一次工具（写过审计），下次启动必崩**，与前端无关，
+是"单章全绿 ≠ 集成没退化"的又一例（s24 的端到端用的是 InMemory store，
+`store=None`，从没扫过真实目录）。
+
+修：`list()` 只收会话自己的命名空间 `sess_*.jsonl`（文件名即身份，
+Manager 的编号盘点也按这个前缀读；同目录的 audit.jsonl / harness.db 不归它管），
+回归测试 `test_list_ignores_other_evidence_files`。全量 **854 条 OK（含 2 skip）**，
+README 计数跟上。对真实 `.sessions/` 只读验过：list 回来 5 个会话、跳过审计链。
+
+**没能做完的一步**：本会话命令沙箱的令牌是低完整性，写不了 `.sessions/`
+（sidecar 报 `unable to open database file`），所以没法在会话里把 web_app
+真起起来跑 `scripts/smoke_frontend.cjs`。这一步留给用户终端补；上面 27 项
+是浏览器里真跑的，不受影响。
+
+## 三、状态（提交安排）
+
+分两笔：① 前端三文件（上一轮打磨）+ `.fe-card-check-work/` 忽略规则；
+② `jsonl_store.list()` 修复 + 回归测试 + README 计数 + 本记录。
+
+# 2026-11-06：修 bash 环境泄漏（P0，测试路线的第一步）
+
+真机验收（见 `TEST_REPORT-2026-10-26.md`）里 agent 跑 `python -m unittest`
+直接崩 `SRE module mismatch`，根因不是用户环境：
+
+- `.venv` 是 uv 建的，它的 python 启动时把 `PYTHONHOME` 指到 uv 的 3.12
+  标准库——子进程里换成机器上的 3.13 就 `_sre` 版本不匹配；
+- `scripts/shell.py:46` 为 sidecar 能 import，把项目根注进 `PYTHONPATH`；
+- `std_tools._clean_env()` 只过滤 KEY/TOKEN 之类的名字，两个变量原样进
+  bash 工具。
+
+修（`src/harness/std_tools.py`）：`_clean_env()` 剥掉 `PYTHONHOME`，并把
+`PYTHONPATH` 里等于 harness 根的那条去掉（用户原有路径保留）。顺手在 bash
+的 description 里补一句“stdout/stderr 已合并，跑测试不用加 `2>&1`”——
+`&` 是 shell 元字符，会让只读白名单失效，把本可免审批的测试命令变成要审批
+（真机日志里 7 次审批全是这个原因）。
+
+测试 +2（全量 **856 条 OK（含 2 skip）**）：`test_interpreter_env_vars_do_not_leak`
+/ `test_harness_pythonpath_removed_entirely`。改动未提交。
+
+# 2026-11-07：代码审查（自查）+ 修两条 P2
+
+按 code-review 技能 + 安全/契约两段额外视角，审了未提交的 11 文件 diff
+（约 200 行），得 2 P2 + 3 P3。先修两条 P2：
+
+- **P2-1 交付卡片的 URL 白名单**：把 `[files]` 解析抽成纯函数
+  `public/src/files-cards.js`——校验数组形状、只放行 http(s)、条数封顶 50、
+  主交付只认第一个；`store.js` 改用它，`scripts/smoke_frontend.cjs` 纯函数段
+  加 8 条断言（data: URL 直跑）。背景：tool_end 原文可能来自仓库里任意文件，
+  `<a :href>` 没有 markdown 的 `safeHref` 兜底；浏览器实测 Chrome 下
+  `javascript:` 靠 `target=_blank` 才没执行（同页对照链接会执行）——属于
+  “靠巧合安全”，所以按不可信输入处理。
+- **P2-2 会话 id 契约**：`_transcript()` 只收 `sess_<数字>`，create / load /
+  delete 与 `list()` 的 `sess_*.jsonl` 口径一致（审查实测：`custom.jsonl`
+  能落盘、`list()` 返回空）。回归测试 `test_non_session_namespace_rejected`。
+
+未修（P3，见审查记录）：`PYTHONHOME` 无条件剥（用户自设值会丢）、相对
+`PYTHONPATH` 条目按进程 cwd 解析、env 修复缺子进程级测试、报告引用
+`.fe-card-check-work/`。全量 **857 条 OK（含 2 skip）**；前端冒烟纯函数段
+0b 的 8 条新断言通过；交付卡片浏览器复验全过。改动未提交。
+
+## 附：reviewer MVP 第一步（同日）
+
+- `.workbuddy/experts/reviewer.json`（本地配置；`.workbuddy/` 已 ignore）：
+  只读人设 + 四条准则（信任边界 / 契约对称 / 不确认不报）+ 摘除
+  bash/fs_write/fs_edit/memory_write + 技能束 `code-review`。加载验过：
+  `ExpertIndex(".").load("reviewer")` 能渲染 specialization。
+- 激活通道打通：`SidecarShell._create_session_remote/new_session(expert_id)`
+  → `WebApp.action(..., expert_id)` → `POST /api/sessions {expertId}`。
+  默认空串不带字段，老行为零变化。
+- 测试 +2（test_web_app 假壳、test_shell 假 client）；全量 **859 条 OK**。
+- 未做：`scripts/review.py` CLI、评测集——都要先起服务 + 真 diff 才能验，
+  留给下一轮（reviewer 会话要先在 UI 把工作区切到仓库根，专家/技能才可见）。
+
