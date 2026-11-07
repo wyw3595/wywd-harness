@@ -192,6 +192,25 @@ class SessionTranscript:
 # JsonlSessionStore — SessionStore 协议的 JSONL 落地
 # ═══════════════════════════════════════════════════════════════
 
+_SESSION_ID_PREFIX = "sess_"
+
+
+def _is_session_id(value: str) -> bool:
+    """会话 id 的唯一判定：`sess_<ASCII 数字>`。
+
+    2026-11-07 reviewer 首跑抓到：list() 用 `sess_*` 前缀 glob、_transcript
+    用更严的 isdigit 校验，两个口径不一致——磁盘上只要有一个
+    `sess_abc.jsonl`（旧版本允许 create 的名字），list() 就会把它交给
+    load() → _transcript 抛错 → **整个会话列表起不来**，和刚修掉的
+    audit.jsonl 崩溃是同一类问题换了触发源。判定只此一份，两边都用它。
+    """
+
+    if not value.startswith(_SESSION_ID_PREFIX):
+        return False
+    suffix = value[len(_SESSION_ID_PREFIX):]
+    return bool(suffix) and suffix.isascii() and suffix.isdigit()
+
+
 class JsonlSessionStore(SessionStore):
     """s07 端口的第一个真后端：文件在，会话就在（跨进程重启）。
 
@@ -221,8 +240,7 @@ class JsonlSessionStore(SessionStore):
         if "/" in session_id or "\\" in session_id \
                 or session_id in {".", ".."}:
             raise SessionLifecycleError(f"unsafe session id: {session_id!r}")
-        suffix = session_id[len("sess_"):] if session_id.startswith("sess_") else ""
-        if not (suffix.isascii() and suffix.isdigit()):
+        if not _is_session_id(session_id):
             raise SessionLifecycleError(
                 f"session id 必须是 sess_<数字>：{session_id!r}")
         return SessionTranscript(self.root / f"{session_id}.jsonl", session_id)
@@ -325,6 +343,11 @@ class JsonlSessionStore(SessionStore):
         with self._lock:
             records = []
             for path in sorted(self.root.glob("sess_*.jsonl")):
+                # 与 _transcript 用同一个判定（_is_session_id）：不符合
+                # sess_<数字> 的文件（sess_abc / SESS_0001 大小写变体）跳过，
+                # 不能交给 load() 去炸掉整个列表。
+                if not _is_session_id(path.stem):
+                    continue
                 records.append(self.load(path.stem))   # stem = 去 .jsonl 的 id
             return records
 

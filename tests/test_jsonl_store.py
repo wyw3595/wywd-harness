@@ -240,6 +240,20 @@ class JsonlSessionStoreTests(unittest.TestCase):
                 self.store.load(bad)
         self.assertEqual(self.store.list(), [])
 
+    def test_list_skips_stems_that_are_not_session_ids(self) -> None:
+        """reviewer 首跑抓到：glob 与 _transcript 口径不一致的后果。
+
+        `sess_abc.jsonl` 能匹配 `sess_*.jsonl`，但过不了 _transcript 的
+        `sess_<数字>` 校验——list() 若直接 load 它，整个会话列表会抛错
+        （和 audit.jsonl 崩溃同一类问题换了个触发源）。判定共用
+        `_is_session_id`：不符合的文件跳过，不交给 load()。
+        """
+
+        self.store.create(_record("sess_0001"))
+        (Path(self.root) / "sess_abc.jsonl").write_text("{}\n", encoding="utf-8")
+        (Path(self.root) / "SESS_0002.jsonl").write_text("{}\n", encoding="utf-8")
+        self.assertEqual([r.id for r in self.store.list()], ["sess_0001"])
+
     def test_unsafe_session_id_rejected(self) -> None:
         """sid 进文件名 = 路径穿越面；store 是协议端口，必须自查。"""
 
