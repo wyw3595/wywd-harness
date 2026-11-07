@@ -754,23 +754,36 @@ class BashToolTests(unittest.TestCase):
         self.assertNotIn("WYWD_FAKE_SECRET", _clean_env())
 
     def test_interpreter_env_vars_do_not_leak(self) -> None:
-        """PYTHONHOME / harness 自己的 PYTHONPATH 不该进用户命令。
+        """PYTHONHOME（shim 那份）/ harness 自己的 PYTHONPATH 不该进用户命令。
 
         2026-11-06 真机验收：uv 建的 venv 把 PYTHONHOME 指到自己的 3.12
-        标准库，用户机器上的 python 3.13 一 import 就崩 SRE module
-        mismatch；shell.py 注入的 PYTHONPATH 还会遮蔽同名包。
+        标准库（值等于 sys.base_prefix），用户机器上的 python 3.13 一
+        import 就崩 SRE module mismatch；shell.py 注入的 PYTHONPATH 还会
+        遮蔽同名包。
+
+        2026-11-07 审查细化：只剥等于 base_prefix 的那份；相对条目
+        （"."）按子进程 cwd 解析，原样保留。
         """
 
         user_path = str(Path(self.root) / "user-lib")
         with mock.patch.dict(os.environ, {
-            "PYTHONHOME": r"C:\uv\python\3.12",
-            "PYTHONPATH": os.pathsep.join([_HARNESS_ROOT, user_path]),
+            "PYTHONHOME": sys.base_prefix,
+            "PYTHONPATH": os.pathsep.join([_HARNESS_ROOT, user_path, "."]),
         }):
             env = _clean_env()
 
         self.assertNotIn("PYTHONHOME", env)
-        # 用户自己的路径留着，只剥 harness 那份。
-        self.assertEqual(env.get("PYTHONPATH"), user_path)
+        # harness 那份剥掉，用户路径 + 相对条目原样保留。
+        self.assertEqual(env.get("PYTHONPATH"),
+                         os.pathsep.join([user_path, "."]))
+
+    def test_user_pythonhome_is_preserved(self) -> None:
+        """用户自己指向别的解释器的 PYTHONHOME 不该被 harness 替天行道。"""
+
+        with mock.patch.dict(os.environ, {"PYTHONHOME": "/custom/python"}):
+            env = _clean_env()
+
+        self.assertEqual(env.get("PYTHONHOME"), "/custom/python")
 
     def test_harness_pythonpath_removed_entirely(self) -> None:
         """PYTHONPATH 里只有 harness 根时，整个变量都别传给子进程。"""

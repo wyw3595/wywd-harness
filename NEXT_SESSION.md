@@ -3205,8 +3205,14 @@ README 计数跟上。对真实 `.sessions/` 只读验过：list 回来 5 个会
   里不匹配就跳过；回归测试 `test_list_skips_stems_that_are_not_session_ids`。
 - 另外它复述了两条 P3（相对 PYTHONPATH 按进程 cwd 解析、PYTHONHOME
   无条件剥）——与人工审查一致，说明提示词+技能能稳定命中共识问题。
+- 两条 P3 顺手收了：PYTHONHOME 只在**等于 `sys.base_prefix`** 时剥
+  （uv shim 的值就是它；用户自设的自定义解释器保留）；PYTHONPATH 只比对
+  **绝对路径**条目（`.` 这类相对条目按子进程 cwd 解析，原样保留）。
+  测试改写 `test_interpreter_env_vars_do_not_leak` + 新增
+  `test_user_pythonhome_is_preserved`。
 
-测试 +8（7 条 CLI 离线 + 1 条 list 跳过），全量 **867 条 OK（含 2 skip）**。
-`reviewer.json` / code-review 技能都在 `.workbuddy/`（已 ignore），属于本地
-配置，不入库；缺了 CLI 会报人话并退出。改动未提交。
+测试 +9（7 条 CLI 离线 + 1 条 list 跳过 + 1 条 PYTHONHOME 保留），全量
+**868 条 OK（含 2 skip）**。`reviewer.json` / code-review 技能都在
+`.workbuddy/`（已 ignore），属于本地配置，不入库；缺了 CLI 会报人话并退出。
+改动未提交。
 

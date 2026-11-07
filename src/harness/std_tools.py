@@ -35,6 +35,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import uuid
 from collections import deque
@@ -527,7 +528,12 @@ def _clean_env() -> dict[str, str]:
       - `scripts/shell.py` 为了 sidecar 能 import，把项目根塞进了
         PYTHONPATH——它会跟着 bash 工具漏进用户命令，遮蔽用户项目里的
         同名包（src / scripts 这类名字最容易撞）。
-    只剥 harness 自己那一份 PYTHONPATH，用户原有的路径原样保留。
+
+    边界（2026-11-07 审查细化）：
+      - PYTHONHOME 只在**等于本解释器 base_prefix** 时才剥（那才是 uv/venv
+        shim 注入的那一份）；用户自己指向别的解释器的值保留——那是他的环境；
+      - PYTHONPATH 只比对**绝对路径**条目：相对条目（如 "."）按子进程 cwd
+        解析，在这里用 abspath 展开会拿 sidecar 的 cwd 冒充，可能误删。
     """
 
     env = {
@@ -535,12 +541,20 @@ def _clean_env() -> dict[str, str]:
         for name, value in os.environ.items()
         if not any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS)
     }
-    env.pop("PYTHONHOME", None)
+    pythonhome = env.get("PYTHONHOME", "")
+    if pythonhome and os.path.normcase(os.path.abspath(pythonhome)) == \
+            os.path.normcase(sys.base_prefix):
+        env.pop("PYTHONHOME", None)
     pythonpath = env.get("PYTHONPATH", "")
     if pythonpath:
-        kept = [entry for entry in pythonpath.split(os.pathsep)
-                if entry
-                and os.path.normcase(os.path.abspath(entry)) != _HARNESS_ROOT]
+        kept = []
+        for entry in pythonpath.split(os.pathsep):
+            if not entry:
+                continue
+            if os.path.isabs(entry) and \
+                    os.path.normcase(os.path.abspath(entry)) == _HARNESS_ROOT:
+                continue
+            kept.append(entry)
         if kept:
             env["PYTHONPATH"] = os.pathsep.join(kept)
         else:
