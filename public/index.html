@@ -318,16 +318,25 @@
   #live-feed .widget-frame{width:100%;height:420px;border:1px solid var(--line);
     border-radius:10px;background:var(--surface);display:block}
   /* 交付卡片行（s20 present_files）：主交付打 ★，缺失的文件红边——
-     "说好的交付物不在"要摆出来，不能悄悄漏掉 */
+     "说好的交付物不在"要摆出来，不能悄悄漏掉。s24 打磨：主交付整卡
+     提格（墨边 + 面板底 + 徽标）、URL 卡可点（noopener）、悬浮反馈 */
   #live-feed .lf-files-box{padding:4px 0}
+  #live-feed .lf-files-note{font-size:11.5px;color:var(--tx2);
+    margin:2px 0 2px;line-height:1.5}
   #live-feed .files-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
-  #live-feed .file-card{display:flex;gap:6px;align-items:center;
-    border:1px solid var(--line);border-radius:8px;padding:4px 9px;
-    font-size:12px;color:var(--tx2);max-width:260px;background:var(--surface)}
+  #live-feed .file-card{display:flex;gap:7px;align-items:center;
+    border:1px solid var(--line);border-radius:8px;padding:5px 10px;
+    font-size:12px;color:var(--tx);max-width:280px;background:var(--surface);
+    text-decoration:none;transition:border-color .12s ease}
+  #live-feed a.file-card:hover{border-color:var(--tx3)}
+  #live-feed .file-card.is-primary{border-color:var(--ink);
+    background:var(--panel)}
   #live-feed .file-card.is-missing{border-color:var(--danger);color:var(--danger)}
-  #live-feed .fc-primary{color:var(--ink);font-size:11px;flex:0 0 auto}
+  #live-feed .fc-primary{flex:0 0 auto;color:var(--ink-fg);background:var(--ink);
+    border-radius:5px;padding:1px 6px;font-size:10.5px;font-weight:600}
   #live-feed .fc-icon{flex:0 0 auto}
-  #live-feed .fc-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #live-feed .fc-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font-weight:500}
   #live-feed .fc-size{flex:0 0 auto;color:var(--tx3);font-size:11px}
   /* 本轮结局卡：不是历史的一部分，所以样式也和正文区分开 */
   .msg.notice{align-self:stretch;border-radius:10px;padding:9px 12px;

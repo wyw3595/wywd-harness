@@ -66,3 +66,7 @@ workspaces/
 /_procs.txt
 /smoke_result.log
 /web_app_smoke.log
+
+# 前端复核临时产物（2026-10-26）：无头 Chromium 截图 + 从会话证据抽出的
+# 真 payload 副本，本地排查用，随时可删可重建，不进仓库
+/.fe-card-check-work/

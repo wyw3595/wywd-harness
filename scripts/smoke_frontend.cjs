@@ -171,6 +171,52 @@ async function pureSection() {
      parseMarkdown("[点我](https://a.com)")[0].inline[0],
      { type: "link", href: "https://a.com",
        inline: [{ type: "text", text: "点我" }] });
+
+  // ── [files] 协议解析（2026-11-07 审查修复）：交付卡片的数据入口是
+  //    tool_end 原文（仓库里任意文件都可能带回这段），必须当成不可信数据。
+  console.log("== 0b. [files] 协议解析（纯函数）==");
+  const filesSrc = fs.readFileSync(
+    path.join(__dirname, "..", "public", "src", "files-cards.js"), "utf8");
+  const filesMod = await import("data:text/javascript;base64," +
+    Buffer.from(filesSrc).toString("base64"));
+  const { parseFilesPayload, parseFilesNote } = filesMod;
+  const filesPayload = (raw) =>
+    "工具返回：交付 2 个文件：本次实验产出\n[files]\n" +
+    JSON.stringify(raw) + "\n[/files]";
+
+  const good = parseFilesPayload(filesPayload([
+    { path: "a.md", name: "a.md", icon: "📄", size: "1B",
+      exists: true, isPrimary: true },
+    { path: "https://example.com/x", name: "u", icon: "🔗", size: "—",
+      exists: true, isUrl: true },
+  ]));
+  eq("[files] 合法数组 → 两张卡（第二条才是 URL）",
+     good && good.map((c) => [c.path, c.isUrl, c.exists]),
+     [["a.md", false, true], ["https://example.com/x", true, true]]);
+
+  const evilUrl = parseFilesPayload(filesPayload([
+    { path: "javascript:alert(1)", isUrl: true, exists: true }]));
+  eq("javascript: 不算 URL（href 会被置空）", evilUrl && evilUrl[0].isUrl, false);
+
+  eq("非数组 JSON → null（走普通输出行）",
+     parseFilesPayload(filesPayload(42)), null);
+  eq("坏 JSON → null",
+     parseFilesPayload("交付 1 个文件：x\n[files]\n{nope\n[/files]"), null);
+
+  const many = Array.from({ length: 60 },
+    (_, i) => ({ path: `f${i}.md`, exists: true }));
+  eq("卡片条数封顶 50", parseFilesPayload(filesPayload(many)).length, 50);
+
+  const twoPrimary = parseFilesPayload(filesPayload([
+    { path: "a", isPrimary: true, exists: true },
+    { path: "b", isPrimary: true, exists: true },
+  ]));
+  eq("主交付只认第一个", twoPrimary.map((c) => c.isPrimary), [true, false]);
+
+  eq("头行说明提取",
+     parseFilesNote("交付 2 个文件：本次实验产出\n[files]\n[]\n[/files]"),
+     "本次实验产出");
+  eq("没有说明 → 空串", parseFilesNote("交付 1 个文件。"), "");
 }
 
 async function findPage() {

@@ -21,6 +21,7 @@
 
 import { computed, reactive } from "vue";
 import * as api from "./api.js";
+import { parseFilesNote, parseFilesPayload } from "./files-cards.js";
 import { ui } from "./ui.js";
 
 const LS_CURRENT = "wywd_current_sid";
@@ -602,20 +603,16 @@ function handleEvent(ev) {
     const widgetMatch = out.match(
       /widget「(.+?)」已注入对话。\n\[widget\]\n([\s\S]*?)\n\[\/widget\]/);
     // 成果交付（s20）：同样按 payload 形状判定（与工具名无关，同
-    // widget 的理由）。[files] 块里是 JSON 卡片数组，渲染成交付卡片行；
+    // widget 的理由）。[files] 块交给纯函数解析——它会校验数组形状、
+    // 只放行 http(s) 链接、封顶条数（解析层是不可信数据入口：仓库里
+    // 任意文件的内容都可能带回这段文本，见 files-cards.js 的头注释）。
     // JSON 坏了走普通输出行——协议错误不该吞掉整条工具结果。
-    const filesStart = out.indexOf("[files]");
-    const filesEnd = out.indexOf("[/files]");
-    let filesCards = null;
-    if (filesStart >= 0 && filesEnd > filesStart) {
-      try {
-        filesCards = JSON.parse(out.slice(filesStart + 7, filesEnd).trim());
-      } catch (e) { filesCards = null; }
-    }
+    const filesCards = parseFilesPayload(out);
     if (filesCards) {
       pushLive("files", "", "交付", {
         cards: filesCards,
         summary: filesCards.length + " 个交付物",
+        note: parseFilesNote(out),
       });
     } else if (widgetMatch) {
       pushLive("widget", widgetMatch[2], "图表", {

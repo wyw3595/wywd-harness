@@ -507,16 +507,21 @@ export const ChatArea = {
                     <span class="lf-widget-tag">📦 交付</span>
                     <span class="lf-plan-sum">{{ line.summary }}</span>
                   </div>
+                  <div v-if="line.note" class="lf-files-note">{{ line.note }}</div>
                   <div class="files-row">
-                    <div v-for="(card, i) in line.cards" :key="i"
-                         class="file-card"
-                         :class="{ 'is-missing': !card.exists }"
-                         :title="card.path">
-                      <span class="fc-primary" v-if="card.isPrimary">★</span>
-                      <span class="fc-icon">{{ card.icon }}</span>
+                    <a v-for="(card, i) in line.cards" :key="i"
+                       :href="card.isUrl ? card.path : undefined"
+                       :target="card.isUrl ? '_blank' : undefined"
+                       rel="noopener noreferrer"
+                       class="file-card"
+                       :class="{ 'is-missing': !card.exists,
+                                 'is-primary': card.isPrimary }"
+                       :title="card.isUrl ? ('打开 ' + card.path) : card.path">
+                      <span class="fc-primary" v-if="card.isPrimary">★ 主交付</span>
+                      <span class="fc-icon">{{ card.exists ? card.icon : '⚠' }}</span>
                       <span class="fc-name">{{ card.name }}</span>
                       <span class="fc-size">{{ card.exists ? card.size : '未找到' }}</span>
-                    </div>
+                    </a>
                   </div>
                 </div>
                 <div v-else class="lf-line" :class="'lf-' + line.kind">
