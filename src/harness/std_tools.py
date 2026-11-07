@@ -507,19 +507,45 @@ BASH_OUTPUT_LIMIT = 8000
 # 而工具输出是要回灌给模型的（还随 transcript 落盘）——等于把密钥送给模型。
 _SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
 
+# harness 自己的项目根：scripts/shell.py 会把根塞进 PYTHONPATH 给 sidecar 用，
+# 但那份 PYTHONPATH 不该跟着 bash 工具漏进用户命令（会遮蔽同名包）。这里按
+# __file__ 反推，和 shell.py 的 _PROJECT_ROOT 是同一个目录。
+_HARNESS_ROOT = os.path.normcase(str(Path(__file__).resolve().parents[2]))
+
 
 def _clean_env() -> dict[str, str]:
-    """继承当前环境，但剥掉看起来是密钥的变量。
+    """继承当前环境，但剥掉密钥，以及 harness 自己注入的 Python 变量。
 
-    按名字特征过滤，不追求完备——能想到的都挡住，想不到的靠"每次都审批"
-    兜底。宁可偶尔少给一个无关变量，也不能把密钥漏进上下文。
+    密钥：按名字特征过滤，不追求完备——能想到的都挡住，想不到的靠
+    "每次都审批"兜底。宁可偶尔少给一个无关变量，也不能把密钥漏进上下文。
+
+    解释器变量（2026-11-06 真机验收抓到的坑）：
+      - `.venv` 是 uv 建的，它的 python 启动时会把 PYTHONHOME 指到 uv 的
+        3.12 标准库。子进程里任何**别的** Python（比如用户机器上的 3.13）
+        都会因为 `_sre` 版本不匹配，一 import 标准库就崩在
+        "SRE module mismatch"——跑测试直接变成环境排障；
+      - `scripts/shell.py` 为了 sidecar 能 import，把项目根塞进了
+        PYTHONPATH——它会跟着 bash 工具漏进用户命令，遮蔽用户项目里的
+        同名包（src / scripts 这类名字最容易撞）。
+    只剥 harness 自己那一份 PYTHONPATH，用户原有的路径原样保留。
     """
 
-    return {
+    env = {
         name: value
         for name, value in os.environ.items()
         if not any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS)
     }
+    env.pop("PYTHONHOME", None)
+    pythonpath = env.get("PYTHONPATH", "")
+    if pythonpath:
+        kept = [entry for entry in pythonpath.split(os.pathsep)
+                if entry
+                and os.path.normcase(os.path.abspath(entry)) != _HARNESS_ROOT]
+        if kept:
+            env["PYTHONPATH"] = os.pathsep.join(kept)
+        else:
+            env.pop("PYTHONPATH", None)
+    return env
 
 
 def _decode_output(data: bytes) -> str:

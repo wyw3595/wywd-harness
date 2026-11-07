@@ -417,6 +417,9 @@ def build_instant_tools(root_: Path) -> list[Tool]:
             # background=true；起完用 bash_output 探活确认，别拿"跑过"当"起好"。
             description="在项目目录里执行一条 shell 命令（工作目录固定为项目根，"
             "默认超时 60 秒、上限 300，输出上限 8000 字符）。"
+            "stdout 与 stderr 会合并返回，跑测试**不需要**加 `2>&1`；"
+            "命令里出现 `; | & > <` 等 shell 元字符会走人工审批"
+            "（只读白名单只认单条纯命令）。"
             "本命令是**同步等待**的：命令不结束，调用就不返回。"
             "起 dev server / watch / 服务等长驻进程必须传 background=true："
             "立即返回 task_id，进程在后台持续运行，不会被超时误杀；随后用 "

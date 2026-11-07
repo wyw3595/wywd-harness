@@ -14,6 +14,7 @@ from unittest import mock
 from src.harness import file_tools
 from src.harness.std_tools import (
     BASH_OUTPUT_LIMIT,
+    _HARNESS_ROOT,
     _clean_env,
     _glob_to_regex,
     _should_skip_file,
@@ -751,6 +752,33 @@ class BashToolTests(unittest.TestCase):
         self.assertNotIn("leak-me", result)
         # 顺带直接测那个纯函数：名字里带 SECRET/KEY/TOKEN 的一律不传下去。
         self.assertNotIn("WYWD_FAKE_SECRET", _clean_env())
+
+    def test_interpreter_env_vars_do_not_leak(self) -> None:
+        """PYTHONHOME / harness 自己的 PYTHONPATH 不该进用户命令。
+
+        2026-11-06 真机验收：uv 建的 venv 把 PYTHONHOME 指到自己的 3.12
+        标准库，用户机器上的 python 3.13 一 import 就崩 SRE module
+        mismatch；shell.py 注入的 PYTHONPATH 还会遮蔽同名包。
+        """
+
+        user_path = str(Path(self.root) / "user-lib")
+        with mock.patch.dict(os.environ, {
+            "PYTHONHOME": r"C:\uv\python\3.12",
+            "PYTHONPATH": os.pathsep.join([_HARNESS_ROOT, user_path]),
+        }):
+            env = _clean_env()
+
+        self.assertNotIn("PYTHONHOME", env)
+        # 用户自己的路径留着，只剥 harness 那份。
+        self.assertEqual(env.get("PYTHONPATH"), user_path)
+
+    def test_harness_pythonpath_removed_entirely(self) -> None:
+        """PYTHONPATH 里只有 harness 根时，整个变量都别传给子进程。"""
+
+        with mock.patch.dict(os.environ, {"PYTHONPATH": _HARNESS_ROOT}):
+            env = _clean_env()
+
+        self.assertNotIn("PYTHONPATH", env)
 
     def test_policy_sends_bash_to_approval(self) -> None:
         """普通命令必须走 ASK——"每次都要人点头"是它敢默认上架的唯一理由。
