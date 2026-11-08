@@ -3237,3 +3237,32 @@ README 计数跟上。对真实 `.sessions/` 只读验过：list 回来 5 个会
 边界：一个档位只按**最后使用**的模型计价（build_model_router 现状是每档
 一个模型）；峰谷价差用峰值价保守估算。改动未提交。
 
+# 2026-11-08（续）：reviewer 评测结果 + 审计链并发修复
+
+评测（`scripts/eval_review.py`）：4 个历史 bug，`git worktree` 回放修复前
+提交，审它自己的 diff。首轮关键词太松，audit-collision 被误判成命中；
+加 `--score-only` 用已存报告重算后，**诚实召回 2/4**：
+
+| case | 提交 | 结果 | 说明 |
+|---|---|---|---|
+| restart-list | 297ea6a | ✅ | 点名 glob/校验两套口径，2 major + 6 minor |
+| audit-collision | 15e5bf2 | ❌ | 没提 session store 的 `*.jsonl` glob；但在 audit.py 找到 12 major + 12 minor（append 无锁、锚点非原子、O(n²)、call_id 缺失…） |
+| env-leak | deab242 | ✅ | PYTHONPATH abspath vs resolve、PYTHONHOME 无条件剥 |
+| delivery-history | f0db847 | ❌ | 没提"刷新后历史无卡片"；但找到 5 条 files-cards 边界（首个 `[files]` 标记、note 多行、summary 计数、isUrl+exists 矛盾、暗色主交付凹陷） |
+
+结论：**本地代码/边界条件强，跨文件集成/设计缺口弱**——reviewer 适合当
+第二双眼，不能替代集成审查；先不进 UI，CLI 用着。成本 4 次约 **$0.16**
+上限、12 分钟。
+
+评测顺带抓到两个真 bug，已修（`src/harness/audit.py`）：
+
+- `append` 无锁：sidecar 用 ThreadPoolExecutor 并行跑 turn，两个 tool_end
+  同时写会拿到同一个 (seq, prev) → 重复 seq/分叉链。用 RLock 把
+  「读链尾→算 hash→写日志→写锚点」包成临界区；verify/entries 同锁；
+- `_write_head` 非原子：改成 `mkstemp + os.replace`；verify 读到坏锚点
+  返回「锚点文件损坏」，不再抛 JSONDecodeError。
+
+测试 +2（并发 40 条仍连续、锚点原子/坏 JSON），全量 **874 条 OK（含 2 skip）**。
+评测脚本与 `review.py --config-dir` 已提交；评测报告在
+`.fe-card-check-work/review-eval/eval-report.md`（ignore，不入库）。
+
