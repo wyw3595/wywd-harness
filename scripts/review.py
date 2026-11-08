@@ -144,11 +144,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--head", default="HEAD", help="目标（默认 HEAD）")
     parser.add_argument("--path", default="", help="只看某个路径")
     parser.add_argument("--repo", default=str(PROJECT_ROOT), help="仓库根")
+    parser.add_argument("--config-dir", default="",
+                        help="reviewer 专家包/技能所在目录（默认同 --repo；"
+                             "用 worktree 评测修复前代码时指向当前仓库）")
     parser.add_argument("--out", default="", help="把报告写到文件（可选）")
     parser.add_argument("--max-steps", type=int, default=8)
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
+    config_dir = Path(args.config_dir).resolve() if args.config_dir else repo
     stat, body, truncated = collect_diff(repo, args.base, args.head, args.path)
     if not body.strip():
         print("没有 diff（基线/目标相同，或该路径没有改动）")
@@ -156,8 +160,8 @@ def main(argv: list[str] | None = None) -> int:
 
     workspace = Workspace(workspace_id="review", root=repo)
     try:
-        package = ExpertIndex(repo).load("reviewer")
-        skill_body = build_skill_index(repo).load("code-review")
+        package = ExpertIndex(config_dir).load("reviewer")
+        skill_body = build_skill_index(config_dir).load("code-review")
     except Exception as error:      # ExpertError / 技能缺失：人话，不抛栈
         print(f"[review] 缺少 reviewer 本地配置：{error}\n"
               "  需要 .workbuddy/experts/reviewer.json 与 "
