@@ -3266,3 +3266,36 @@ README 计数跟上。对真实 `.sessions/` 只读验过：list 回来 5 个会
 评测脚本与 `review.py --config-dir` 已提交；评测报告在
 `.fe-card-check-work/review-eval/eval-report.md`（ignore，不入库）。
 
+# 2026-11-08（三续）：reviewer 集成检查 + 失败 case 重跑
+
+给 reviewer 补了**集成检查清单**（`scripts/review.py` 的 system prompt）：
+调用方/邻居、契约两端、落盘目录谁在 glob、数据来源、错误语义、
+UI 实时/历史两条渲染路径。本仓库的架构提示（live vs `groupTurns`、
+`.sessions/` 三类文件）放在本地专家包 `.workbuddy/experts/reviewer.json`
+（ignore，不入库）。
+
+重跑两个失败 case：
+
+- **audit-collision：❌ → ✅**。现在第一条就是 blocker：`shell.py:213-214`
+  把 audit.jsonl 落进 `.sessions/`，`jsonl_store.list()` 的 `glob("*.jsonl")`
+  会 `load("audit")` → `TranscriptCorruptionError` → sidecar 启动即死；
+  10 major + 10 minor（并发写、锚点原子性等，多数是真问题）。
+- **delivery-history：仍算 ❌（部分）**。它确实走到了历史路径
+  `components.js:276` 的 `groupTurns`，也看到它不解析 `[files]`，但判断成
+  “与改动前一致，不算回归”——**发现了事实，没当成缺口**。同时给了 6 major
+  + 6 minor（首个 `[files]` 标记、`isUrl+exists`、`.gitignore` 绝对路径等）。
+  结论：关键词命中 ≠ 真发现，评测指标本身有盲区。
+
+顺带修了两个**评测暴露的 CLI 真 bug**：
+
+- 强制定稿用 `RealModel(tools=None)`，思考模式会因缺
+  `reasoning_content` 直接 400（`_to_wire_messages` 白名单刻意不回传），
+  改成 `thinking=False` 的 deepseek-chat；定稿失败给 clean error，不抛栈；
+- eval 脚本会读**上次残留的 `.md`** 冒充本轮结果；现在跑前删旧报告、
+  exit 2 / 缺报告都算失败、失败重试前也清产物。
+
+严格口径：4 个 case 里 **3 个真召回**（restart / audit / env），
+delivery 是“发现但判错”，关键词指标算 ✅ 但人工判 ❌——报告里按 3/4 记。
+测试 +1（集成清单在 system prompt 里），全量 **875 条 OK（含 2 skip）**；
+重跑 3 次约 $0.05。改动未提交。
+
