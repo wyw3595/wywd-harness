@@ -3216,3 +3216,24 @@ README 计数跟上。对真实 `.sessions/` 只读验过：list 回来 5 个会
 `.workbuddy/`（已 ignore），属于本地配置，不入库；缺了 CLI 会报人话并退出。
 改动未提交。
 
+# 2026-11-08：成本口径修复（按实际模型计价）
+
+2026-10-26 真机验收留下的 P0：有 key 时三个档位全映射到 DeepSeek，但
+`CostTracker` 按 craft 档的 $15/$75 教学价记账——一次 FizzBuzz 显示
+**$1.44**，实际约 $0.006（差 240–480 倍），且完全不计缓存命中折扣。
+
+- `model_router` 新增 `ModelPricing`（缓存命中 / 未命中 / 输出三价）+
+  `MODEL_PRICING`（deepseek-flash 与 deepseek-chat 同价；v4-pro 另一档）；
+  `CostTracker` 记 `model_id` 与 `cache_hit_tokens`，**有已知计价就按模型
+  算**，未知模型（自建端点/FakeModel）退回档位教学价并标 `estimate=false`；
+- `ModelRouter.call` 把你实际用的模型名和 `prompt_cache_hit_tokens` 一起记账；
+- `summary()` 行新增 `model / cacheHitTokens / estimate / pricingNote`
+  （峰值价估算，宁可高估）；
+- 前端顶栏从 `累计 $` 改成 `累计 ≈$`，悬停 title 显示模型、缓存命中量和
+  "按官方峰值价估算"；
+- 实测一轮 4,304 / 2 tokens：craft 行 `model=deepseek-flash`、
+  `cost=0.001294`（旧口径会显示 0.064710）；全量 **872 条 OK（含 2 skip）**。
+
+边界：一个档位只按**最后使用**的模型计价（build_model_router 现状是每档
+一个模型）；峰谷价差用峰值价保守估算。改动未提交。
+

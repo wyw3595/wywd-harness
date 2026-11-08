@@ -96,16 +96,23 @@ export const costLine = computed(() => {
                " / 输出 " + fmtInt(u.completion_tokens));
   }
   const total = costTotal.value;
-  if (total != null) parts.push("累计 $" + total.toFixed(6));
+  if (total != null) parts.push("累计 ≈$" + total.toFixed(6));
   return parts.join("   ·   ");
 });
 
-/** 悬停看层级明细（per-tier 表在顶栏塞不下，先做成 title） */
+/** 悬停看层级明细（per-tier 表在顶栏塞不下，先做成 title）。
+    2026-11-08：按实际模型计价后，附上模型名、缓存命中量和"估算"说明——
+    顶栏那个 ≈$ 不再让人误以为是账单。 */
 export const costTitle = computed(() => {
   if (!cost.rows || !cost.rows.length) return "";
-  return cost.rows.map((row) =>
-    row.tier + ": " + row.calls + " 次 · 输入 " + fmtInt(row.promptTokens) +
-    " / 输出 " + fmtInt(row.completionTokens) + " · $" + row.cost).join("\n");
+  const lines = cost.rows.map((row) =>
+    row.tier + (row.model ? "（" + row.model + "）" : "") + ": " +
+    row.calls + " 次 · 输入 " + fmtInt(row.promptTokens) +
+    (row.cacheHitTokens ? "（命中 " + fmtInt(row.cacheHitTokens) + "）" : "") +
+    " / 输出 " + fmtInt(row.completionTokens) + " · ≈$" + row.cost);
+  const note = cost.rows.find((row) => row.pricingNote);
+  if (note) lines.push(note.pricingNote);
+  return lines.join("\n");
 });
 
 // 能不能发消息：一个 computed 吃掉 vanilla 版散落各处的 setInputEnabled。

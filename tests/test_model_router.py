@@ -88,6 +88,27 @@ class CallTests(unittest.TestCase):
         # 离线模型 usage 为空 → tokens 记 0（调用发生了，钱是 0，不撒谎）
         self.assertEqual(router.tracker.prompt_tokens[ModelTier.CRAFT], 0)
 
+    def test_call_records_actual_model_and_cache_hits(self) -> None:
+        """记账要带上实际模型与缓存命中量，UI 才能按真实价算。"""
+
+        craft = ScriptedModel([_reply("x", usage={
+            "prompt_tokens": 1_000, "completion_tokens": 500,
+            "prompt_cache_hit_tokens": 800})])
+        craft.model = "deepseek-chat"
+        router = ModelRouter(routes={
+            ModelTier.LITE: FakeModel(),
+            ModelTier.DEFAULT: FakeModel(),
+            ModelTier.CRAFT: craft,
+        })
+
+        router.generate([{"role": "user", "content": "q"}])
+
+        row = next(r for r in router.cost_summary() if r["tier"] == "craft")
+        self.assertEqual(row["model"], "deepseek-chat")
+        self.assertEqual(row["cacheHitTokens"], 800)
+        # 记账字符串保留 6 位小数；这里按显示精度比（0.0006648 → 0.000665）
+        self.assertAlmostEqual(float(row["cost"]), 0.0006648, places=6)
+
 
 class ProtocolTests(unittest.TestCase):
     """generate 满足 Model 协议——run_agent 零改动接入（本课的关节）。"""
@@ -134,6 +155,43 @@ class CostTrackerTests(unittest.TestCase):
         tracker.reset()
         self.assertEqual(tracker.total_cost(), 0.0)
         self.assertEqual(tracker.calls[ModelTier.LITE], 0)
+
+    def test_real_model_pricing_uses_cache_split(self) -> None:
+        """2026-11-08：有真实模型时按它的价算，缓存命中/未命中分开。
+
+        之前按 craft 档 $15/$75 记，一次 FizzBuzz 显示 $1.44；这里
+        800 命中 + 200 未命中 + 500 输出 ≈ $0.000665。
+        """
+
+        tracker = CostTracker()
+        tracker.track(ModelTier.CRAFT, 1_000, 500,
+                      model_id="deepseek-chat", cache_hit_tokens=800)
+
+        self.assertAlmostEqual(tracker.cost_by_tier()[ModelTier.CRAFT],
+                               0.0006648)
+        row = tracker.summary()[2]
+        self.assertEqual(row["model"], "deepseek-chat")
+        self.assertEqual(row["cacheHitTokens"], 800)
+        self.assertTrue(row["estimate"])
+        self.assertIn("峰值价", row["pricingNote"])
+
+    def test_unknown_model_falls_back_to_tier_price(self) -> None:
+        """没有计价表的模型（自建端点）退回档位教学价，并标 estimate=False。"""
+
+        tracker = CostTracker()
+        tracker.track(ModelTier.CRAFT, 1_000_000, 0, model_id="custom-llm")
+
+        self.assertAlmostEqual(tracker.cost_by_tier()[ModelTier.CRAFT], 15.0)
+        self.assertFalse(tracker.summary()[2]["estimate"])
+
+    def test_cache_hit_is_clamped_to_prompt(self) -> None:
+        """脏数据（命中 > 输入）不该算出负的未命中量。"""
+
+        tracker = CostTracker()
+        tracker.track(ModelTier.CRAFT, 100, 0,
+                      model_id="deepseek-chat", cache_hit_tokens=500)
+        self.assertAlmostEqual(tracker.cost_by_tier()[ModelTier.CRAFT],
+                               100 * 0.006 / 1_000_000)
 
 
 class SidecarIntegrationTests(unittest.TestCase):

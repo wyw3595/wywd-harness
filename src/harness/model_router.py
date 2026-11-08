@@ -83,6 +83,56 @@ PRICES: dict[ModelTier, ModelInfo] = {
         input_per_million=15.0, output_per_million=75.0, latency_ms=2000),
 }
 
+
+# ═══════════════════════════════════════════════════════════════
+# 真实模型计价（2026-11-08）：按**模型**而不是按档位算钱
+# ═══════════════════════════════════════════════════════════════
+#
+# 为什么要有这张表：上面的 PRICES 是"档位假想价"（教材的 cost matrix），
+# 而本项目的三个档位在有 key 时全部映射到 DeepSeek——按 craft 档的
+# $15/$75 记账，一次 FizzBuzz 会显示 $1.44，实际不到 1 分钱（2026-10-26
+# 真机验收抓到的 P0）。档位价继续留着做教学对照，但**账单**必须按实际
+# 模型算。
+#
+# 价格来源：DeepSeek 官方 pricing（per 1M tokens）。这里取**峰值价**
+# （off-peak 是它的一半），并在 UI 上标"估算"——宁可高估，不要低报。
+
+PRICING_NOTE = "按官方峰值价估算（缓存命中/未命中分开计）"
+
+
+@dataclass(frozen=True)
+class ModelPricing:
+    """一个真实模型的计价：缓存命中、未命中、输出三个价（USD / 1M）。"""
+
+    model_id: str
+    cache_hit_per_million: float
+    cache_miss_per_million: float
+    output_per_million: float
+
+    def cost(self, prompt_tokens: int, completion_tokens: int,
+             cache_hit_tokens: int = 0) -> float:
+        hit = max(0, min(int(cache_hit_tokens), int(prompt_tokens)))
+        miss = max(0, int(prompt_tokens) - hit)
+        return (hit * self.cache_hit_per_million
+                + miss * self.cache_miss_per_million
+                + int(completion_tokens) * self.output_per_million) / 1_000_000
+
+
+# deepseek-chat 是 deepseek-flash 的非思考兼容别名，同价（见 real_model.py）。
+MODEL_PRICING: dict[str, ModelPricing] = {
+    "deepseek-chat": ModelPricing("deepseek-chat", 0.006, 0.3, 1.2),
+    "deepseek-flash": ModelPricing("deepseek-flash", 0.006, 0.3, 1.2),
+    "deepseek-v4-flash": ModelPricing("deepseek-v4-flash", 0.006, 0.3, 1.2),
+    "deepseek-v4-pro": ModelPricing("deepseek-v4-pro", 0.044, 1.32, 3.96),
+}
+
+
+def pricing_for(model_id: str) -> Optional[ModelPricing]:
+    """按模型名找计价；找不到（FakeModel / 自建端点）返回 None。"""
+
+    key = str(model_id or "").strip().lower()
+    return MODEL_PRICING.get(key)
+
 # 路由表：agent 名 → 层级。唯一已存在的 agent 是 cli（主对话）；
 # 其他是 s10+ 的预注册槽位——现在立名，到课再接真调用方。
 DEFAULT_AGENT_ROUTES: dict[str, ModelTier] = {
@@ -101,6 +151,12 @@ DEFAULT_AGENT_ROUTES: dict[str, ModelTier] = {
 class CostTracker:
     """按层级累计调用次数与 tokens（跨调用聚合——练习 18 的 usage 是
     单次运行的账单，这里是"哪个层级花了多少"的层级视图，分工不同）。
+
+    2026-11-08：每档额外记住**实际模型**与**缓存命中 tokens**。有已知
+    计价就按模型算（缓存命中/未命中分开），没有就退回档位教学价——账单
+    宁可高估，不能像之前那样把 craft 假想价套在 deepseek-chat 上。
+    假设一个档位只映射一个模型（build_model_router 的现状）；同档多模型
+    时按最后一次的模型计价，属于已知近似。
     """
 
     def __init__(self) -> None:
@@ -108,17 +164,31 @@ class CostTracker:
         self.prompt_tokens = {t: 0 for t in ModelTier}
         self.completion_tokens = {t: 0 for t in ModelTier}
         self.calls = {t: 0 for t in ModelTier}
+        self.cache_hit_tokens = {t: 0 for t in ModelTier}
+        self.model_ids = {t: "" for t in ModelTier}
 
 
-    def track(self, tier: ModelTier, prompt_tokens: int, completion_tokens: int) -> None:
+    def track(self, tier: ModelTier, prompt_tokens: int, completion_tokens: int,
+              *, model_id: str = "", cache_hit_tokens: int = 0) -> None:
         self.prompt_tokens[tier] += prompt_tokens
         self.completion_tokens[tier] += completion_tokens
         self.calls[tier] += 1
+        self.cache_hit_tokens[tier] += max(0, int(cache_hit_tokens))
+        if model_id:
+            self.model_ids[tier] = str(model_id)
 
     def cost_by_tier(self) -> dict[ModelTier, float]:
-        return {tier: PRICES[tier].cost(self.prompt_tokens[tier],
-                                        self.completion_tokens[tier])
-                for tier in ModelTier}
+        result = {}
+        for tier in ModelTier:
+            pricing = pricing_for(self.model_ids[tier])
+            if pricing is not None:
+                result[tier] = pricing.cost(
+                    self.prompt_tokens[tier], self.completion_tokens[tier],
+                    self.cache_hit_tokens[tier])
+            else:   # 未知模型 / 离线模型：退回档位教学价（离线 tokens 为 0 → 0）
+                result[tier] = PRICES[tier].cost(
+                    self.prompt_tokens[tier], self.completion_tokens[tier])
+        return result
 
     def total_cost(self) -> float:
         return sum(self.cost_by_tier().values())
@@ -126,15 +196,30 @@ class CostTracker:
     def summary(self) -> list[dict]:
         # t.value 才是小写字符串（"lite"）；t.name 是成员名（"LITE"）——
         # str 混血 Enum 的 .value 直接当字符串用，s07 埋的设计
-        return [{"tier": t.value, "calls": self.calls[t],
-                 "promptTokens": self.prompt_tokens[t],
-                 "completionTokens": self.completion_tokens[t],
-                 "cost": f"{self.cost_by_tier()[t]:.6f}"} for t in ModelTier]
+        costs = self.cost_by_tier()
+        rows = []
+        for t in ModelTier:
+            model_id = self.model_ids[t]
+            known = pricing_for(model_id) is not None
+            rows.append({
+                "tier": t.value,
+                "model": model_id or PRICES[t].name,
+                "calls": self.calls[t],
+                "promptTokens": self.prompt_tokens[t],
+                "completionTokens": self.completion_tokens[t],
+                "cacheHitTokens": self.cache_hit_tokens[t],
+                "cost": f"{costs[t]:.6f}",
+                "estimate": known,
+                "pricingNote": PRICING_NOTE,
+            })
+        return rows
 
     def reset(self) -> None:
         self.prompt_tokens = {t: 0 for t in ModelTier}
         self.completion_tokens = {t: 0 for t in ModelTier}
         self.calls = {t: 0 for t in ModelTier}
+        self.cache_hit_tokens = {t: 0 for t in ModelTier}
+        self.model_ids = {t: "" for t in ModelTier}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -183,10 +268,17 @@ class ModelRouter:
         model = self.route(agent_name)
         reply = model.generate(messages)
         usage = reply.usage or {}
+        # 记账用**实际模型**与缓存命中量：真实厂商的输入价分命中/未命中，
+        # 而 deepseek-chat 与 craft 档的假想价差两个数量级（2026-10-26 验收）。
+        model_id = (getattr(model, "model", "")
+                    or getattr(model, "name", "")
+                    or type(model).__name__.lower())
         self.tracker.track(
             self.agents.get(agent_name, ModelTier.DEFAULT),
             usage.get("prompt_tokens", 0),
-            usage.get("completion_tokens", 0))
+            usage.get("completion_tokens", 0),
+            model_id=str(model_id),
+            cache_hit_tokens=usage.get("prompt_cache_hit_tokens", 0) or 0)
         return reply
 
 
