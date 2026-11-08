@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -47,7 +48,8 @@ class AuditChainTests(unittest.TestCase):
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             ok, at, reason = AuditChain(path).verify()
             self.assertFalse(ok)
-            self.assertIn("被改过"[:0] + "hash", reason)   # 指认第几条
+            self.assertEqual(at, 1)                  # 指认第 1 条
+            self.assertIn("hash", reason)
 
     def test_truncation_is_detected_by_head_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -82,6 +84,51 @@ class AuditChainTests(unittest.TestCase):
             ok, count, _ = second.verify()
             self.assertTrue(ok)
             self.assertEqual(count, 2)
+
+    def test_concurrent_appends_keep_chain_valid(self) -> None:
+        """reviewer 评测抓到的 blocker：并发 tool_end 同时 append。
+
+        sidecar 用 ThreadPoolExecutor 并行跑会话；两个线程若都读到同一个
+        (seq, prev)，会写出重复 seq + 分叉 prev_hash，链永久断。锁住
+        「读链尾→算 hash→写日志→写锚点」后，40 条并发追加必须连续。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chain = self._chain(tmp)
+            barrier = threading.Barrier(4)
+
+            def worker() -> None:
+                barrier.wait()
+                for i in range(10):
+                    chain.append("tool_call",
+                                 {"thread": threading.get_ident(), "i": i}, "r")
+
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            entries = chain.entries()
+            self.assertEqual([e["seq"] for e in entries], list(range(1, 41)))
+            ok, count, reason = chain.verify()
+            self.assertTrue(ok, reason)
+            self.assertEqual(count, 40)
+
+    def test_head_written_atomically(self) -> None:
+        """锚点原子写：正常路径不留临时文件，坏 JSON 只报告不抛异常。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chain = self._chain(tmp)
+            chain.append("a", {}, "1")
+            self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
+
+            (Path(tmp) / "audit.head").write_text('{"count": 1',
+                                                  encoding="utf-8")
+            ok, count, reason = chain.verify()
+            self.assertFalse(ok)
+            self.assertEqual(count, 1)
+            self.assertIn("锚点", reason)
 
 
 class SidecarAuditTests(unittest.TestCase):
