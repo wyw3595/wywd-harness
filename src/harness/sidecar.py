@@ -80,6 +80,7 @@ from src.harness.experts import (
     ExpertError,
     ExpertIndex,
     render_specialization,
+    select_tools,
 )
 from src.harness.permissions import Approver, AuditTrail, GovernedToolRunner
 from src.harness.session import (
@@ -670,6 +671,33 @@ class SidecarServer:
         self._runtime_cache[cwd] = bundle
         return bundle
 
+    def _expert_registry(self, registry: ToolRegistry,
+                         expert_id: str) -> ToolRegistry:
+        """按会话的专家包收窄注册表（2026-11-08 补上 s18 缺的那一半）。
+
+        专家包只能**少给**工具：kept = names - disabled。失败一律
+        fail-closed——包读不出来就给空注册表（模型一个工具都看不见），
+        绝不退回全量：「收窄声明失效 = 权限变大」是最不该静默发生的方向。
+        """
+
+        if not expert_id:
+            return registry
+        if self._expert_index is None:
+            self._log(f"expert {expert_id}: 没有索引，fail-closed（禁用全部工具）")
+            return ToolRegistry()
+        try:
+            package = self._expert_index.load(expert_id)
+        except ExpertError as error:
+            self._log(f"expert {expert_id}: 读取失败（{error}），fail-closed")
+            return ToolRegistry()
+        kept, disabled = select_tools(registry.names(), package.tools_config)
+        narrowed = ToolRegistry()
+        for name in kept:
+            narrowed.register(registry.get(name))
+        if disabled:
+            self._log(f"expert {expert_id}: 收窄工具 {sorted(disabled)}")
+        return narrowed
+
     def _make_turn_runner_for(self, record: "SessionRecord"):
         """给**一个会话**造 runner：它的 cwd 决定用哪套沙箱。
 
@@ -679,6 +707,9 @@ class SidecarServer:
         """
 
         registry, policy, _info = self._runtime_for(record.cwd)
+        # s18：专家包的工具收窄在这一层落地——创建和 resume 都会走到，
+        # 只改创建那一刻的 runner 会让「复活后权限变大」。
+        registry = self._expert_registry(registry, record.expert_id)
         runner = GovernedToolRunner(
             policy=policy,
             approver=self._make_approver(self._conn),
@@ -928,16 +959,13 @@ class SidecarServer:
 
         s18 专家激活（expertId 可选）：specialization 作为一条 system
         消息追加在起步历史**末尾**（叠加不覆盖），写进两个副本——
-        转录即证据，resume/重开自然带着人格回来，不需要额外字段。
-        未知专家/坏包翻成 ValueError 人话（RPC 的唯一错误通道）。
+        转录即证据，resume/重开自然带着人格回来。同时把 expert_id 写进
+        record：运行时 factory 按它**收窄工具**（只少给，不多给），
+        resume 后依然生效。未知专家/坏包翻成 ValueError 人话。
         """
-        sid = self._manager.create_session(
-            cwd=params.get("cwd", self._default_session_cwd),
-            mode=params.get("mode", "craft"),
-            title=params.get("title", "未命名会话"))
-        runtime = self._manager.get_session(sid)
-        seed = self._history_seed()
+
         expert_id = str(params.get("expertId") or "").strip()
+        package = None
         if expert_id:
             if self._expert_index is None:
                 raise ValueError(
@@ -946,6 +974,15 @@ class SidecarServer:
                 package = self._expert_index.load(expert_id)
             except ExpertError as error:
                 raise ValueError(str(error)) from error
+
+        sid = self._manager.create_session(
+            cwd=params.get("cwd", self._default_session_cwd),
+            mode=params.get("mode", "craft"),
+            title=params.get("title", "未命名会话"),
+            expert_id=expert_id)
+        runtime = self._manager.get_session(sid)
+        seed = self._history_seed()
+        if package is not None:
             seed.append({"role": "system",
                          "content": render_specialization(package)})
             self._log(f"expert activated: {expert_id}")

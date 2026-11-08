@@ -308,6 +308,16 @@ class SessionManagerTests(unittest.TestCase):
         self.assertTrue(manager.get_session(sid1) is not None)   # live
         self.assertTrue(manager.list_sessions()[0]["live"])
 
+    def test_create_records_expert_id(self) -> None:
+        """s18：专家 id 进 Record，resume 后运行时才知道收窄哪套工具。"""
+
+        manager, _, _ = make_manager()
+        sid = manager.create_session(TESTS_CWD, expert_id="reviewer")
+        self.assertEqual(manager.load_record(sid).expert_id, "reviewer")
+        # 不传就是空串（老行为）
+        other = manager.create_session(TESTS_CWD)
+        self.assertEqual(manager.load_record(other).expert_id, "")
+
     def test_counter_continues_across_managers(self) -> None:
         manager1, store, _ = make_manager()
         manager1.create_session(TESTS_CWD)

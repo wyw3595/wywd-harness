@@ -131,6 +131,23 @@ class JsonlSessionStoreTests(unittest.TestCase):
         self.assertIsNone(loaded.last_error)
         self.assertEqual(loaded.messages, [])
 
+    def test_expert_id_roundtrip_and_legacy_default(self) -> None:
+        """s18：专家 id 落进证据；旧文件没有该字段时按空串读回。"""
+
+        self.store.create(_record("sess_0001", expert_id="reviewer"))
+        restarted = JsonlSessionStore(self.root)
+        self.assertEqual(restarted.load("sess_0001").expert_id, "reviewer")
+
+        # 模拟本次改动之前的证据：record 事件里没有 expert_id
+        path = Path(self.root) / "sess_0001.jsonl"
+        lines = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            event.pop("expert_id", None)
+            lines.append(json.dumps(event, ensure_ascii=False))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertEqual(self.store.load("sess_0001").expert_id, "")
+
     def test_save_appends_only_new_messages(self) -> None:
         record = _record()
         self.store.create(record)

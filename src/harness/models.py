@@ -52,9 +52,15 @@ class ModelReply:
 
 
 class Model(Protocol):
-    """任何可供 Harness 调用的模型都必须遵守的接口。"""
+    """任何可供 Harness 调用的模型都必须遵守的接口。
 
-    def generate(self, messages: list[dict]) -> ModelReply:
+    tools 是**本轮**可用的工具 schema（2026-11-08）：注册表可能被会话级
+    专家收窄，模型看到的工具清单必须跟着走，不能退回构造期的全量。
+    None = 沿用模型自己的默认清单（独立使用 RealModel 的老路径）。
+    """
+
+    def generate(self, messages: list[dict],
+                 tools: list[dict] | None = None) -> ModelReply:
         """根据消息历史生成一轮结构化回复。"""
 
 
@@ -64,7 +70,8 @@ class FakeModel:
 
     response_prefix: str = "模拟模型回复："
 
-    def generate(self, messages: list[dict]) -> ModelReply:
+    def generate(self, messages: list[dict],
+                 tools: list[dict] | None = None) -> ModelReply:
         # 假模型只关心最初的任务——它就是第一条 user 消息的内容。
         return ModelReply(
             kind="final",
@@ -91,7 +98,8 @@ class ScriptedModel:
         self._replies = list(replies)
         self.received_inputs: list[list[dict]] = []
 
-    def generate(self, messages: list[dict]) -> ModelReply:
+    def generate(self, messages: list[dict],
+                 tools: list[dict] | None = None) -> ModelReply:
         """依次返回下一条结构化回复；只剩最后一条时一直重复它。"""
 
         # 必须快照一份外壳（list(messages)）：循环还会继续往它自己的

@@ -241,7 +241,8 @@ class RealModel:
         # 没传 tools 就是"手无寸铁"的模型；传了说明书它才知道能调用什么。
         self.tools = tools
 
-    def generate(self, messages: list[dict]) -> ModelReply:
+    def generate(self, messages: list[dict],
+                 tools: list[dict] | None = None) -> ModelReply:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -254,12 +255,15 @@ class RealModel:
                 {"role": "system", "content": self.system_prompt},
                 *wire_messages,
             ]
+        # tools 参数 = **本轮**的可用工具（会话级专家收窄后的注册表）；
+        # None 才退回构造期那份（独立使用 RealModel 的老路径）。
+        effective_tools = self.tools if tools is None else tools
         payload = {
             "model": self.model,
             "messages": wire_messages,
         }
-        if self.tools:
-            payload["tools"] = self.tools
+        if effective_tools:
+            payload["tools"] = effective_tools
         if self.thinking:
             payload["thinking"] = {"type": "enabled"}
 

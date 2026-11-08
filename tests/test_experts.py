@@ -25,7 +25,7 @@ from src.harness.experts import (
 )
 from src.harness.permissions import build_default_policy
 from src.harness.sidecar import SidecarServer
-from src.harness.tools import ToolRegistry
+from src.harness.tools import Tool, ToolRegistry
 
 
 def _package(**overrides) -> ExpertPackage:
@@ -230,6 +230,66 @@ class SidecarExpertTests(unittest.TestCase):
         self.assertEqual(messages[-1]["role"], "system")      # 叠加在末尾
         self.assertIn("<expert_specialization>", messages[-1]["content"])
         self.assertIn("资深架构师", messages[-1]["content"])
+
+    def test_expert_id_is_persisted_and_survives_resume(self) -> None:
+        """s18：expert_id 进 Record，resume 后才能按它收窄工具。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_package(root, {
+                "expert_id": "architect", "name": "软件架构师",
+                "system_prompt": "你是资深架构师。"})
+            server = self._server(root)
+            sid = server._handle_session_create(
+                {"expertId": "architect"})["sessionId"]
+            self.assertEqual(server._manager.load_record(sid).expert_id,
+                             "architect")
+            server._handle_session_close({"sessionId": sid})
+            server._handle_session_resume({"sessionId": sid})
+
+        self.assertEqual(server._manager.load_record(sid).expert_id,
+                         "architect")
+
+    def test_expert_narrows_registry(self) -> None:
+        """2026-11-08 补的 s18 另一半：专家包必须在运行时真的摘工具。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_package(root, {
+                "expert_id": "architect", "name": "软件架构师",
+                "system_prompt": "你是资深架构师。",
+                "tools_config": {"preferred_tools": ["fs_read"],
+                                 "disabled_tools": ["bash"]}})
+            server = self._server(root)
+            base = ToolRegistry()
+            for name in ("bash", "fs_read", "fs_write"):
+                base.register(Tool(name=name, description=name,
+                                   handler=lambda **kwargs: ""))
+            narrowed = server._expert_registry(base, "architect")
+
+        self.assertEqual(narrowed.names(), ["fs_read", "fs_write"])
+
+    def test_expert_registry_fails_closed(self) -> None:
+        """索引缺失 / 未知专家：宁可禁用全部工具，也不能退回全量。"""
+
+        base = ToolRegistry()
+        base.register(Tool(name="bash", description="bash",
+                           handler=lambda **kwargs: ""))
+        self.assertEqual(
+            self._server()._expert_registry(base, "architect").names(), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            self.assertEqual(
+                server._expert_registry(base, "ghost").names(), [])
+
+    def test_unknown_expert_does_not_create_orphan_session(self) -> None:
+        """先验专家再建会话：坏 expertId 不该留下一个半成品会话。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            with self.assertRaises(ValueError):
+                server._handle_session_create({"expertId": "ghost"})
+            self.assertEqual(server._manager.list_sessions(), [])
 
     def test_no_expert_id_keeps_legacy_shape(self) -> None:
         # 不带 expertId 的创建与改造前完全一致（老调用零感知）。

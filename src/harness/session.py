@@ -147,6 +147,10 @@ class SessionRecord:
     runtime_generation: int = 1
     messages: list[dict] = field(default_factory=list)
     last_error: Optional[str] = None
+    # s18（2026-11-08）：会话级专家 id。它决定**运行时收窄哪套工具**
+    # （专家包只能少给），必须可持久化——resume 后 factory 重建 runner 时
+    # 还要按它再收窄一次，不能只在创建时生效。
+    expert_id: str = ""
 
     def summary(self) -> dict:
         """UI 安全的视图：不含任何运行时对象，messages 只给条数。"""
@@ -489,13 +493,19 @@ class SessionManager:
         cwd: str,
         mode: str = MODE_CRAFT,
         title: str = DEFAULT_TITLE,
+        expert_id: str = "",
     ) -> str:
-        """创建新逻辑身份 + 第 1 代运行时，返回 session id。"""
+        """创建新逻辑身份 + 第 1 代运行时，返回 session id。
+
+        expert_id（s18）：写进 record，运行时 factory 按它收窄工具；
+        resume / 重启后仍生效（不是只在创建那一刻的装饰）。
+        """
 
         resolved = self._validate_options(cwd, mode)
         self._counter += 1
         sid = f"sess_{self._counter:04d}"
-        record = SessionRecord(id=sid, cwd=resolved, mode=mode, title=title)
+        record = SessionRecord(id=sid, cwd=resolved, mode=mode, title=title,
+                               expert_id=str(expert_id or ""))
         self.store.create(record)      # 先有身份
         self._start_runtime(record)    # 再有第 1 代运行时
         return sid

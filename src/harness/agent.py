@@ -171,7 +171,11 @@ def run_agent(
         # 炸穿调用方，而是落地成 status="failed" 的结果——失败是结果，
         # 不是异常。messages 照常返回：用户的问题已入列，不许弄丢。
         try:
-            reply = model.generate(messages)
+            # 工具 schema 由**本轮注册表**决定（会话级专家可能收窄过）；
+            # 模型构造期自带的清单只作 None 时的兜底。
+            tool_schemas = (registry.model_schemas()
+                            if registry is not None else None)
+            reply = model.generate(messages, tools=tool_schemas)
         except Exception as error:
             return RunResult(
                 run_id=str(uuid4()),

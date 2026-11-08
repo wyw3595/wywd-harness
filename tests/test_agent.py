@@ -627,11 +627,35 @@ class UsageAccumulationTests(unittest.TestCase):
 class RunAgentFailureTests(unittest.TestCase):
     """练习 16：失败也是出口——模型层的异常不能炸穿 Harness。"""
 
+    def test_passes_registry_schemas_as_tools(self) -> None:
+        """2026-11-08：工具清单按**本轮注册表**给，不能用模型构造期全量。
+
+        会话级专家收窄注册表后，模型上下文里也必须看不到被摘掉。
+        """
+
+        class RecordingModel:
+            tools = None
+
+            def generate(self, messages: list[dict],
+                         tools: list[dict] | None = None) -> ModelReply:
+                self.tools = tools
+                return ModelReply(kind="final", text="ok")
+
+        registry = ToolRegistry()
+        registry.register(Tool(name="echo", description="回声",
+                               handler=lambda text="": text))
+        model = RecordingModel()
+        run_agent("hi", model=model, registry=registry)
+
+        names = [item["function"]["name"] for item in model.tools]
+        self.assertEqual(names, ["echo"])
+
     def test_model_exception_becomes_failed_result(self) -> None:
         # 满足 Model 协议（只有一个 generate 方法）就能塞进 run_agent——
         # 协议的妙处：不用继承任何东西。
         class ExplodingModel:
-            def generate(self, messages: list[dict]) -> ModelReply:
+            def generate(self, messages: list[dict],
+                         tools: list[dict] | None = None) -> ModelReply:
                 raise RuntimeError("模拟：API 密钥无效")
 
         result = run_agent("随便什么任务", model=ExplodingModel())

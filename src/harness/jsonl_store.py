@@ -76,7 +76,10 @@ RESERVED_ENVELOPE_FIELDS = frozenset(
 _RECORD_META_FIELDS = (
     "id", "cwd", "mode", "title", "status",
     "created_at", "updated_at", "runtime_generation", "last_error",
+    "expert_id",       # 2026-11-08：会话级专家（决定运行时收窄哪套工具）
 )
+# 旧证据文件没有这些字段：fold 时用默认值补齐，不能让老会话打不开。
+_RECORD_META_DEFAULTS = {"expert_id": ""}
 
 
 class TranscriptCorruptionError(RuntimeError):
@@ -321,9 +324,14 @@ class JsonlSessionStore(SessionStore):
             if latest_meta is None:
                 raise TranscriptCorruptionError(
                     f"{t.path.name}: no record event to fold")
-            return SessionRecord(
-                **{field: latest_meta[field] for field in _RECORD_META_FIELDS},
-                messages=self._persisted_messages(t))
+            meta = {
+                field: latest_meta[field]
+                for field in _RECORD_META_FIELDS
+                if field not in _RECORD_META_DEFAULTS
+            }
+            for field, default in _RECORD_META_DEFAULTS.items():
+                meta[field] = latest_meta.get(field, default)
+            return SessionRecord(**meta, messages=self._persisted_messages(t))
 
     def list(self) -> list[SessionRecord]:
         """扫目录列全部会话：glob sess_*.jsonl，逐个 fold。

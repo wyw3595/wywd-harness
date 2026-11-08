@@ -259,14 +259,16 @@ class ModelRouter:
         tier = self.agents.get(agent_name, ModelTier.DEFAULT)  # 未知 agent 兜底 default
         return self.routes[tier]
 
-    def call(self, agent_name: str, messages: list[dict]) -> ModelReply:
+    def call(self, agent_name: str, messages: list[dict],
+             tools: list[dict] | None = None) -> ModelReply:
         """路由 → 转发到真 Model → 按 tier 记账。
 
         记账诚实边界：离线模型 usage 为空 → 记 0 次 tokens 但 calls +1
         （调用确实发生了，钱是 0——不撒谎也不瞎编）。
+        tools 是本轮可用工具（会话级专家收窄后）；None = 模型默认清单。
         """
         model = self.route(agent_name)
-        reply = model.generate(messages)
+        reply = model.generate(messages, tools=tools)
         usage = reply.usage or {}
         # 记账用**实际模型**与缓存命中量：真实厂商的输入价分命中/未命中，
         # 而 deepseek-chat 与 craft 档的假想价差两个数量级（2026-10-26 验收）。
@@ -283,13 +285,14 @@ class ModelRouter:
 
 
 
-    def generate(self, messages: list[dict]) -> ModelReply:
+    def generate(self, messages: list[dict],
+                 tools: list[dict] | None = None) -> ModelReply:
         """Model 协议适配：默认服务主对话（default_agent → craft 槽）。
 
         这一行是本课的关节：有了它，router 就是一个 Model（结构子类型），
         run_agent(model=router) 零改动可用。
         """
-        return self.call(self.default_agent, messages)
+        return self.call(self.default_agent, messages, tools=tools)
 
     def cost_summary(self) -> list[dict]:
         """给 sidecar/status 的 UI 安全成本表（duck typing 钩子——

@@ -228,7 +228,7 @@ def _sidecar_process(sock: socket.socket) -> None:
         max_steps=max_steps,                  # 单轮步数上限（默认 30）
         externalize=artifacts.externalize,    # s13：超阈值工具输出外化
         skill_index=skills,                   # s16：命中触发词时展开正文
-        expert_index=build_expert_index(default_workspace.root),  # s18
+        expert_index=build_expert_index(),       # s18：与技能同源（项目根 .workbuddy/experts）
         metrics_db=metrics_db,                # s21：统计索引（WAL）
     )
     server.handle_connection(RPCConnection(sock))
