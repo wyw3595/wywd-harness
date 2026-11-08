@@ -87,6 +87,7 @@ def _worktree(case: dict) -> Path:
 
 def _run_case(case: dict, keep: bool = False) -> dict:
     out = WORK / f"{case['name']}.md"
+    out.unlink(missing_ok=True)       # 旧报告不能冒充本轮结果
     worktree = _worktree(case)
     command = [
         sys.executable, "-X", "utf8", str(PROJECT_ROOT / "scripts" / "review.py"),
@@ -105,10 +106,15 @@ def _run_case(case: dict, keep: bool = False) -> dict:
                 _git(PROJECT_ROOT, "worktree", "remove", "--force",
                      str(worktree), check=False)
         current = out.read_text(encoding="utf-8") if out.exists() else ""
-        if "调用模型失败" not in (current + (proc.stdout or "")) or attempt == 1:
+        combined = current + (proc.stdout or "") + (proc.stderr or "")
+        transient = ("调用模型失败" in combined
+                     or "强制定稿失败" in combined
+                     or proc.returncode == 2)
+        if not transient or attempt == 1:
             break
         print(f"        [warn] 模型调用失败，5s 后重试 {case['name']}",
               file=sys.stderr)
+        out.unlink(missing_ok=True)   # 失败输出不要混进重试结果
         time.sleep(5)
         if not keep:
             worktree = _worktree(case)          # 重试前重建 worktree
@@ -118,7 +124,10 @@ def _run_case(case: dict, keep: bool = False) -> dict:
     if out.exists():
         text = out.read_text(encoding="utf-8") + "\n" + text
     lower = text.lower()
-    failed = "调用模型失败" in text or not out.exists()
+    api_failed = ("调用模型失败" in text or "强制定稿失败" in text
+                  or proc.returncode == 2)
+    missing_report = not out.exists()
+    failed = api_failed or missing_report
 
     groups = []
     for group in case["expect"]:
@@ -142,7 +151,8 @@ def _run_case(case: dict, keep: bool = False) -> dict:
         "costUpper": round(cost_upper, 6),
         "groups": groups,
         "recall": all(groups) and not failed,
-        "error": "调用模型失败（已重试）" if failed else "",
+        "error": ("调用模型失败（已重试）" if api_failed
+                  else "没有产出报告" if missing_report else ""),
         "major": len(re.findall(r"\[(?:major|blocker)\]", text, re.I)),
         "minor": len(re.findall(r"\[minor\]", text, re.I)),
         "report": str(out) if out.exists() else "",

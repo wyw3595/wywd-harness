@@ -112,6 +112,18 @@ class PromptTests(unittest.TestCase):
         self.assertIn("信任边界", prompt)
         self.assertIn("先看结构", prompt)
         self.assertIn("fs_read", prompt)
+        # 2026-11-08 评测后加的集成检查：调用方/邻居、契约两端、落盘目录。
+        self.assertIn("集成检查", prompt)
+        self.assertIn("调用方", prompt)
+        self.assertIn("契约两端", prompt)
+        self.assertIn("调用方或邻居文件", prompt)
+        # UI 改动必须同时检查实时路径与历史回放路径。
+        self.assertIn("历史回放", prompt)
+
+    def test_task_orders_integration_check_first(self) -> None:
+        task = review.build_task("main", "HEAD", "x", "+y")
+        self.assertIn("集成检查", task)
+        self.assertLess(task.index("集成检查"), task.index("每条发现"))
 
 
 if __name__ == "__main__":

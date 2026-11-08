@@ -96,15 +96,32 @@ def filter_registry(registry: ToolRegistry,
     return filtered, disabled
 
 
+# 2026-11-08 评测（2/4）暴露的短板：reviewer 擅长 diff 内部，跨文件集成差。
+# 两个失败的 case 都是“改动本身对，但和邻居打架”：audit.jsonl 没被联想到
+# 会话目录的 *.jsonl glob；交付卡片没被联想到历史回放路径。所以把集成检查
+# 固定进系统提示——不是让模型自由发挥，而是按清单至少读一个调用方/邻居。
+_INTEGRATION_CHECKLIST = (
+    "## 集成检查（先做这一步，再看 diff 细节）\n"
+    "1. 这次改动的**调用方**和**邻居文件**是谁？至少读 1 个，确认行为没被改坏。\n"
+    "2. 契约两端是否对称：create/list、写/读、发/收、实时渲染/历史回放。\n"
+    "3. 新增或改变落盘路径时，同目录还有谁在扫（glob/list）？\n"
+    "4. 数据从哪来、被谁控制：工具输出、文件内容、URL 都当不可信。\n"
+    "5. 错误语义变了（抛异常 vs 返回 False/None）？找出所有调用方。\n"
+    "6. 改动是 UI 数据/渲染时：实时路径（SSE/live）和历史回放路径\n"
+    "   （transcript/历史列表）都要走一遍——只画实时不算完成。"
+)
+
+
 def build_system_prompt(package: ExpertPackage, skill_body: str,
                         repo: Path) -> str:
     return "\n\n".join([
         render_specialization(package),
+        _INTEGRATION_CHECKLIST,
         "## 本仓库评审技能（code-review）\n" + skill_body.strip(),
         f"仓库根：{repo}\n只审用户给出的 diff；需要上下文时用 "
         "fs_read / fs_glob / fs_find 读文件，不要改任何文件。\n"
-        "diff 已经完整给出——不要通读仓库，最多读 3 个文件确认引用；"
-        "读完就给结论，不要无限取证。",
+        "diff 已经完整给出——不要通读仓库；总共读 2-4 个文件，其中至少 1 个是"
+        "本次改动的调用方或邻居文件。读完就给结论，不要无限取证。",
     ])
 
 
@@ -116,6 +133,8 @@ def build_task(base: str, head: str, stat: str, body: str,
         f"变更统计：\n{stat or '（无）'}\n\n"
         f"diff：{note}\n```diff\n{body or '（空）'}\n```\n\n"
         "输出要求：\n"
+        "- 先按系统提示里的集成检查走一遍（调用方/邻居、契约两端、"
+        "落盘目录、数据来源），再逐条看 diff\n"
         "- 每条发现一行：`[severity] file:line — 一句话`，"
         "下面 2-4 行说清什么输入/状态下会错、建议怎么改；"
         "severity 用 blocker / major / minor\n"
@@ -198,15 +217,26 @@ def main(argv: list[str] | None = None) -> int:
     if result.status == "max_steps" and result.messages:
         # 步数用尽 = 取证停不下来，不是没话可说。这里用**已经读到的上下文**
         # 强制作一份结论：无工具的模型调用只做总结，不再要求继续探。
-        # （deepseek-chat 对"最多读 3 个文件"这类预算指令执行力很差，
+        # （deepseek-chat 对"读 2-4 个文件"这类预算指令执行力很差，
         #   真机实测：65 行 diff 读了 20 轮还没收尾。）
         forced = True
-        final = RealModel(tools=None, system_prompt="").generate(
-            list(result.messages) + [{
-                "role": "user",
-                "content": "现在只输出审查结论（按上面的格式），不要再调用工具。",
-            }])
-        output = final.text
+        try:
+            # 定稿**必须用非思考模型**：DeepSeek 思考模式要求把上一轮的
+            # reasoning_content 原样回传，而 `_to_wire_messages` 出于安全
+            # 白名单把它丢了——带工具历史 + thinking 的请求会 400
+            # （2026-11-08 评测真机抓到）。总结不需要思考链，用 deepseek-chat。
+            final = RealModel(tools=None, thinking=False,
+                              system_prompt="").generate(
+                list(result.messages) + [{
+                    "role": "user",
+                    "content": "现在只输出审查结论（按上面的格式），不要再调用工具。",
+                }])
+            output = final.text
+        except RuntimeError as error:
+            # 定稿也是一次模型调用，会失败；别让 traceback 穿出去。
+            print(f"[review] 强制定稿失败：{error}（本轮没有拿到结论）",
+                  file=sys.stderr)
+            return 2
 
     print(output)
     if args.out:
