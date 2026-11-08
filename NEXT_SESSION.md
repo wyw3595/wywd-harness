@@ -3299,3 +3299,28 @@ delivery 是“发现但判错”，关键词指标算 ✅ 但人工判 ❌—�
 测试 +1（集成清单在 system prompt 里），全量 **875 条 OK（含 2 skip）**；
 重跑 3 次约 $0.05。改动未提交。
 
+# 2026-11-08（四续）：专家工具收窄接进会话运行时
+
+s18 此前只做了“人格叠加”：`tools_config` 在 sidecar 是死代码——会话创建
+只追加 specialization，runner 仍拿全量注册表。现在补齐：
+
+- `SessionRecord.expert_id` 可持久化（`_RECORD_META_FIELDS` 加字段，
+  旧证据文件缺该字段时默认 `""`，老会话照常打开）；
+- `SidecarServer._expert_registry`：`kept = names - disabled`；索引缺失 /
+  包头读失败 **fail-closed 给空注册表**（收窄失效绝不能变成权限变大）；
+- `_make_turn_runner_for` 按 `record.expert_id` 收窄——创建和 resume 走
+  同一条 factory；先验专家再建会话，坏 expertId 不再留半成品；
+- **工具清单也必须跟着走**：`run_agent` 每轮把 `registry.model_schemas()`
+  传给 `model.generate(tools=...)`；RealModel / ModelRouter / Fake /
+  Scripted 全签名更新。只改执行注册表不够——模型仍会看到 bash 并调用，
+  然后报「工具不存在」（第一版真机抓到的）；
+- shell 的专家索引改回**项目根**（与技能同源），仓库里的 `reviewer.json`
+  直接可用；
+- 测试 +7（expert_id 往返/旧证据默认、收窄与 fail-closed、孤儿会话、
+  模型收到本轮 schema），全量 **882 条 OK（含 2 skip）**，约 23 秒；
+- 真机：reviewer 会话问 bash → 不再出现 `tool_start: bash`，回复
+  「没有 bash 工具」；转录 `expert_id=reviewer`；普通会话不受影响。
+
+注：中途一次全量测试报 13,878 秒，是机器休眠把墙钟算进去了；重跑 23 秒。
+改动未提交。
+
