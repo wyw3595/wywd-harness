@@ -217,7 +217,15 @@ class GlobFilesTests(unittest.TestCase):
     def test_explicit_root_bypasses_ignore_list(self) -> None:
         """pattern 相对 root 解释（与 Path.glob 一致），报出的路径相对项目根。"""
 
-        result = glob_files("*.md", root="learn-workbuddy", max_results=10)
+        # 不依赖仓库里的 learn-workbuddy/（它被 gitignore，CI 干净 checkout
+        # 没有）——自建一棵临时树，语义一样：显式 root 指向被忽略的目录。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "learn-workbuddy").mkdir()
+            (base / "learn-workbuddy" / "README.md").write_text(
+                "教材\n", encoding="utf-8")
+            result = glob_files("*.md", root="learn-workbuddy",
+                                max_results=10, sandbox_root=base.resolve())
         self.assertIn("learn-workbuddy/README.md", result)
 
     def test_no_match_message_carries_the_pattern(self) -> None:

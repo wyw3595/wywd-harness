@@ -10,6 +10,7 @@
 
 import contextlib
 import io
+import os
 import subprocess
 import sys
 import unittest
@@ -29,6 +30,11 @@ def _done(stdout: str = "", stderr: str = "", code: int = 0):
 class AvailableTests(unittest.TestCase):
     """探活：能不能弹，不能要给出人话原因（调用方据此降级）。"""
 
+    @unittest.skipUnless(
+        sys.platform == "win32"
+        or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"),
+        "CI/服务器没有图形环境：探活本来就该报不可用",
+    )
     def test_reports_available_on_this_machine(self) -> None:
         # 这台机器有可用后端；探活不该弹任何窗口
         can, reason = native_dialog.available()
@@ -93,6 +99,15 @@ class AvailableTests(unittest.TestCase):
 
 class PickDirectoryProtocolTests(unittest.TestCase):
     """协议：子进程回话怎么读，读不出来算什么。"""
+
+    def setUp(self) -> None:
+        # 这组测试只验**父进程协议**，不该依赖跑测试的机器有没有显示器。
+        # CI 是 headless Linux：不 patch 的话 pick_directory 在探活处就
+        # 抛 DialogUnavailable，测试变成"环境检测"而不是协议测试。
+        patcher = mock.patch("scripts.native_dialog.available",
+                             return_value=(True, "测试：假装有图形环境"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_returns_resolved_path(self) -> None:
         with mock.patch("scripts.native_dialog.subprocess.run",
@@ -174,6 +189,13 @@ class PickDirectoryProtocolTests(unittest.TestCase):
 
 class ChildModeTests(unittest.TestCase):
     """子进程入口：参数解析（真弹框在冒烟里验）。"""
+
+    def setUp(self) -> None:
+        # 同上：只验参数转发，不依赖本机是否有图形环境。
+        patcher = mock.patch("scripts.native_dialog.available",
+                             return_value=(True, "测试：假装有图形环境"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _child_stdout(self, argv: list[str]) -> str:
         """跑一次子进程的自检模式（不建窗），把它的回话抓回来。"""
