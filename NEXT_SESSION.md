@@ -3428,3 +3428,30 @@ CI 用旧人格审代码，或者本地新增的禁用工具没同步（reviewer
   --write 互斥。
 
 全量 **913 条 OK（含 2 skip）**。改动未提交。
+
+# 2026-11-09（五续）：pre-commit 真机验证 + 闸门漏判修复
+
+带真实 `DEEPSEEK_API_KEY` 跑 `.git/hooks/pre-commit`（暂存区真实 diff），
+三个场景：
+
+| 场景 | 暂存内容 | 结果 |
+|---|---|---|
+| 无 blocker | README 末尾加一个空行 | 退出 0，报告"没有发现"（21K/1.2K tokens，17s） |
+| 有 blocker | 临时文件：打印 `DEEPSEEK_API_KEY` + `subprocess(shell=True)` | 退出 **1**，两条 blocker（38K/3.4K tokens，36s） |
+| 绕过 | 同上 + `WYWD_SKIP_REVIEW=1` | 退出 0，0.13s（没有模型调用） |
+
+**真机抓到闸门漏判**：第一次 blocker 演练时，报告里明明有
+`**[blocker] _review_probe.py:...`，钩子却退出 0。根因是
+`severity_at_least` 的正则只认"行首就是 `[`"，而模型习惯加粗/列点
+（`**[blocker]`、`- [major]`、`1. [minor]`、`## [BLOCKER]`）。
+修：`_SEVERITY_LINE` 允许行首 markdown 装饰（粗体/列表/标题/编号）
+再匹配；正文里复述级别词仍不算发现。测试 +2（装饰四形态、行内提及不触发）。
+这是"离线测试全绿 ≠ 闸门真的会关"的活例子——旧测试只喂了裸 `[blocker]`。
+
+顺带：给第一笔提交装钩子时，reviewer 把"定稿结论重复落盘"报成 blocker，
+核对是假阳性（`turn_end` 的 output 不进 messages；已补计数断言钉死），
+该笔与第二笔提交用 `WYWD_SKIP_REVIEW=1` 落地——钩子会误报，本地保留
+绕过开关是必要的。演练用的暂存文件已 `git restore --staged` 并删除，
+没有进历史。
+
+全量 **915 条 OK（含 2 skip）**；前端 smoke 见下条。

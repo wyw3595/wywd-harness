@@ -120,13 +120,28 @@ def collect_worktree_diff(repo: Path, path: str = "") -> tuple[str, str, bool]:
 # 严重度从高到低；--fail-on blocker 只被 blocker 触发。
 _SEVERITY = {"blocker": 0, "major": 1, "minor": 2}
 
+# 一行"发现"的形状：行首允许 markdown 装饰（粗体/斜体 ** __ * _、列表
+# - + *、引用 >、标题 #、编号 1. / 1)）再跟 [blocker|major|minor]。
+# 注意不要放宽成"行内出现即算"：报告正文复述级别词会误触发闸门。
+_SEVERITY_LINE = re.compile(
+    r"^\s*(?:[#>*_+\-]+\s*|\d+[.)]\s*)*\[(blocker|major|minor)\]",
+    re.I,
+)
+
 
 def severity_at_least(output: str, threshold: str) -> bool:
-    """输出里是否存在 >= threshold 的发现（CI / pre-commit 的闸门）。"""
+    """输出里是否存在 >= threshold 的发现（CI / pre-commit 的闸门）。
+
+    **必须容忍 markdown 装饰**：模型实际会写 `**[blocker] ...**`、
+    `- [major] ...`、`## [minor]`——旧实现只认"行首就是 ["，于是
+    blocker 被当成没看见、钩子放行（2026-11-09 真机抓到：退出码 0，
+    报告里明明有 `**[blocker]`）。判据只认行首那一段装饰后的标记，
+    正文里提到 "[blocker] 这个词" 不算发现。
+    """
 
     rank = _SEVERITY[threshold]
     for line in output.splitlines():
-        match = re.match(r"\s*\[(blocker|major|minor)\]", line, re.I)
+        match = _SEVERITY_LINE.match(line)
         if match and _SEVERITY[match.group(1).lower()] <= rank:
             return True
     return False

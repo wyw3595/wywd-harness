@@ -123,7 +123,7 @@ scripts/            壳层与入口
   sync_reviewer_config.py  reviewer 配置：本地 .workbuddy ↔ CI 副本
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              913 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              915 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始

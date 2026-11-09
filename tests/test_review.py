@@ -88,6 +88,24 @@ class CollectDiffTests(unittest.TestCase):
         self.assertFalse(review.severity_at_least("[minor] b:2 — y", "major"))
         self.assertFalse(review.severity_at_least("没有发现", "blocker"))
 
+    def test_severity_gate_tolerates_markdown(self) -> None:
+        """模型实际会加粗/列点：`**[blocker]` 必须真的挡住（真机踩过）。"""
+
+        cases = (
+            ("**[blocker] a:1 — x**", "blocker"),
+            ("- [major] b:2 — y", "major"),
+            ("1. [minor] c:3 — z", "minor"),
+            ("## [BLOCKER] d:4 — w", "blocker"),
+        )
+        for line, threshold in cases:
+            with self.subTest(line=line):
+                self.assertTrue(review.severity_at_least(line, threshold))
+
+    def test_severity_gate_ignores_inline_mentions(self) -> None:
+        # 正文里复述级别词不是一条发现——闸门只看行首的标记。
+        self.assertFalse(review.severity_at_least(
+            "这条说明里提到 [blocker] 这个词，但没有发现。", "blocker"))
+
     def test_task_headers_follow_scope(self) -> None:
         self.assertIn("未提交", review.build_task("a", "b", "s", "d",
                                                  scope="worktree"))
