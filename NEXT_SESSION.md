@@ -3324,3 +3324,28 @@ s18 此前只做了“人格叠加”：`tools_config` 在 sidecar 是死代码�
 注：中途一次全量测试报 13,878 秒，是机器休眠把墙钟算进去了；重跑 23 秒。
 改动未提交。
 
+# 2026-11-09：reviewer UI 入口（选择器 + 只读徽标 + 快捷审查）
+
+- `GET /api/experts`：sidecar `expert/list` 透传；专家摘要新增
+  `disabled_tools` / `read_only`（bash + 三个写工具全摘才算只读，徽标
+  不靠名字猜）；
+- `SessionRecord.summary()` 带 `expertId`：侧栏行尾显示专家名，聊天头部
+  显示专家徽标；reviewer 再加一个「只读」徽标；
+- 侧栏新建区加专家选择器（普通会话 / 已安装专家），create 透传 expertId；
+  没装 reviewer 包时「审查」按钮不出现（点了必然报错，不如不摆）；
+- `POST /api/review`：服务端用 `review.collect_diff` 收集当前工作区
+  `HEAD~1..HEAD` 的 diff → `new_session("reviewer", cwd=目标仓库)` →
+  返回 `{sessionId, message}`；前端 `openSession` 后走**正常 send**，
+  用户气泡 / posting / SSE 与普通消息同一条路径（不在后端抢跑提交）；
+- reviewer 会话的沙箱根指到目标仓库，diff 之外还能 `fs_read` 读改动附近
+  文件；仍是只读工具集（无 bash/写文件/编辑）；
+- 测试 +5（专家只读摘要、`/api/experts`、review 正常/非 git/空 diff），
+  全量 **887 条 OK（含 2 skip）**；
+- 前端 smoke 新增 5b/5c 两段：选 reviewer 建会话 → 清单/顶部徽标；
+  点「审查」→ 只读会话 + diff 任务已提交；顺手修正 SSE 检查把
+  `after=0` 一次性重建误判成轮询（`restores=2, polls=0`）。全部通过。
+
+边界：review 默认审 `HEAD~1..HEAD`（最近一次提交），不是工作区未提交
+改动；要审未提交改动得另开参数。reviewer 评测仍是 3/4，UI 徽标只承诺
+“只读”，不承诺“审得全”。改动未提交。
+
