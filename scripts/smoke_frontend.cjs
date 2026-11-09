@@ -490,9 +490,14 @@ function connect(url) {
   await check("事件走 SSE 长连，不再有轮询请求", `(() => {
     const hits = ${JSON.stringify(requests)}.filter((u) => u.includes('/api/events'));
     const streams = hits.filter((u) => u.includes('/stream'));
-    const polls = hits.filter((u) => !u.includes('/stream'));
+    // after=0 是 openSession 的一次性“重建上一轮结局”，不是轮询；
+    // 它每个会话只发一次，允许存在（之前把它误算成 poll，测试自己红）。
+    const restores = hits.filter((u) => u.includes('after=0'));
+    const polls = hits.filter((u) => !u.includes('/stream')
+                                 && !u.includes('after=0'));
     return { ok: streams.length > 0 && polls.length === 0,
-             streams: streams.length, polls: polls.length, sample: streams[0] || null };
+             streams: streams.length, polls: polls.length,
+             restores: restores.length, sample: streams[0] || null };
   })()`);
   await check("关掉当前会话 → 输入栏锁住、历史仍可读", `(async () => {
     const cur = document.getElementById('chat-sid').textContent;
@@ -517,6 +522,62 @@ function connect(url) {
     const forget = await post({ action: 'forget', sid: cur });
     return { ok: close.ok === true && forget.ok === true, sid: cur,
              close: close.detail, forget: forget.detail };
+  })()`);
+
+  console.log("== 5b. 专家选择器与只读徽标（s18，2026-11-08）==");
+  await check("选 reviewer 新建 → 会话行/顶部有专家与只读徽标", `(async () => {
+    const picker = document.getElementById('expert-picker');
+    if (!picker) return { ok: false, why: '没有专家选择器' };
+    const options = [...picker.options].filter((o) => o.value);
+    if (!options.length) return { ok: true, skipped: '没有安装专家包' };
+    const target = options.find((o) => /只读/.test(o.textContent)) || options[0];
+    picker.value = target.value;
+    picker.dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 60));
+    document.getElementById('btn-create').click();
+    await new Promise(r => setTimeout(r, 1200));
+    const sid = document.getElementById('chat-sid').textContent;
+    const chip = document.getElementById('expert-chip');
+    const ro = document.getElementById('readonly-chip');
+    const row = [...document.querySelectorAll('#session-list .row')]
+      .find((r) => r.textContent.includes(sid));
+    const expertName = target.textContent.replace('（只读）', '').trim();
+    const wantsRo = /只读/.test(target.textContent);
+    const ok = !!chip && chip.textContent.includes(expertName)
+      && (!wantsRo || (!!ro && ro.textContent.includes('只读')))
+      && !!row && row.textContent.includes(expertName);
+    const post = (body) => fetch('/api/sessions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json',
+                                 'X-Wywd-Ui': '1' },
+      body: JSON.stringify(body) }).then((r) => r.json());
+    await post({ action: 'close', sid });
+    await post({ action: 'forget', sid });
+    return { ok, sid, expert: expertName,
+             chip: chip ? chip.textContent : '',
+             ro: ro ? ro.textContent : '', row: !!row };
+  })()`);
+
+  console.log("== 5c. 快捷审查（2026-11-08）==");
+  await check("点「审查」→ 只读 reviewer 会话，diff 任务已提交", `(async () => {
+    const btn = document.getElementById('btn-review');
+    if (!btn) return { ok: true, skipped: '没有 reviewer 专家包' };
+    btn.click();
+    await new Promise(r => setTimeout(r, 2500));
+    const sid = document.getElementById('chat-sid').textContent;
+    const chip = document.getElementById('expert-chip');
+    const ro = document.getElementById('readonly-chip');
+    const text = document.getElementById('messages').textContent;
+    const ok = !!chip && chip.textContent.includes('只读代码审查员')
+      && !!ro && ro.textContent.includes('只读')
+      && text.includes('请审查 HEAD~1..HEAD');
+    const post = (body) => fetch('/api/sessions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json',
+                                 'X-Wywd-Ui': '1' },
+      body: JSON.stringify(body) }).then((r) => r.json());
+    await post({ action: 'close', sid });
+    await post({ action: 'forget', sid });
+    return { ok, sid, chip: chip ? chip.textContent : '',
+             ro: ro ? ro.textContent : '', task: text.includes('请审查') };
   })()`);
 
   console.log("== 6. 报错可见性（后端拒绝这一轮时用户看得见）==");

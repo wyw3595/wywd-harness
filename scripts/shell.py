@@ -518,6 +518,15 @@ class SidecarShell:
 
         return self._result(self._client.call("session/list"))
 
+    def expert_list(self) -> dict:
+        """专家目录（s18）：给 UI 的新建会话选择器。
+
+        摘要里带 read_only / disabled_tools，前端据此画只读徽标——
+        徽标不靠专家名字猜，和运行时收窄同一份声明。
+        """
+
+        return self._result(self._client.call("expert/list"))
+
     def messages(self, sid: str = "") -> dict:
         """读一个会话的完整消息历史（历史重放/审计用；closed 也能读）。
 
@@ -614,11 +623,14 @@ class SidecarShell:
         return self._result(self._client.call("session/forget",
               {"sessionId": target}))
 
-    def _create_session_remote(self, expert_id: str = "") -> str:
+    def _create_session_remote(self, expert_id: str = "",
+                               cwd: str = "") -> str:
         """让 sidecar 建个会话并取回 id。
 
         expert_id 可选（s18）：非空时随 session/create 透传，sidecar 会把
-        专家人格写成一条 system 消息进转录。空串 = 不带专家（老行为）。
+        专家人格写成一条 system 消息进转录。
+        cwd 可选：显式指定会话沙箱根（代码审查要读目标仓库，不是壳当前
+        目录）；空串维持老行为（用壳的 _cwd / 装配默认）。
 
         失败抛 RuntimeError（带上 sidecar 的人话）而不是让 KeyError 穿透：
         `["result"]["sessionId"]` 在 error 响应上会炸穿 HTTP handler，
@@ -629,7 +641,9 @@ class SidecarShell:
         params: dict = {"mode": "craft"}
         if expert_id:
             params["expertId"] = expert_id
-        if self._cwd:
+        if cwd:
+            params["cwd"] = cwd
+        elif self._cwd:
             params["cwd"] = self._cwd
         data = self._result(self._client.call("session/create", params))
         if "error" in data or not data.get("sessionId"):
@@ -650,11 +664,12 @@ class SidecarShell:
         self._sid = sid
         return sid
 
-    def new_session(self, expert_id: str = "") -> str:
+    def new_session(self, expert_id: str = "", cwd: str = "") -> str:
         """另开一个新会话并切换为当前——旧的只 close（记录保留），不 forget。
 
         expert_id（s18 可选）非空时让 sidecar 在建会话时激活专家；空串
         维持老行为（无专家）。专家包只能收窄工具，不会多给能力。
+        cwd 可选：代码审查要把沙箱根设到目标仓库（不是壳当前目录）。
 
         与 clear()（close→forget→create 全清）的区别：新建是"开个新的，
         旧的留档"；旧记录还要不要，留给用户用 /forget 决定。
@@ -663,7 +678,7 @@ class SidecarShell:
 
         if self._sid:
             self._client.call("session/close", {"sessionId": self._sid})
-        sid = self._create_session_remote(expert_id)
+        sid = self._create_session_remote(expert_id, cwd=cwd)
         self._sid = sid
         return sid
 

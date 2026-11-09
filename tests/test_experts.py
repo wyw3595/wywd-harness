@@ -94,6 +94,16 @@ class PackageContractTests(unittest.TestCase):
         summary = _package().summary()
         self.assertEqual(summary["expert_id"], "architect")
         self.assertNotIn("system_prompt", summary)  # 正文很贵，清单不带
+        self.assertEqual(summary["disabled_tools"], ["bash"])
+        self.assertFalse(summary["read_only"])      # 只摘 bash 不算只读
+
+    def test_summary_flags_full_read_only(self) -> None:
+        summary = _package(tools_config={
+            "disabled_tools": ["bash", "fs_write", "fs_edit", "memory_write"],
+        }).summary()
+        self.assertTrue(summary["read_only"])
+        self.assertEqual(summary["disabled_tools"],
+                         ["bash", "fs_edit", "fs_write", "memory_write"])
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -164,6 +164,8 @@ class SessionRecord:
             "runtimeGeneration": self.runtime_generation,
             "messages": len(self.messages),
             "lastError": self.last_error,
+            # s18：UI 靠它显示专家徽标/只读标记（空串 = 普通会话）。
+            "expertId": self.expert_id,
         }
 
 

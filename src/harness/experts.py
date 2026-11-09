@@ -156,13 +156,21 @@ class ExpertPackage:
                 "（expert_id / name / system_prompt）") from error
 
     def summary(self) -> dict:
-        """给 UI/清单的不透明摘要（不含正文——正文很贵）。"""
+        """给 UI/清单的不透明摘要（不含正文——正文很贵）。
 
+        read_only（2026-11-08）：同时摘掉 bash 与三个写工具才算只读。
+        UI 的徽标不能靠专家名字猜——包是本地可改的，声明与展示必须同源。
+        """
+
+        disabled = set(self.tools_config.disabled)
         return {
             "expert_id": self.expert_id,
             "name": self.name,
             "category": self.category,
             "description": self.description,
+            "disabled_tools": sorted(disabled),
+            "read_only": {"bash", "fs_write", "fs_edit",
+                          "memory_write"} <= disabled,
         }
 
 

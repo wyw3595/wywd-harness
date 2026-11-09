@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -48,12 +49,22 @@ class FakeShell:
         self.stopped: list[str] = []
         self.paused: list[str] = []
         self.ops: list[tuple[str, str]] = []
+        self.last_cwd: str = ""                # 代码审查把沙箱根指到目标仓库
         self.zip_existed: bool | None = None   # set_workspace 那刻 zip 在不在盘上
 
     def sessions(self) -> dict:
         return {"sessions": copy.deepcopy(self._rows)}
 
-    def new_session(self, expert_id: str = "") -> str:
+    def expert_list(self) -> dict:
+        return {"experts": [{
+            "expert_id": "reviewer", "name": "只读代码审查员",
+            "category": "软件开发", "description": "只审 diff",
+            "disabled_tools": ["bash", "fs_edit", "fs_write", "memory_write"],
+            "read_only": True,
+        }]}
+
+    def new_session(self, expert_id: str = "", cwd: str = "") -> str:
+        self.last_cwd = cwd
         self.ops.append(("new_session", expert_id))
         return "sess_0099"
 
@@ -148,13 +159,71 @@ class WebAppActionsTests(unittest.TestCase):
     def test_create_forwards_expert_id(self) -> None:
         """s18 专家激活：create 带 expertId 时要透传到壳。
 
-        UI 还没有专家选择器（reviewer CLI 先走 API），但通道必须先打通；
-        假壳在这里充当"传参有没有丢"的见证者。
+        UI 选择器与 CLI 走同一条通道；假壳在这里充当“传参有没有丢”的见证者。
         """
 
         result = self.app.action("create", "", "reviewer")
         self.assertTrue(result["ok"])
         self.assertEqual(self.shell.ops, [("new_session", "reviewer")])
+
+    def test_experts_passthrough(self) -> None:
+        data = WebApp(shell=FakeShell([])).experts()
+        self.assertEqual(data["experts"][0]["expert_id"], "reviewer")
+        self.assertTrue(data["experts"][0]["read_only"])
+
+    def _git_repo(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        env = {**os.environ,
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", str(repo), *args], check=True,
+                           capture_output=True, text=True, env=env)
+
+        git("init", "-q")
+        (repo / "a.txt").write_text("one\n", encoding="utf-8")
+        git("add", ".")
+        git("commit", "-q", "-m", "one")
+        (repo / "a.txt").write_text("two\n", encoding="utf-8")
+        git("add", ".")
+        git("commit", "-q", "-m", "two")
+        return repo
+
+    def test_review_prepares_read_only_session_with_diff(self) -> None:
+        """快捷审查：建 reviewer 会话、cwd 指到仓库、返回带真 diff 的任务。"""
+
+        repo = self._git_repo()
+        result = self.app.review({"cwd": str(repo)})
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.shell.ops, [("new_session", "reviewer")])
+        self.assertEqual(self.shell.last_cwd, str(repo))
+        self.assertEqual(result["sessionId"], "sess_0099")
+        message = result["message"]
+        self.assertIn("-one", message)
+        self.assertIn("+two", message)
+        self.assertIn("集成检查", message)
+        # 提交交给前端正常 send（用户气泡/posting 同一条路径），这里不抢跑。
+        self.assertEqual(self.shell.submitted, [])
+
+    def test_review_reports_non_git_workspace(self) -> None:
+        # 不能放在仓库内：git 会向上发现父仓库，把 HEAD~1..HEAD 当成“有改动”
+        tmp = tempfile.TemporaryDirectory(dir=str(Path.home()))
+        self.addCleanup(tmp.cleanup)
+        result = self.app.review({"cwd": tmp.name})
+        self.assertIn("error", result)
+        self.assertIn("git", result["error"])
+        self.assertEqual(self.shell.submitted, [])
+
+    def test_review_rejects_empty_diff(self) -> None:
+        repo = self._git_repo()
+        result = self.app.review({"cwd": str(repo), "base": "HEAD",
+                                  "head": "HEAD"})
+        self.assertIn("没有可审的 diff", result["error"])
+        self.assertEqual(self.shell.submitted, [])
 
     def test_close_resume_forget(self) -> None:
         close = self.app.action("close", "sess_0001")

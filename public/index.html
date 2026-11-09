@@ -90,6 +90,7 @@
     #sidebar.collapsed #btn-create,
     #sidebar.collapsed #btn-refresh,
     #sidebar.collapsed .sb-search,
+    #sidebar.collapsed .sb-expert,
     #sidebar.collapsed #session-list,
     #sidebar.collapsed .sb-foot{display:none}
     #sidebar.collapsed .sb-head{justify-content:center;padding:0}
@@ -115,6 +116,19 @@
   }
   .sb-search input::placeholder{color:var(--tx3)}
   .sb-search input:focus{border-color:var(--tx3)}
+  .sb-expert{display:flex;gap:6px;padding:0 10px 8px}
+  .sb-expert select{
+    flex:1;min-width:0;background:var(--surface);color:var(--tx);
+    border:1px solid var(--line);border-radius:9px;padding:5px 8px;
+    font-size:12px;outline:none;font-family:inherit;
+  }
+  .sb-expert select:focus{border-color:var(--tx3)}
+  .mini-btn{
+    border:1px solid var(--line);background:var(--surface);color:var(--tx2);
+    border-radius:9px;padding:0 10px;font-size:12px;cursor:pointer;
+    font-family:inherit;flex:0 0 auto;
+  }
+  .mini-btn:hover{background:var(--panel-hover);color:var(--tx)}
   #session-list{flex:1;overflow-y:auto;padding:0 8px 8px}
   .row{padding:7px 9px;border-radius:9px;margin-bottom:2px;cursor:pointer;
     border:1px solid transparent}
@@ -128,6 +142,9 @@
     border:1px solid var(--line)}
   .row.cur .badge{background:var(--user-bg)}
   .badge.off{color:var(--tx3)}
+  .badge.exp{color:var(--tx2)}
+  .badge.ro{color:#b45309;border-color:#f59e0b66;background:#f59e0b14}
+  .row .r-expert{color:var(--tx2)}
   .row .r-meta{color:var(--tx3);font-size:11px;margin-top:2px;
     word-break:break-all;font-variant-numeric:tabular-nums}
   .row .r-ops{margin-top:5px;display:none;gap:4px}

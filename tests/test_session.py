@@ -91,11 +91,12 @@ class SessionRecordTests(unittest.TestCase):
         self.assertEqual(
             set(summary.keys()),
             {"id", "cwd", "title", "status", "mode", "runtimeGeneration",
-             "messages", "lastError"},
+             "messages", "lastError", "expertId"},
         )
         self.assertEqual(summary["messages"], 1)       # 只有条数，不是列表本身
         self.assertEqual(summary["status"], "creating")
         self.assertEqual(summary["runtimeGeneration"], 1)
+        self.assertEqual(summary["expertId"], "")      # 普通会话
 
 
 class InMemorySessionStoreTests(unittest.TestCase):

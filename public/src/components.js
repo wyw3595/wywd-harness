@@ -17,9 +17,12 @@ import {
   costLine,
   costTitle,
   createSession,
+  expertById,
+  expertName,
   notify,
   pauseTurn,
   refreshSessions,
+  reviewChanges,
   runAction,
   selectSession,
   send,
@@ -124,6 +127,10 @@ export const SessionList = {
     // 过滤后的行：搜索词在 ui 里（本 tab 的视图状态），过滤是纯函数
     const rows = computed(() => filterRows(state.sessions, ui.search));
 
+    // 没装 reviewer 专家包就不摆“审查”按钮——点了必然报错，不如不摆。
+    const hasReviewer = computed(() =>
+      state.experts.some((e) => e.expert_id === "reviewer"));
+
     // 底部"项目"标识 = 当前会话的工作目录（Codex 把项目空间挂在侧栏底部）
     const cwd = computed(() => {
       const row = state.sessions.find((r) => r.id === state.sid) ||
@@ -143,6 +150,7 @@ export const SessionList = {
     }
 
     return { state, ui, rows, cwd, armed, onForget, createSession,
+             expertName, reviewChanges, hasReviewer,
              refreshSessions, runAction, selectSession, toggleSidebar,
              toggleDrawer };
   },
@@ -166,6 +174,17 @@ export const SessionList = {
         <input id="search" v-model="ui.search" type="search" autocomplete="off"
                placeholder="搜索会话" aria-label="按 id 或状态过滤会话">
       </div>
+      <div class="sb-expert" v-if="!ui.sidebarCollapsed">
+        <select id="expert-picker" v-model="state.newExpert"
+                aria-label="新建会话使用的专家">
+          <option value="">普通会话</option>
+          <option v-for="e in state.experts" :key="e.expert_id"
+                  :value="e.expert_id">{{ e.name }}{{ e.read_only ? '（只读）' : '' }}</option>
+        </select>
+        <button id="btn-review" v-if="hasReviewer" type="button" class="mini-btn"
+                title="审查当前工作区改动：开一个只读 reviewer 会话"
+                aria-label="审查当前工作区改动" @click="reviewChanges">审查</button>
+      </div>
       <div id="session-list" role="list">
         <div v-if="state.listError" class="err">{{ state.listError }}</div>
         <div v-else-if="!rows.length" class="empty">{{ ui.search ? '没有匹配的会话' : (state.listLoading ? '清单加载中…（后端正忙，跑完这轮就好）' : '还没有会话，点 ＋ 开始') }}</div>
@@ -178,7 +197,7 @@ export const SessionList = {
               <span v-else-if="row.live" class="badge">live</span>
               <span v-else class="badge off">closed</span>
             </div>
-            <div class="r-meta">{{ row.id }} &#183; {{ row.status }} &#183; gen={{ row.generation }} &#183; {{ row.count }} 条</div>
+            <div class="r-meta">{{ row.id }} &#183; {{ row.status }} &#183; gen={{ row.generation }} &#183; {{ row.count }} 条<span v-if="row.expertId" class="r-expert" :title="'专家：' + expertName(row.expertId)"> &#183; {{ expertName(row.expertId) }}</span></div>
             <div class="r-ops" @click.stop>
               <button v-if="row.live" type="button" :aria-label="'关闭会话 ' + row.id" @click="runAction('close', row.id)">关</button>
               <button v-else type="button" :aria-label="'复活会话 ' + row.id" @click="runAction('resume', row.id)">活</button>
@@ -322,6 +341,13 @@ export const ChatArea = {
     // 页面上只露最终回答，过程默认收起、点开逐条看。
     const rendered = computed(() => groupTurns(state.messages));
 
+    // 当前会话的专家（s18）：头部徽标 / 只读标记；null = 普通会话。
+    // 从清单行取，不再单独查一次接口——清单已经是唯一真源。
+    const currentExpert = computed(() => {
+      const row = state.sessions.find((r) => r.id === state.sid);
+      return row ? expertById(row.expertId) : null;
+    });
+
     function toBottom() {
       nextTick(() => {
         const el = box.value;
@@ -372,8 +398,8 @@ export const ChatArea = {
     }
 
     return { state, ui, canSend, costLine, costTitle, draft, box, inputEl,
-             rendered, atBottom, onScroll, toBottom, autoGrow, submit,
-             stopTurn, pauseTurn, toggleDrawer, onLiveToggle };
+             rendered, currentExpert, atBottom, onScroll, toBottom, autoGrow,
+             submit, stopTurn, pauseTurn, toggleDrawer, onLiveToggle };
   },
 
   template: `
@@ -384,6 +410,10 @@ export const ChatArea = {
                     : (state.streamUp === false ? '事件流断开，浏览器重连中' : '事件流连接中')"></span>
         <template v-if="state.sid">会话 <b id="chat-sid">{{ state.sid }}</b></template>
         <span v-else class="tb-ghost">未选择会话</span>
+        <span id="expert-chip" v-if="currentExpert" class="badge exp"
+              :title="currentExpert.description || currentExpert.name">{{ currentExpert.name }}</span>
+        <span id="readonly-chip" v-if="currentExpert && currentExpert.read_only"
+              class="badge ro" title="工具已收窄：无 bash / 写文件 / 编辑">只读</span>
         <span id="cost-line" v-if="costLine" :title="costTitle">{{ costLine }}</span>
         <button id="btn-drawer" type="button" class="icon-btn"
                 :aria-expanded="ui.drawerOpen ? 'true' : 'false'"
@@ -458,7 +488,7 @@ export const ChatArea = {
                       stroke="currentColor" stroke-width="1.4"/>
               </svg>
               <p class="te-title">Harness Agent</p>
-              <p class="te-sub">从左侧选一个会话，或点 ＋ 新建；然后在下面描述你的任务。</p>
+              <p class="te-sub">从左侧选一个会话，或点 ＋ 新建（可先选专家）；点「审查」让只读审查员看当前工作区的 diff。</p>
             </div>
             <div v-if="state.chatError" class="msg notice lv-error">
               <span class="n-tag">读不到历史</span>

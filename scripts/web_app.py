@@ -77,6 +77,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from scripts import native_dialog             # noqa: E402
 from scripts.shell import SidecarShell          # noqa: E402
+from scripts.review import collect_diff         # noqa: E402
 from src.harness.jsonl_store import JsonlSessionStore  # noqa: E402
 from src.harness.session import (              # noqa: E402
     SessionLifecycleError,
@@ -423,6 +424,63 @@ class WebApp:
         """清单走 RPC（live 是 sidecar 进程内 _runtimes 的事实）。"""
 
         return self.shell.sessions()
+
+    def experts(self) -> dict:
+        """专家目录（s18）：UI 的新建会话选择器 + 只读徽标。"""
+
+        return self.shell.expert_list()
+
+    def review(self, request: dict) -> dict:
+        """审查当前工作区改动：收集 diff → 建只读审查会话 → 返回任务文本。
+
+        2026-11-08 UI 入口。diff 由服务端收集（reviewer 没有 bash，不能自己
+        跑 git）；会话 cwd 指到目标仓库，这样它还能 fs_read 读改动附近文件。
+        返回 {sessionId, message}；前端走正常 send 流程提交（用户气泡、
+        posting、SSE 与普通消息同一条路径）。
+        """
+
+        payload = request or {}
+        base = str(payload.get("base") or "HEAD~1").strip()
+        head = str(payload.get("head") or "HEAD").strip()
+        path = str(payload.get("path") or "").strip()
+        cwd = str(payload.get("cwd") or "").strip()
+        if not cwd:
+            info = self.shell.workspace() or {}
+            workspace = info.get("workspace") or {}
+            cwd = str(workspace.get("root") or info.get("cwd") or "")
+        repo = Path(cwd).resolve() if cwd else None
+        if repo is None or not repo.is_dir():
+            return {"error": "当前工作区不可用：先选一个目录（侧栏底部）"}
+
+        try:
+            stat, body, truncated = collect_diff(repo, base, head, path)
+        except (OSError, RuntimeError) as exc:
+            return {"error": f"取 diff 失败（不是 git 仓库或区间不合法）：{exc}"}
+        if not body.strip():
+            return {"error": "没有可审的 diff：当前工作区不是 git 仓库，"
+                             "或这个区间没有改动"}
+
+        note = "\n（diff 被截断，未展示的部分按需读文件）" if truncated else ""
+        task = (
+            f"请审查 {base}..{head} 的改动。\n\n"
+            f"仓库：{repo}\n\n变更统计：\n{stat or '（无）'}\n\n"
+            f"diff：{note}\n```diff\n{body}\n```\n\n"
+            "先按系统提示里的集成检查走一遍（调用方/邻居、契约两端、"
+            "落盘目录、数据来源、实时/历史），再逐条看 diff。"
+            "diff 已完整给出：读 2-4 个文件就下结论，不要通读仓库。\n"
+            "输出要求：每条一行 `[severity] file:line — 一句话`，下面 2-4 行；"
+            "severity 用 blocker / major / minor；只报改动行；"
+            "没有发现就写「没有发现」；不要修改任何文件。"
+        )
+        try:
+            sid = self.shell.new_session("reviewer", cwd=str(repo))
+        except Exception as exc:          # 缺 reviewer 包 / 会话建不起来
+            return {"error": f"审查会话起不来：{exc}"}
+        # 不在这里 submit：前端拿 message 走正常 send 流程（用户气泡、
+        # posting 状态、SSE 都由那条路径统一处理），避免“提交了但界面
+        # 还没看到用户消息”的竞态。
+        return {"ok": True, "sessionId": sid, "message": task,
+                "detail": f"已开 {sid}，准备审查"}
 
     def action(self, action: str, sid: str = "",
                expert_id: str = "") -> dict:
@@ -966,6 +1024,10 @@ def create_app(web: Optional[WebApp] = None) -> FastAPI:
     def get_sessions(web: WebApp = Depends(get_web)) -> JSONResponse:
         return JSONResponse(web.sessions())
 
+    @app.get("/api/experts")
+    def get_experts(web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.experts())
+
     @app.get("/api/sessions/{sid}/messages")
     def get_messages(sid: str, web: WebApp = Depends(get_web)) -> JSONResponse:
         return JSONResponse(web.messages(sid))
@@ -1042,6 +1104,11 @@ def create_app(web: Optional[WebApp] = None) -> FastAPI:
         return JSONResponse(web.action(payload.get("action", ""),
                                        payload.get("sid", ""),
                                        payload.get("expertId", "")))
+
+    @app.post("/api/review")
+    def post_review(payload: dict = Depends(_json_body),
+                    web: WebApp = Depends(get_web)) -> JSONResponse:
+        return JSONResponse(web.review(payload))
 
     @app.post("/api/sessions/{sid}/messages")
     def post_message(sid: str, payload: dict = Depends(_json_body),

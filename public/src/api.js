@@ -40,8 +40,20 @@ export function listSessions() {
 }
 
 /** action ∈ create | close | resume | forget */
-export function sessionAction(action, sid = "") {
-  return post("/api/sessions", { action, sid });
+export function sessionAction(action, sid = "", expertId = "") {
+  const body = { action, sid };
+  if (expertId) body.expertId = expertId;   // s18：不带就不发，老请求形状不变
+  return post("/api/sessions", body);
+}
+
+/** 专家目录（s18）：新建会话选择器 + 只读徽标的数据源。 */
+export function listExperts() {
+  return get("/api/experts");
+}
+
+/** 快捷审查：服务端收集当前工作区 diff，开只读 reviewer 会话并提交任务。 */
+export function startReview(payload = {}) {
+  return post("/api/review", payload);
 }
 
 // ── 历史（纯读，不经过 sidecar RPC）──────────────────────

@@ -42,6 +42,8 @@ export const state = reactive({
   listError: "",      // 清单拉取失败（显示在侧边栏）
   listLoading: true,  // 清单在途（2026-09-23：区分"还没拉到"和"真的没有"——
                       // turn 阻塞期间清单 GET 排队，不能显示"还没有会话"撒谎）
+  experts: [],        // 专家目录（s18）：新建选择器 + 只读徽标
+  newExpert: "",      // 新建会话选中的专家 id（空 = 普通会话）
   posting: false,     // 正在等一轮 turn 结束
   stopping: false,    // 已请求停止、等 turn 收场（按钮变"停止中…"）
   pausing: false,     // 已请求暂停、等 turn 收场（按钮变"暂停中…"）
@@ -148,6 +150,7 @@ function normalizeRow(raw) {
     generation: raw.runtimeGeneration || 1,
     count: raw.messages || 0,
     cwd: raw.cwd || "",          // 侧栏底部的"项目"标识
+    expertId: raw.expertId || "",  // s18：空串 = 普通会话
   };
 }
 
@@ -220,12 +223,48 @@ export async function refreshStatus(includeLogs = false) {
 
 export async function createSession() {
   try {
-    const res = await api.sessionAction("create");
+    const res = await api.sessionAction("create", "", state.newExpert);
     if (res && res.ok) {
       await openSession(res.sessionId);
       refreshSessions();
     } else {
       notify((res && res.detail) || "新建失败");
+    }
+  } catch (err) {
+    notify("后端没响应");
+  }
+}
+
+/** 专家目录（s18）：失败不打扰用户——选择器留空即可，会话照常能建。 */
+export async function refreshExperts() {
+  try {
+    const data = await api.listExperts();
+    state.experts = Array.isArray(data.experts) ? data.experts : [];
+  } catch (err) {
+    state.experts = [];
+  }
+}
+
+export function expertById(id) {
+  if (!id) return null;
+  return state.experts.find((item) => item.expert_id === id) || null;
+}
+
+export function expertName(id) {
+  const expert = expertById(id);
+  return expert ? expert.name : (id || "");
+}
+
+/** 快捷审查（2026-11-08）：服务端收集 diff，开 reviewer 会话，
+    再走正常 send 流程提交——用户气泡/posting/SSE 不另起一套。 */
+export async function reviewChanges() {
+  try {
+    const res = await api.startReview({});
+    if (res && res.ok) {
+      await openSession(res.sessionId);
+      await send(res.message);
+    } else {
+      notify((res && res.error) || "审查没起来");
     }
   } catch (err) {
     notify("后端没响应");
@@ -909,6 +948,7 @@ let listTimer = null;
 
 export function start() {
   refreshSessions();
+  refreshExperts();            // 专家目录一次就够；建会话前失败也不阻塞
   refreshStatus();
   refreshWorkspace();
   listTimer = setInterval(refreshSessions, LIST_INTERVAL);
