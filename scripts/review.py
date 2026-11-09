@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -64,22 +65,71 @@ def _run_git(repo: Path, *args: str) -> str:
     return proc.stdout
 
 
-def collect_diff(repo: Path, base: str, head: str = "HEAD",
-                 path: str = "") -> tuple[str, str, bool]:
-    """(stat, diff, 是否截断)。path 非空时只看该路径。"""
+def _path_args(path: str) -> list[str]:
+    return ["--", path] if path else []
 
-    stat_args = ["diff", "--stat", f"{base}..{head}"]
-    diff_args = ["diff", "-U3", f"{base}..{head}"]
-    if path:
-        stat_args += ["--", path]
-        diff_args += ["--", path]
-    stat = _run_git(repo, *stat_args).strip()
-    body = _run_git(repo, *diff_args).rstrip()
+
+def _finish(stat: str, body: str) -> tuple[str, str, bool]:
     truncated = len(body) > MAX_DIFF_CHARS
     if truncated:
         body = (body[:MAX_DIFF_CHARS]
                 + f"\n…（diff 被截断，原始 {len(body)} 字符；需要的文件请自己读）")
     return stat, body, truncated
+
+
+def _collect(repo: Path, diff_args: list[str],
+             path: str = "") -> tuple[str, str]:
+    stat = _run_git(repo, *diff_args, "--stat", *_path_args(path)).strip()
+    body = _run_git(repo, *diff_args, "-U3", *_path_args(path)).rstrip()
+    return stat, body
+
+
+def collect_diff(repo: Path, base: str, head: str = "HEAD",
+                 path: str = "") -> tuple[str, str, bool]:
+    """(stat, diff, 是否截断)。path 非空时只看该路径。"""
+
+    stat, body = _collect(repo, ["diff", f"{base}..{head}"], path)
+    return _finish(stat, body)
+
+
+def collect_staged_diff(repo: Path, path: str = "") -> tuple[str, str, bool]:
+    """已暂存的改动（pre-commit 用：即将进入这次提交的内容）。"""
+
+    stat, body = _collect(repo, ["diff", "--cached"], path)
+    return _finish(stat, body)
+
+
+def collect_worktree_diff(repo: Path, path: str = "") -> tuple[str, str, bool]:
+    """工作区未提交的改动（相对 HEAD）：staged + unstaged + 未跟踪文件清单。
+
+    `git diff HEAD` 已经同时包含已暂存与未暂存；未跟踪文件不在 diff 里，
+    只给清单（正文让 reviewer 按需 fs_read），不假装审过。
+    """
+
+    stat, body = _collect(repo, ["diff", "HEAD"], path)
+    untracked = _run_git(repo, "ls-files", "--others", "--exclude-standard",
+                         *_path_args(path)).strip()
+    if untracked:
+        listing = ("未跟踪文件（不在 diff 里，需要时用 fs_read 读）：\n"
+                   + "\n".join(f"- {line}" for line in untracked.splitlines()))
+        stat = (stat + "\n" + listing).strip()
+        body = (body + "\n\n" + listing).strip()
+    return _finish(stat, body)
+
+
+# 严重度从高到低；--fail-on blocker 只被 blocker 触发。
+_SEVERITY = {"blocker": 0, "major": 1, "minor": 2}
+
+
+def severity_at_least(output: str, threshold: str) -> bool:
+    """输出里是否存在 >= threshold 的发现（CI / pre-commit 的闸门）。"""
+
+    rank = _SEVERITY[threshold]
+    for line in output.splitlines():
+        match = re.match(r"\s*\[(blocker|major|minor)\]", line, re.I)
+        if match and _SEVERITY[match.group(1).lower()] <= rank:
+            return True
+    return False
 
 
 def filter_registry(registry: ToolRegistry,
@@ -126,10 +176,20 @@ def build_system_prompt(package: ExpertPackage, skill_body: str,
 
 
 def build_task(base: str, head: str, stat: str, body: str,
-               truncated: bool = False) -> str:
+               truncated: bool = False, scope: str = "commit",
+               repo: str = "") -> str:
+    """scope: commit（区间）/ worktree（未提交）/ staged（已暂存）。"""
+
     note = "\n（注意：diff 被截断，未展示的部分按需读文件）" if truncated else ""
+    if scope == "worktree":
+        header = "请审查工作区**未提交**的改动（相对 HEAD）。"
+    elif scope == "staged":
+        header = "请审查**已暂存**的改动（即将进入这次提交）。"
+    else:
+        header = f"请审查 {base}..{head} 的改动。"
+    where = f"\n仓库：{repo}" if repo else ""
     return (
-        f"请审查 {base}..{head} 的改动。\n\n"
+        f"{header}{where}\n\n"
         f"变更统计：\n{stat or '（无）'}\n\n"
         f"diff：{note}\n```diff\n{body or '（空）'}\n```\n\n"
         "输出要求：\n"
@@ -162,6 +222,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", default="HEAD~1", help="基线（默认 HEAD~1）")
     parser.add_argument("--head", default="HEAD", help="目标（默认 HEAD）")
     parser.add_argument("--path", default="", help="只看某个路径")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--staged", action="store_true",
+                      help="审已暂存的改动（pre-commit 钩子用）")
+    mode.add_argument("--worktree", action="store_true",
+                      help="审工作区未提交的改动（相对 HEAD）")
+    parser.add_argument("--fail-on", default="none",
+                        choices=("none", "blocker", "major", "minor"),
+                        help="发现 >= 该级别时返回 1（CI / 钩子闸门）")
     parser.add_argument("--repo", default=str(PROJECT_ROOT), help="仓库根")
     parser.add_argument("--config-dir", default="",
                         help="reviewer 专家包/技能所在目录（默认同 --repo；"
@@ -172,9 +240,21 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = Path(args.repo).resolve()
     config_dir = Path(args.config_dir).resolve() if args.config_dir else repo
-    stat, body, truncated = collect_diff(repo, args.base, args.head, args.path)
+    if args.staged:
+        scope = "staged"
+        label = "已暂存改动"
+        stat, body, truncated = collect_staged_diff(repo, args.path)
+    elif args.worktree:
+        scope = "worktree"
+        label = "未提交改动"
+        stat, body, truncated = collect_worktree_diff(repo, args.path)
+    else:
+        scope = "commit"
+        label = f"{args.base}..{args.head}"
+        stat, body, truncated = collect_diff(repo, args.base, args.head,
+                                             args.path)
     if not body.strip():
-        print("没有 diff（基线/目标相同，或该路径没有改动）")
+        print(f"没有 diff（{label}）")
         return 0
 
     workspace = Workspace(workspace_id="review", root=repo)
@@ -196,11 +276,12 @@ def main(argv: list[str] | None = None) -> int:
     history = [{"role": "system",
                 "content": build_system_prompt(package, skill_body, repo)}]
 
-    print(f"[review] {args.base}..{args.head}  {stat.splitlines()[0] if stat else '无改动'}")
+    print(f"[review] {label}  {stat.splitlines()[0] if stat else '无改动'}")
     print(f"[review] 工具收窄：摘掉 {', '.join(disabled) or '（无）'}", file=sys.stderr)
     try:
         result = run_agent(
-            build_task(args.base, args.head, stat, body, truncated),
+            build_task(args.base, args.head, stat, body, truncated,
+                       scope=scope, repo=str(repo)),
             model=build_model(registry),
             registry=registry,
             max_steps=args.max_steps,
@@ -241,14 +322,20 @@ def main(argv: list[str] | None = None) -> int:
     print(output)
     if args.out:
         Path(args.out).write_text(
-            f"# 代码审查：{args.base}..{args.head}\n\n{output}\n",
+            f"# 代码审查：{label}\n\n{output}\n",
             encoding="utf-8")
         print(f"[review] 报告已写入 {args.out}", file=sys.stderr)
     usage = result.usage or {}
     print(f"[review] 状态 {result.status}{'（强制定稿）' if forced else ''}；"
           f"tokens {usage.get('prompt_tokens', 0)}/{usage.get('completion_tokens', 0)}",
           file=sys.stderr)
-    return 0 if output.strip() else 1
+    if not output.strip():
+        return 1
+    if args.fail_on != "none" and severity_at_least(output, args.fail_on):
+        print(f"[review] 发现 >= {args.fail_on}，按 --fail-on 返回 1",
+              file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

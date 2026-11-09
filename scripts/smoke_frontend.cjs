@@ -561,6 +561,13 @@ function connect(url) {
   await check("点「审查」→ 只读 reviewer 会话，diff 任务已提交", `(async () => {
     const btn = document.getElementById('btn-review');
     if (!btn) return { ok: true, skipped: '没有 reviewer 专家包' };
+    // 用“最近提交”保证可复现：未提交改动在干净工作区可能是空的。
+    const scope = document.getElementById('review-scope');
+    if (scope) {
+      scope.value = 'commit';
+      scope.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise(r => setTimeout(r, 60));
+    }
     btn.click();
     await new Promise(r => setTimeout(r, 2500));
     const sid = document.getElementById('chat-sid').textContent;

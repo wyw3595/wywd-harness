@@ -60,6 +60,61 @@ class CollectDiffTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertIn("被截断", body)
 
+    def test_staged_diff_only_includes_staged(self) -> None:
+        (self.repo / "b.txt").write_text("staged\n", encoding="utf-8")
+        _git(self.repo, "add", "b.txt")
+        (self.repo / "a.txt").write_text("unstaged\n", encoding="utf-8")
+
+        _, body, _ = review.collect_staged_diff(self.repo)
+
+        self.assertIn("+staged", body)
+        self.assertNotIn("+unstaged", body)   # 没 add 的不能混进本次提交
+
+    def test_worktree_diff_includes_unstaged_and_untracked_listing(self) -> None:
+        (self.repo / "a.txt").write_text("worktree\n", encoding="utf-8")
+        (self.repo / "c.txt").write_text("untracked\n", encoding="utf-8")
+
+        stat, body, _ = review.collect_worktree_diff(self.repo)
+
+        self.assertIn("+worktree", body)
+        self.assertIn("-new", body)
+        self.assertIn("c.txt", stat)          # 未跟踪文件给清单
+        self.assertIn("未跟踪", body)
+
+    def test_severity_gate_levels(self) -> None:
+        output = "[blocker] a:1 — x\n[minor] b:2 — y\n"
+        self.assertTrue(review.severity_at_least(output, "blocker"))
+        self.assertTrue(review.severity_at_least(output, "major"))
+        self.assertFalse(review.severity_at_least("[minor] b:2 — y", "major"))
+        self.assertFalse(review.severity_at_least("没有发现", "blocker"))
+
+    def test_task_headers_follow_scope(self) -> None:
+        self.assertIn("未提交", review.build_task("a", "b", "s", "d",
+                                                 scope="worktree"))
+        self.assertIn("已暂存", review.build_task("a", "b", "s", "d",
+                                                 scope="staged"))
+        self.assertIn("a..b", review.build_task("a", "b", "s", "d"))
+
+
+class CiConfigTests(unittest.TestCase):
+    """CI 没有本地 .workbuddy：config/reviewer 那份必须能直接加载。"""
+
+    def test_tracked_reviewer_config_is_loadable(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "config" / "reviewer"
+        package = review.ExpertIndex(root).load("reviewer")
+        self.assertEqual(package.expert_id, "reviewer")
+        self.assertTrue(package.tools_config.disabled)
+        body = review.build_skill_index(root).load("code-review")
+        self.assertIn("评审", body)
+
+    def test_ci_workflow_has_review_job(self) -> None:
+        text = (Path(__file__).resolve().parents[1]
+                / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("review:", text)
+        self.assertIn("--config-dir config/reviewer", text)
+        self.assertIn("--fail-on blocker", text)
+        self.assertIn("DEEPSEEK_API_KEY", text)
+
 
 class FilterRegistryTests(unittest.TestCase):
     """专家包只能少给工具：disabled 必须在注册表上真的摘掉。"""

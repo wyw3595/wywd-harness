@@ -77,7 +77,11 @@ if _PROJECT_ROOT not in sys.path:
 
 from scripts import native_dialog             # noqa: E402
 from scripts.shell import SidecarShell          # noqa: E402
-from scripts.review import collect_diff         # noqa: E402
+from scripts.review import (                     # noqa: E402
+    build_task,
+    collect_diff,
+    collect_worktree_diff,
+)
 from src.harness.jsonl_store import JsonlSessionStore  # noqa: E402
 from src.harness.session import (              # noqa: E402
     SessionLifecycleError,
@@ -440,6 +444,9 @@ class WebApp:
         """
 
         payload = request or {}
+        scope = str(payload.get("scope") or "worktree").strip()
+        if scope not in ("worktree", "commit"):
+            return {"error": f"不认识的审查范围：{scope}"}
         base = str(payload.get("base") or "HEAD~1").strip()
         head = str(payload.get("head") or "HEAD").strip()
         path = str(payload.get("path") or "").strip()
@@ -453,25 +460,21 @@ class WebApp:
             return {"error": "当前工作区不可用：先选一个目录（侧栏底部）"}
 
         try:
-            stat, body, truncated = collect_diff(repo, base, head, path)
+            if scope == "worktree":
+                stat, body, truncated = collect_worktree_diff(repo, path)
+                empty_hint = "工作区干净（没有未提交/未跟踪改动）"
+                range_label = "未提交改动"
+            else:
+                stat, body, truncated = collect_diff(repo, base, head, path)
+                empty_hint = f"{base}..{head} 没有改动"
+                range_label = f"{base}..{head}"
         except (OSError, RuntimeError) as exc:
             return {"error": f"取 diff 失败（不是 git 仓库或区间不合法）：{exc}"}
         if not body.strip():
-            return {"error": "没有可审的 diff：当前工作区不是 git 仓库，"
-                             "或这个区间没有改动"}
+            return {"error": f"没有可审的改动：{empty_hint}"}
 
-        note = "\n（diff 被截断，未展示的部分按需读文件）" if truncated else ""
-        task = (
-            f"请审查 {base}..{head} 的改动。\n\n"
-            f"仓库：{repo}\n\n变更统计：\n{stat or '（无）'}\n\n"
-            f"diff：{note}\n```diff\n{body}\n```\n\n"
-            "先按系统提示里的集成检查走一遍（调用方/邻居、契约两端、"
-            "落盘目录、数据来源、实时/历史），再逐条看 diff。"
-            "diff 已完整给出：读 2-4 个文件就下结论，不要通读仓库。\n"
-            "输出要求：每条一行 `[severity] file:line — 一句话`，下面 2-4 行；"
-            "severity 用 blocker / major / minor；只报改动行；"
-            "没有发现就写「没有发现」；不要修改任何文件。"
-        )
+        task = build_task(base, head, stat, body, truncated,
+                          scope=scope, repo=str(repo))
         try:
             sid = self.shell.new_session("reviewer", cwd=str(repo))
         except Exception as exc:          # 缺 reviewer 包 / 会话建不起来
@@ -480,7 +483,7 @@ class WebApp:
         # posting 状态、SSE 都由那条路径统一处理），避免“提交了但界面
         # 还没看到用户消息”的竞态。
         return {"ok": True, "sessionId": sid, "message": task,
-                "detail": f"已开 {sid}，准备审查"}
+                "scope": scope, "detail": f"已开 {sid}，准备审查{range_label}"}
 
     def action(self, action: str, sid: str = "",
                expert_id: str = "") -> dict:

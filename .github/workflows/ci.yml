@@ -40,3 +40,53 @@ jobs:
 
       - name: 跑全部离线测试
         run: python -X utf8 -m unittest discover -s tests -v
+
+  # ============================================================
+  # 可选：reviewer 审查（2026-11-09）
+  # ============================================================
+  # 没有 DEEPSEEK_API_KEY 就整步跳过（不阻塞 fork PR / 无 secret 的仓库）。
+  # 配置在 config/reviewer（可跟踪），本地 .workbuddy 那份仍是主开发用的。
+  # 只把 blocker 当失败；报告作为 artifact 留下，便于人工看 major/minor。
+  review:
+    # 只审 PR：push 到 master 时 origin/master 就是 HEAD，没有可审区间。
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装审查依赖
+        run: pip install requests
+
+      - name: 取基线分支
+        if: env.DEEPSEEK_API_KEY != ''
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'master' }}
+        run: git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+
+      - name: reviewer（只读，--fail-on blocker）
+        if: env.DEEPSEEK_API_KEY != ''
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'master' }}
+        run: |
+          python -X utf8 scripts/review.py \
+            --config-dir config/reviewer \
+            --base "origin/$BASE_REF" \
+            --head HEAD \
+            --fail-on blocker \
+            --out review.md
+
+      - name: 上传审查报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviewer-report
+          path: review.md
+          if-no-files-found: ignore

@@ -181,9 +181,16 @@ export const SessionList = {
           <option v-for="e in state.experts" :key="e.expert_id"
                   :value="e.expert_id">{{ e.name }}{{ e.read_only ? '（只读）' : '' }}</option>
         </select>
-        <button id="btn-review" v-if="hasReviewer" type="button" class="mini-btn"
-                title="审查当前工作区改动：开一个只读 reviewer 会话"
-                aria-label="审查当前工作区改动" @click="reviewChanges">审查</button>
+      </div>
+      <div class="sb-review" v-if="!ui.sidebarCollapsed && hasReviewer">
+        <select id="review-scope" v-model="state.reviewScope"
+                aria-label="审查范围">
+          <option value="worktree">未提交改动</option>
+          <option value="commit">最近提交</option>
+        </select>
+        <button id="btn-review" type="button" class="mini-btn"
+                title="用只读 reviewer 审查当前工作区"
+                aria-label="审查当前工作区" @click="reviewChanges">审查</button>
       </div>
       <div id="session-list" role="list">
         <div v-if="state.listError" class="err">{{ state.listError }}</div>

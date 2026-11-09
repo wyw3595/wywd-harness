@@ -44,6 +44,7 @@ export const state = reactive({
                       // turn 阻塞期间清单 GET 排队，不能显示"还没有会话"撒谎）
   experts: [],        // 专家目录（s18）：新建选择器 + 只读徽标
   newExpert: "",      // 新建会话选中的专家 id（空 = 普通会话）
+  reviewScope: "worktree",  // 审查范围：worktree=未提交 / commit=最近提交
   posting: false,     // 正在等一轮 turn 结束
   stopping: false,    // 已请求停止、等 turn 收场（按钮变"停止中…"）
   pausing: false,     // 已请求暂停、等 turn 收场（按钮变"暂停中…"）
@@ -259,7 +260,7 @@ export function expertName(id) {
     再走正常 send 流程提交——用户气泡/posting/SSE 不另起一套。 */
 export async function reviewChanges() {
   try {
-    const res = await api.startReview({});
+    const res = await api.startReview({ scope: state.reviewScope });
     if (res && res.ok) {
       await openSession(res.sessionId);
       await send(res.message);

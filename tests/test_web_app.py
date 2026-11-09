@@ -196,7 +196,7 @@ class WebAppActionsTests(unittest.TestCase):
         """快捷审查：建 reviewer 会话、cwd 指到仓库、返回带真 diff 的任务。"""
 
         repo = self._git_repo()
-        result = self.app.review({"cwd": str(repo)})
+        result = self.app.review({"cwd": str(repo), "scope": "commit"})
 
         self.assertTrue(result["ok"], result)
         self.assertEqual(self.shell.ops, [("new_session", "reviewer")])
@@ -207,6 +207,23 @@ class WebAppActionsTests(unittest.TestCase):
         self.assertIn("+two", message)
         self.assertIn("集成检查", message)
         # 提交交给前端正常 send（用户气泡/posting 同一条路径），这里不抢跑。
+        self.assertEqual(self.shell.submitted, [])
+
+    def test_review_worktree_includes_uncommitted_and_untracked(self) -> None:
+        """UI 默认审未提交改动：modified 进 diff，untracked 只给清单。"""
+
+        repo = self._git_repo()
+        (repo / "a.txt").write_text("three\n", encoding="utf-8")
+        (repo / "b.txt").write_text("brand new\n", encoding="utf-8")
+
+        result = self.app.review({"cwd": str(repo)})
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["scope"], "worktree")
+        message = result["message"]
+        self.assertIn("未提交", message)
+        self.assertIn("+three", message)
+        self.assertIn("b.txt", message)
         self.assertEqual(self.shell.submitted, [])
 
     def test_review_reports_non_git_workspace(self) -> None:
@@ -220,9 +237,9 @@ class WebAppActionsTests(unittest.TestCase):
 
     def test_review_rejects_empty_diff(self) -> None:
         repo = self._git_repo()
-        result = self.app.review({"cwd": str(repo), "base": "HEAD",
-                                  "head": "HEAD"})
-        self.assertIn("没有可审的 diff", result["error"])
+        result = self.app.review({"cwd": str(repo), "scope": "commit",
+                                  "base": "HEAD", "head": "HEAD"})
+        self.assertIn("没有可审的改动", result["error"])
         self.assertEqual(self.shell.submitted, [])
 
     def test_close_resume_forget(self) -> None:
