@@ -37,7 +37,7 @@ from scripts.toolbox import (          # noqa: E402
     build_registry_for,
     build_skill_index,
 )
-from src.harness.agent import run_agent                    # noqa: E402
+from src.harness.agent import finalize_without_tools, run_agent  # noqa: E402
 from src.harness.experts import (                          # noqa: E402
     ExpertPackage,
     ExpertIndex,
@@ -306,13 +306,10 @@ def main(argv: list[str] | None = None) -> int:
             # reasoning_content 原样回传，而 `_to_wire_messages` 出于安全
             # 白名单把它丢了——带工具历史 + thinking 的请求会 400
             # （2026-11-08 评测真机抓到）。总结不需要思考链，用 deepseek-chat。
-            final = RealModel(tools=None, thinking=False,
-                              system_prompt="").generate(
-                list(result.messages) + [{
-                    "role": "user",
-                    "content": "现在只输出审查结论（按上面的格式），不要再调用工具。",
-                }])
-            output = final.text
+            output = finalize_without_tools(
+                RealModel(tools=None, thinking=False, system_prompt=""),
+                result.messages,
+                "现在只输出审查结论（按上面的格式），不要再调用工具。")
         except RuntimeError as error:
             # 定稿也是一次模型调用，会失败；别让 traceback 穿出去。
             print(f"[review] 强制定稿失败：{error}（本轮没有拿到结论）",

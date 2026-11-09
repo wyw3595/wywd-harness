@@ -79,6 +79,8 @@ from src.harness.compact import (
 from src.harness.experts import (
     ExpertError,
     ExpertIndex,
+    expert_step_limit,
+    max_steps_for_expert,
     render_specialization,
     select_tools,
 )
@@ -298,6 +300,7 @@ class SidecarServer:
         metrics_db: Optional["HarnessDB"] = None,
         automation_interval: float = 0.0,
         audit_chain: Optional["AuditChain"] = None,
+        finalizer: Optional[Callable[[list[dict]], str]] = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -329,6 +332,11 @@ class SidecarServer:
         # 装配层（依赖方向铁律），所以这里是同一数值的第二处声明，
         # 改默认值时两处一起改。
         self._max_steps = max_steps
+        # 专家限额撞顶后的定稿接缝（2026-11-09）：None = 不收尾（老装配
+        # 零感知）。契约：收已有 messages，返回一段结论文本；**用哪个模型
+        # 由装配层决定**——定稿必须是非思考模型，而"思考模式"是具体厂商的
+        # 概念，内核不该认识它（依赖方向：装配层 import harness）。
+        self._finalizer = finalizer
         # 工具输出外化（s13）：装配层用 ArtifactStore.externalize 填这个洞。
         # None = 不外化（既有行为零变化）——和 runner/history_seed 一样，
         # harness 只留接缝，不决定磁盘布局。
@@ -548,12 +556,20 @@ class SidecarServer:
 
         return model_summarizer(self._model)
 
-    def _make_turn_runner(self, registry=None, runner=None, sid: str = ""):
+    def _make_turn_runner(self, registry=None, runner=None, sid: str = "",
+                          expert_id: str = ""):
         """造 turn_runner 闭包：session 层的执行入口 → 本文件的 run_agent。
 
         `registry` / `runner` 不传就用 sidecar 级那套（老装配：所有会话共享）；
         传了就用传进来的——**这是"一个会话一个目录"的落点**：每个会话的 runner
         绑着它自己 cwd 的 registry 与 policy，"互不越界"才成立。
+
+        `expert_id`（2026-11-09）决定两件相关的事：
+          - **步数上限**：reviewer 这类批处理专家有自己的成本封顶
+            （`max_steps_for_expert`，只收窄不放宽）；
+          - **撞顶后定稿**：专家限额用尽时，若装配层注入了 finalizer，
+            用已有 messages 做一次无工具调用逼出结论（status 仍是
+            max_steps，诚实汇报"没做完"，但 output 不再是缴械文案）。
 
         两个设计点：
           - 闭包捕获 self、调用那一刻才读 self._runner / self._on_event：
@@ -567,6 +583,11 @@ class SidecarServer:
             只对**同一会话**成立——SessionProcess 的 turn 锁）。结局
             由 _run_turn_task 广播进 turn_end 事件。
         """
+        # 步数上限在**闭包外**算好：它是这个会话的静态属性（专家包不变、
+        # 全局默认在进程生命周期内不变），每轮重算没有意义。
+        step_limit = max_steps_for_expert(expert_id, self._max_steps)
+        expert_capped = expert_step_limit(expert_id) is not None
+
         def turn_runner(message: str, history: list[dict]):
             # s14：先做四层压缩（预算内不动；超了从最便宜的层开始压），
             # 再让条数上限兜底。两道闸各管一件事：token 管"贵不贵"，
@@ -613,7 +634,7 @@ class SidecarServer:
                 message, model=self._model,
                 registry=registry if registry is not None else self._registry,
                 history=view,
-                max_steps=self._max_steps,
+                max_steps=step_limit,
                 externalize=self._externalize,   # s13：超阈值输出换到磁盘
                 on_event=_stamped if sid else self._on_event,
                 runner=runner if runner is not None else self._runner,
@@ -627,6 +648,26 @@ class SidecarServer:
             # dict() 复制是防御习惯：存引用的话，将来谁在返回后动了那个字典，
             # 这里会跟着变——"快照存的应该是那一刻的值"（练习 08 的老教训）。
             self._turn_ctx.usage = dict(result.usage)
+
+            # 专家限额撞顶后的收尾（2026-11-09）：步数用尽 ≠ 没有结论。
+            # 只对**有专家限额**的会话生效——普通会话撞 60 步是用户该
+            # 继续探索的信号，不该被自动截成一段总结（也避免额外花费）。
+            output = result.output
+            if (result.status == "max_steps" and expert_capped
+                    and self._finalizer is not None and result.messages):
+                try:
+                    conclusion = (self._finalizer(result.messages) or "").strip()
+                except Exception as exc:      # 定稿失败不炸收尾：原文案照发
+                    self._log(f"finalize failed: {exc}")
+                    conclusion = ""
+                if conclusion:
+                    output = conclusion
+                    # 定稿**也要进证据**：前端历史渲染走 session/messages，
+                    # 只活在 turn_end 里的结论刷新一次就没了（实时/历史
+                    # 两条渲染路径必须看到同一份事实）。
+                    result.messages.append(
+                        {"role": "assistant", "content": conclusion})
+                    self._log(f"turn {sid}: 步数用尽，已用已有上下文定稿")
 
             # 落盘的必须是【原始历史 + 本轮新增】——压缩视图只发给模型，
             # **不进证据**。
@@ -643,7 +684,7 @@ class SidecarServer:
             # 副产品：_inject_skills 展开的技能正文也不再落盘了——它每轮
             # 按需重生，本来就不该进证据。
             appended = result.messages[len(view):]
-            return result.output, list(history) + appended
+            return output, list(history) + appended
         return turn_runner
 
     def _runtime_for(self, cwd: str) -> tuple:
@@ -717,7 +758,8 @@ class SidecarServer:
             audit=AuditTrail(),
         )
         return self._make_turn_runner(registry=registry, runner=runner,
-                                      sid=record.id)
+                                      sid=record.id,
+                                      expert_id=record.expert_id)
 
     def _log(self, msg: str) -> None:
         """写进 RingBuffer（模拟生产侧捕获子进程 stdout/stderr）。"""

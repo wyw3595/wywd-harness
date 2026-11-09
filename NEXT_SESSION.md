@@ -3374,3 +3374,34 @@ s18 此前只做了“人格叠加”：`tools_config` 在 sidecar 是死代码�
 本地 `.workbuddy` 是两份，改了要手动同步；`git commit --no-verify` 可绕过
 钩子。改动未提交。
 
+# 2026-11-09（三续）：web reviewer 成本封顶 + 撞顶定稿
+
+web 入口此前一直用 sidecar 的全局 max_steps=30：reviewer 在浏览器里
+可以读 30 轮才收场（CLI 早就是 8 步 + 定稿）。这次把 CLI 的两条约束
+搬进内核，但按依赖方向留接缝：
+
+- `experts.py`：`EXPERT_STEP_LIMITS` / `expert_step_limit()` /
+  `max_steps_for_expert()` 纯函数——reviewer=8，**只收窄不放宽**
+  （全局默认更低时取小的；专家的限额是"最多花多少"）。
+- `sidecar._make_turn_runner(expert_id=...)` 用它定 `max_steps`；
+  `_make_turn_runner_for` 从 `record.expert_id` 传进来——创建与 resume
+  同一条 factory，复活后限额不丢。
+- 撞顶后定稿：`agent.finalize_without_tools(model, messages)` 是内核级
+  的"无工具、只结论"调用（拼 messages + 一句指令）；sidecar 只收
+  `finalizer` **可调用接缝**，不认识"用哪个模型"。
+- 装配层 `toolbox.build_review_finalizer()` 造 `RealModel(tools=None,
+  thinking=False)`——**必须非思考**：思考模式要求回传 reasoning_content，
+  而 wire 白名单刻意不回传，带工具历史会 400（CLI 2026-11-08 踩过）。
+- 定稿结论**追加进 messages**：前端历史渲染走 session/messages，只活在
+  turn_end 的结论刷新一次就没了（实时/历史两条路径必须同一份事实）。
+- 只在**有专家限额**的会话触发定稿：普通会话撞 60 步是"该继续探索"的
+  信号，不该被自动截成总结（也避免额外花费）。status 仍报 max_steps
+  （没做完就是没做完），output 换成结论。
+
+验证：+6 测试（纯函数 3：reviewer/未知/不放宽；sidecar 3：8 步且只定稿
+一次、其他专家 3 步不定稿、定稿抛错保住原文案）。真实 key 两跑：
+reviewer 2 次 fs_read 正常完成；把 max_steps 压到 1 后 status=max_steps、
+定稿给出结论、无 400。全量 **905 条 OK（含 2 skip）**。改动未提交。
+
+边界：定稿这次调用的 token 不在 `result.usage` 里（finalizer 接口只回
+文本）——成本封顶仍成立，但账少记一跳。

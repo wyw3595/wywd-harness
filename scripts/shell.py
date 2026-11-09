@@ -53,6 +53,7 @@ from scripts.toolbox import (
     build_model_router,
     build_policy_for,
     build_registry_for,
+    build_review_finalizer,
     build_skill_index,
     build_user_memory,
     resolve_max_agent_steps,
@@ -230,6 +231,9 @@ def _sidecar_process(sock: socket.socket) -> None:
         skill_index=skills,                   # s16：命中触发词时展开正文
         expert_index=build_expert_index(),       # s18：与技能同源（项目根 .workbuddy/experts）
         metrics_db=metrics_db,                # s21：统计索引（WAL）
+        # 2026-11-09：reviewer 撞步数上限后的定稿器（无工具 + 非思考模型）。
+        # 没 key 时返回 None——内核保持"撞顶就缴械"的老行为。
+        finalizer=build_review_finalizer(),
     )
     server.handle_connection(RPCConnection(sock))
 

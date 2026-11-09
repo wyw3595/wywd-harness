@@ -60,6 +60,31 @@ class TurnControl(Protocol):
         ...
 
 
+def finalize_without_tools(
+    model: Model,
+    messages: list[dict],
+    instruction: str = "现在只输出最终结论，不要再调用任何工具。",
+) -> str:
+    """用一次**无工具**的模型调用把已有上下文压成结论（2026-11-09）。
+
+    为什么需要它：`run_agent` 撞上 max_steps 时返回的是"步数用尽，任务
+    未完成"——对批处理（审查、摘要）来说，前面读到的证据全都浪费了。
+    正确的收尾是**不再取证、只下结论**：把已有 messages 原样交给一个
+    没有工具清单的模型，让它只能说话。
+
+    调用方负责给"无工具"的模型：本函数只做消息拼装，不替装配层决定
+    用哪个模型（也就不会把某个厂商的思考模式开关写进内核）。**定稿模型
+    必须是非思考模型**——DeepSeek 思考模式要求把上一轮 reasoning_content
+    原样回传，而 real_model 的 wire 白名单刻意不回传，带工具历史会 400。
+
+    失败由调用方处理：这里是普通函数调用，模型异常照常抛出。
+    """
+
+    reply = model.generate(
+        list(messages) + [{"role": "user", "content": instruction}])
+    return (reply.text or "").strip()
+
+
 def run_agent(
     task: str,
     model: Model | None = None,

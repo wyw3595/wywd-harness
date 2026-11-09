@@ -31,6 +31,7 @@ Args 段里没有 root（file_tools 的规矩），继承也不会泄露。
 
 from pathlib import Path
 
+from src.harness.agent import finalize_without_tools
 from src.harness.file_tools import (
     ALLOWED_ROOT,
     FORBIDDEN_PARTS,
@@ -1399,6 +1400,34 @@ def build_model(registry: "ToolRegistry | None" = None) -> RealModel:
 
     schemas = (registry or build_registry()).model_schemas()
     return RealModel(tools=schemas, system_prompt="")
+
+
+# reviewer 撞上步数上限后的定稿指令：只下结论，不再取证。
+# 明确要求标"未查看"，因为模型读不完整个仓库——不写这句它会编。
+REVIEW_FINALIZE_INSTRUCTION = (
+    "现在只输出审查结论（按上面的分级格式：blocker / major / minor），"
+    "不要再调用任何工具。已经读到的证据足够下判断；没读到的文件请如实"
+    "标注「未查看」，不要猜测其内容。"
+)
+
+
+def build_review_finalizer():
+    """reviewer 的强制定稿器（2026-11-09）：无工具 + 非思考模型。
+
+    返回 None = 这次装配不提供定稿（没 key 时离线 FakeModel 说不出有用的
+    结论，不如保留原来的"步数用尽"文案；老行为零变化）。
+
+    为什么不用全局的 craft 模型：那条路由默认开思考模式。DeepSeek 思考
+    模式要求把上一轮 `reasoning_content` 原样回传，而 `_to_wire_messages`
+    的 wire 白名单刻意不回传它——带工具历史去定稿会直接 400。
+    `scripts/review.py` 已经踩过并修过，这里用同一套选择（deepseek-chat）。
+    """
+
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        return None
+    model = RealModel(tools=None, thinking=False, system_prompt="")
+    return lambda messages: finalize_without_tools(
+        model, messages, REVIEW_FINALIZE_INSTRUCTION)
 
 
 def build_model_router() -> ModelRouter:

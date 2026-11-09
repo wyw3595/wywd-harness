@@ -12,6 +12,8 @@
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -20,9 +22,12 @@ from src.harness.experts import (
     ExpertIndex,
     ExpertPackage,
     ToolsConfig,
+    expert_step_limit,
+    max_steps_for_expert,
     render_specialization,
     select_tools,
 )
+from src.harness.models import ModelReply, ToolCall
 from src.harness.permissions import build_default_policy
 from src.harness.sidecar import SidecarServer
 from src.harness.tools import Tool, ToolRegistry
@@ -356,6 +361,145 @@ class SidecarExpertTests(unittest.TestCase):
         # 没有索引的装配：空清单（不是报错——UI 可以常驻这个口）。
         self.assertEqual(self._server()._handle_expert_list({}),
                          {"experts": []})
+
+
+class ExpertStepLimitTests(unittest.TestCase):
+    """专家级成本封顶：reviewer 8 步，只收窄不放宽。"""
+
+    def test_reviewer_gets_its_own_limit(self) -> None:
+        self.assertEqual(expert_step_limit("reviewer"), 8)
+        self.assertEqual(max_steps_for_expert("reviewer", 60), 8)
+
+    def test_unknown_expert_keeps_global_default(self) -> None:
+        self.assertIsNone(expert_step_limit("architect"))
+        self.assertEqual(max_steps_for_expert("architect", 60), 60)
+        self.assertEqual(max_steps_for_expert("", 30), 30)
+
+    def test_expert_limit_never_widens_global_default(self) -> None:
+        # 用户把全局调到比专家上限还低：专家的限额是"最多花多少"，
+        # 不是"至少给我多少"。
+        self.assertEqual(max_steps_for_expert("reviewer", 3), 3)
+
+
+class _EndlessToolModel:
+    """永远请求工具的模型：用来把 turn 推到步数上限（不碰网络）。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, messages: list[dict],
+                 tools: list[dict] | None = None) -> ModelReply:
+        self.calls += 1
+        return ModelReply(
+            kind="tool_calls",
+            tool_calls=[ToolCall(f"c{self.calls}", "echo", {"text": "x"})],
+        )
+
+
+class SidecarStepCapTests(unittest.TestCase):
+    """sidecar 接线：按 expert_id 选步数，撞顶后用 finalizer 收尾。
+
+    评审会话的"读几个文件就该下结论"是业务约束；这里钉三件事：
+    步数真的按专家收窄、撞顶真的调定稿、定稿结论真的进证据。
+    """
+
+    def _server(self, root: Path, model, *, max_steps: int = 30,
+                finalizer=None) -> SidecarServer:
+        _write_package(root, {
+            "expert_id": "reviewer", "name": "代码审查员",
+            "system_prompt": "你是只读代码审查员。"})
+        registry = ToolRegistry()
+        registry.register(Tool(name="echo", description="t",
+                               handler=lambda text="": f"回声：{text}"))
+        return SidecarServer(
+            model=model, registry=registry,
+            policy=build_default_policy(safe_tools=("echo",)),
+            expert_index=ExpertIndex(root),
+            max_steps=max_steps,
+            finalizer=finalizer,
+        )
+
+    def _run(self, server: SidecarServer, expert_id: str = "reviewer",
+             message: str = "审查这个 diff") -> dict:
+        events: list[dict] = []
+        server._on_event = lambda event, data: events.append(
+            {"event": event, **data})
+        sid = server._handle_session_create(
+            {"expertId": expert_id} if expert_id else {})["sessionId"]
+        server._handle_agent_send({"sessionId": sid, "message": message})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            for event in events:
+                if event.get("event") == "turn_end":
+                    return {"sid": sid, **event}
+            time.sleep(0.02)
+        raise AssertionError("5 秒内没等到 turn_end")
+
+    def test_reviewer_stops_at_eight_steps_and_finalizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = _EndlessToolModel()
+            seen: list[list[dict]] = []
+
+            def finalizer(messages: list[dict]) -> str:
+                seen.append(list(messages))
+                return "审查结论：发现 1 个 blocker。"
+
+            server = self._server(Path(tmp), model, finalizer=finalizer)
+            outcome = self._run(server)
+
+        self.assertEqual(model.calls, 8)              # 不是全局的 30
+        self.assertEqual(outcome["status"], "max_steps")   # 仍诚实报截断
+        self.assertEqual(outcome["output"], "审查结论：发现 1 个 blocker。")
+        self.assertEqual(len(seen), 1)                # 只定稿一次
+        self.assertTrue(any(message.get("role") == "tool"
+                            for message in seen[0]))
+        # 定稿进了证据：历史渲染不能只靠 turn_end 的直播。
+        # 且**只落一份**——turn_end 的 output 不进 messages，追加一次即可
+        # （2026-11-09 钩子报过"重复落盘"的 blocker，用计数钉死是假阳性）。
+        record = server._manager.get_session(outcome["sid"]).record
+        self.assertEqual(record.messages[-1],
+                         {"role": "assistant",
+                          "content": "审查结论：发现 1 个 blocker。"})
+        self.assertEqual(
+            len([m for m in record.messages
+                 if m.get("content") == "审查结论：发现 1 个 blocker。"]), 1)
+
+    def test_other_expert_keeps_global_limit_and_no_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = _EndlessToolModel()
+            called: list[int] = []
+
+            def finalizer(messages: list[dict]) -> str:
+                called.append(1)
+                return "不该出现"
+
+            server = self._server(Path(tmp), model, max_steps=3,
+                                  finalizer=finalizer)
+            # 用 architect（无专家限额）验证：全局 3 步、不定稿。
+            _write_package(Path(tmp), {
+                "expert_id": "architect", "name": "架构师",
+                "system_prompt": "你是架构师。"})
+            outcome = self._run(server, expert_id="architect")
+
+        self.assertEqual(model.calls, 3)
+        self.assertEqual(called, [])
+        self.assertEqual(outcome["status"], "max_steps")
+        self.assertIn("步数用尽", outcome["output"])
+
+    def test_finalizer_failure_keeps_honest_output(self) -> None:
+        """定稿是一次模型调用，会失败；失败不该炸 turn，也不该吞掉真相。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model = _EndlessToolModel()
+
+            def finalizer(messages: list[dict]) -> str:
+                raise RuntimeError("网关 502")
+
+            server = self._server(Path(tmp), model, finalizer=finalizer)
+            outcome = self._run(server)
+
+        self.assertEqual(outcome["status"], "max_steps")
+        self.assertIn("步数用尽", outcome["output"])
 
 
 if __name__ == "__main__":
