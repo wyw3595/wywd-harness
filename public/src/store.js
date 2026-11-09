@@ -263,6 +263,7 @@ export async function reviewChanges() {
     const res = await api.startReview({ scope: state.reviewScope });
     if (res && res.ok) {
       await openSession(res.sessionId);
+      refreshSessions();        // 清单带上 expertId，徽标不用等 5s 轮询
       await send(res.message);
     } else {
       notify((res && res.error) || "审查没起来");
