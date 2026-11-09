@@ -3349,3 +3349,28 @@ s18 此前只做了“人格叠加”：`tools_config` 在 sidecar 是死代码�
 改动；要审未提交改动得另开参数。reviewer 评测仍是 3/4，UI 徽标只承诺
 “只读”，不承诺“审得全”。改动未提交。
 
+# 2026-11-09（续）：审查范围 + CI + pre-commit
+
+- `review.py` 新增两个采集器：
+  - `--staged`：只 `git diff --cached`（pre-commit 用，没 add 的不混进来）；
+  - `--worktree`：`git diff HEAD`（staged+unstaged）+ 未跟踪文件**清单**
+    （正文不塞进 diff，让 reviewer 按需 fs_read，不假装审过）；
+  - `--fail-on blocker|major|minor`：出现 >= 该级别返回 1（CI/钩子闸门）；
+  - `build_task` 按 scope 换标题；CLI 与 Web 共用。
+- `/api/review` 默认 `scope=worktree`（未提交），可选 `commit`；UI 侧栏加
+  审查范围下拉（未提交改动 / 最近提交）。
+- CI：`config/reviewer/` 是 `.workbuddy` 布局的可跟踪副本；`ci.yml` 加
+  `review` job（仅 PR；有 `DEEPSEEK_API_KEY` 才跑；`--fail-on blocker`；
+  报告上传 artifact；fork/无 secret 自动跳过）。
+- pre-commit：`scripts/install_precommit.py` 写 `.git/hooks/pre-commit`：
+  只审暂存区；`[blocker]` 挡提交；没 key / 缺配置 / 模型失败 / 异常退出码
+  都跳过，不锁死本地提交；`WYWD_SKIP_REVIEW=1` 绕过；解释器在安装时写死
+  当前 venv（本机已装并验证：无 key 跳过、skip 标志退出 0、无暂存 diff 退出 0）。
+- 测试 +12（staged/worktree/severity/task 头、CI 配置与 workflow、安装器
+  5 条、web worktree scope），全量 **899 条 OK（含 2 skip）**；
+  前端 smoke 5c 改选“最近提交”保证干净工作区也可复现，全部通过。
+
+边界：CI 的 review job 需要仓库 secret，fork PR 跳过；`config/reviewer` 与
+本地 `.workbuddy` 是两份，改了要手动同步；`git commit --no-verify` 可绕过
+钩子。改动未提交。
+
