@@ -3455,3 +3455,57 @@ CI 用旧人格审代码，或者本地新增的禁用工具没同步（reviewer
 没有进历史。
 
 全量 **915 条 OK（含 2 skip）**；前端 smoke 见下条。
+
+# 2026-11-09（六续）：CI 真跑（PR #1，验证后已关闭）
+
+第一次把仓库真正推上 GitHub Actions（master 38 个提交 + 临时分支）。
+三件事：测试矩阵、review job、blocker 闸门。
+
+## 一、测试矩阵：先红后绿（4 fail + 8 error）
+
+红不是配置问题，是**测试带了本机假设**：
+
+- `tests/test_native_dialog.py`：协议测试没 patch `available()`，headless
+  Linux 上 `pick_directory` 在探活处就抛 `DialogUnavailable`（7 error），
+  + `test_reports_available_on_this_machine` 硬断言 True（1 fail）、
+  tkinter 文案用例也被 DISPLAY 抢先（1 fail）。修：协议/子进程参数两组
+  `setUp` 统一 patch `available()`；探活用例按"有没有显示器"skip。
+- `test_blocks_path_traversal`：`C:/Windows` 在 Linux 上是**相对路径**，
+  被拼进沙箱 → 测不到越界。改用 `ALLOWED_ROOT.parent / "outside-the-sandbox"`。
+- `glob` 的显式 root 用例依赖 `learn-workbuddy/`（gitignore，干净 checkout
+  没有）。改成自建临时树 + `sandbox_root=`，语义不变、不依赖本机教材目录。
+
+修后 3.11 / 3.12 / 3.13 全绿；本地 915 条 OK，CI 多 1 skip（无显示器）。
+
+## 二、review job：先"假绿"，配 secret 后真跑
+
+仓库此前**没有任何 Actions secret**。第一次 PR 的 review job 结论是
+`success`——因为 job 级 `if` 只判 `pull_request`，步骤级 `if` 判
+`env.DEEPSEEK_API_KEY != ''`，没有 key 时**所有步骤静默跳过**，job 仍然
+绿。这比 skipped 更误导：绿勾看起来像"审过且干净"。
+
+处理：用 API + PyNaCl（临时装在 `D:/Temp/wywd_pynacl`，没进项目依赖）
+把本地 `DEEPSEEK_API_KEY` 加密写进仓库 secret（`secrets` 里现在有它）。
+重跑同一 PR：
+
+- 7 个步骤全执行（取基线 → reviewer → 上传报告）；
+- artifact `reviewer-report` 2.8KB，内容是正常审查报告；
+- 审查范围 `origin/master..HEAD`，结论无 blocker，job 绿。
+
+**遗留**：无 secret / fork PR 仍会重现"假绿"。建议后续给评审 job 加
+job 级 fork 判断（fork 直接 skipped），或补一个 step summary 明写
+"未配置密钥，本次未审查"。这次先记录，不改工作流。
+
+## 三、blocker 闸门：CI 上真的会红
+
+往临时分支加 `_review_probe.py`（打印 `DEEPSEEK_API_KEY` + `shell=True`），
+push 后 PR run：test 三档全绿，**review job `failure`**，报告首条
+`[blocker] _review_probe.py:7-11`；artifact 仍上传（`if: always()`）。
+验证完关闭 PR #1、删除临时分支，探针文件没有进 master。
+
+## 四、状态
+
+- master 增加 CI 修复提交（`5fed033`），已推送；
+- 仓库 secret `DEEPSEEK_API_KEY` 已配置（2026-11-09，如需轮换在
+  Settings → Secrets 里改）；
+- PR #1 只用于验证，已关闭，不合并。
