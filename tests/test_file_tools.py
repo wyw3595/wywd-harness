@@ -33,9 +33,11 @@ class ResolveSafeTests(unittest.TestCase):
         # 相对路径翻墙
         with self.assertRaises(PermissionError):
             _resolve_safe("../..")
-        # 绝对路径指到沙箱外
+        # 绝对路径指到沙箱外（Windows 的 C:/Windows 在 Linux 上是相对路径，
+        # 所以按"项目根的父目录"取一个当前平台真正的绝对路径）。
+        outside = (ALLOWED_ROOT.parent / "outside-the-sandbox").resolve()
         with self.assertRaises(PermissionError):
-            _resolve_safe("C:/Windows")
+            _resolve_safe(str(outside))
 
 
 class FileToolTests(unittest.TestCase):
