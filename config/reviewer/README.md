@@ -12,6 +12,15 @@ config/reviewer/.workbuddy/skills/code-review/SKILL.md
 CI 没有那个目录，所以把 reviewer 的人格与技能复制一份到这里；两边内容
 应保持一致，改了一边记得同步另一边。
 
+同步用脚本，别手工拷：
+
+```bash
+python -X utf8 scripts/sync_reviewer_config.py --check   # 一致 0 / 漂移 1
+python -X utf8 scripts/sync_reviewer_config.py --write   # 本地 → 副本
+```
+
+`--check` 只读，适合接 CI；`--write` 只写副本，不会反向覆盖本地配置。
+
 用法：
 
 ```bash

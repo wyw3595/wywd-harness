@@ -3405,3 +3405,26 @@ reviewer 2 次 fs_read 正常完成；把 max_steps 压到 1 后 status=max_step
 
 边界：定稿这次调用的 token 不在 `result.usage` 里（finalizer 接口只回
 文本）——成本封顶仍成立，但账少记一跳。
+
+# 2026-11-09（四续）：reviewer 配置同步脚本（--check / --write）
+
+动机：`.workbuddy/` 是本地配置（ignore），`config/reviewer/.workbuddy`
+是 CI 用的副本。两份靠"记得手动同步"维持一致——漂移的失败模式是静默的：
+CI 用旧人格审代码，或者本地新增的禁用工具没同步（reviewer 在 CI 里
+多出写权限）。做成命令 + 测试，比纪律可靠。
+
+- `scripts/sync_reviewer_config.py`：
+  - `--check` 逐文件比字节，有漂移退出 1（缺副本也算漂移）；
+  - `--write` 本地 → 副本，已一致的文件不动；源目录缺失退出 2；
+  - 显式列 2 个文件（`experts/reviewer.json`、`skills/code-review/SKILL.md`），
+    不整目录复制——`.workbuddy/` 里还有记忆/日志/临时脚本，绝不能进库。
+- **发现一个真缺口**：`config/reviewer/.workbuddy/` 之前**根本没进 git**。
+  `.gitignore` 的 `.workbuddy/` 是"任意层级"的目录规则，把副本一起忽略
+  了；`git ls-files config` 只有 README.md。也就是说 CI 的 review job
+  在干净 checkout 上一直缺配置（有 key 也会因缺包跳过）。修：加一条
+  `!/config/reviewer/.workbuddy/` 例外，只放行这一个目录。
+- 测试 +8：一致 / 内容漂移（CLI 退出 1）/ 缺副本 / 写回后干净且不重复写 /
+  只同步清单内文件 / 源目录缺失退出 2 / 删源文件算漂移 / --check 与
+  --write 互斥。
+
+全量 **913 条 OK（含 2 skip）**。改动未提交。

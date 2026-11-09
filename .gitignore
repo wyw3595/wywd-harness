@@ -61,6 +61,11 @@ workspaces/
 # 交付物。注意别和上面的 .memory/ 搞混——那个是 harness 自己的记忆，
 # 这个是敲代码的 agent 用的，项目代码里没有任何引用。
 .workbuddy/
+# 例外：CI 用的 reviewer 配置副本必须可跟踪。上面那条是"任意层级"的
+# 目录规则，会连 config/reviewer/.workbuddy 一起忽略——副本进不了库，
+# CI 的 review job 就永远缺配置（静默跳过）。这里只放行这一个目录；
+# 本地 .workbuddy/（记忆/日志/临时脚本）仍然整体忽略。
+!/config/reviewer/.workbuddy/
 
 # 临时运行日志（冒烟输出 / 进程清单）：本地排查用完即弃，不进仓库
 /_procs.txt

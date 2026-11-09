@@ -120,9 +120,10 @@ scripts/            壳层与入口
   chat.py             终端聊天入口
   toolbox.py          装配层：工具/模型/记忆/策略的组装
   native_dialog.py    系统目录选择框（降级机制）
+  sync_reviewer_config.py  reviewer 配置：本地 .workbuddy ↔ CI 副本
   smoke_*.py          冒烟脚本（真实链路自验，不进单测）
 public/             前端（Vue 3 ESM vendor，零构建）
-tests/              905 条离线单元测试（unittest，毫秒级，不碰网络）
+tests/              913 条离线单元测试（unittest，毫秒级，不碰网络）
 ```
 
 ## 快速开始
